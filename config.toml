@@ -1,0 +1,6 @@
+[llm]
+base_url = "https://llm-proxy.ftai.chat/v1"
+model = "deepseek-v4-flash"
+api_key_env = "LLM_API_KEY"
+temperature = 0.7
+max_tokens = 8196

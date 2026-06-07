@@ -65,13 +65,6 @@ impl InputState {
         value
     }
 
-    pub fn cursor_position(&self) -> (u16, u16) {
-        let before = &self.value[..self.cursor];
-        let row = before.chars().filter(|char| *char == '\n').count() as u16;
-        let column = before.rsplit('\n').next().unwrap_or("").chars().count() as u16 + 2;
-        (column, row)
-    }
-
     fn move_vertical(&mut self, direction: isize) {
         let lines: Vec<&str> = self.value.split('\n').collect();
         let (column, row) = self.cursor_column_row();

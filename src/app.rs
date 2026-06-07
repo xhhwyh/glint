@@ -2,7 +2,8 @@ use std::sync::mpsc::{self, Receiver};
 
 use crate::{
     agent::{self, AgentEvent, AgentStatus},
-    event::{AppEvent, KeyAction},
+    config::Config,
+    event::{AppEvent, KeyAction, MouseAction},
     input::InputState,
     message::{Message, Role},
 };
@@ -14,30 +15,29 @@ pub struct App {
     pub status: AgentStatus,
     pub scroll: u16,
     pub agent_events: Receiver<AgentEvent>,
+    pub config: Config,
     agent_tx: mpsc::Sender<AgentEvent>,
 }
 
-impl Default for App {
-    fn default() -> Self {
+impl App {
+    pub fn new(config: Config) -> Self {
         let (agent_tx, agent_events) = mpsc::channel();
         Self {
             should_quit: false,
-            messages: vec![Message::system(
-                "Enter a task. The fake agent will stream a response.",
-            )],
+            messages: Vec::new(),
             input: InputState::default(),
             status: AgentStatus::Idle,
             scroll: 0,
             agent_events,
+            config,
             agent_tx,
         }
     }
-}
 
-impl App {
     pub fn update(&mut self, event: AppEvent) {
         match event {
             AppEvent::Key(key) => self.update_key(key),
+            AppEvent::Mouse(mouse) => self.update_mouse(mouse),
             AppEvent::Agent(event) => self.update_agent(event),
         }
     }
@@ -65,6 +65,14 @@ impl App {
         }
     }
 
+    fn update_mouse(&mut self, mouse: MouseAction) {
+        match mouse {
+            MouseAction::ScrollUp => self.scroll = self.scroll.saturating_add(3),
+            MouseAction::ScrollDown => self.scroll = self.scroll.saturating_sub(3),
+            MouseAction::None => {}
+        }
+    }
+
     fn submit(&mut self) {
         let prompt = self.input.take_trimmed();
         if prompt.is_empty() {
@@ -74,7 +82,7 @@ impl App {
         self.messages.push(Message::user(prompt.clone()));
         self.status = AgentStatus::Thinking;
         self.scroll = 0;
-        agent::spawn_fake_loop(prompt, self.agent_tx.clone());
+        agent::spawn_agent_loop(prompt, self.config.llm.clone(), self.agent_tx.clone());
     }
 
     fn update_agent(&mut self, event: AgentEvent) {
@@ -85,6 +93,10 @@ impl App {
             }
             AgentEvent::AssistantDelta(delta) => self.append_assistant_delta(&delta),
             AgentEvent::AssistantFinished => self.status = AgentStatus::Idle,
+            AgentEvent::Failed(error) => {
+                self.append_assistant_delta(&error);
+                self.status = AgentStatus::Idle;
+            }
         }
     }
 

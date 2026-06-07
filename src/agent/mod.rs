@@ -1,6 +1,6 @@
-mod fake_loop;
+mod openai;
 
-pub use fake_loop::spawn_fake_loop;
+pub use openai::spawn_agent_loop;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum AgentStatus {
@@ -9,18 +9,9 @@ pub enum AgentStatus {
     Responding,
 }
 
-impl AgentStatus {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Idle => "idle",
-            Self::Thinking => "thinking",
-            Self::Responding => "responding",
-        }
-    }
-}
-
 pub enum AgentEvent {
     Started,
     AssistantDelta(String),
     AssistantFinished,
+    Failed(String),
 }

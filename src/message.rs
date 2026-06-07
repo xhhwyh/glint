@@ -2,7 +2,6 @@
 pub enum Role {
     User,
     Assistant,
-    System,
 }
 
 pub struct Message {
@@ -24,9 +23,5 @@ impl Message {
 
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::new(Role::Assistant, content)
-    }
-
-    pub fn system(content: impl Into<String>) -> Self {
-        Self::new(Role::System, content)
     }
 }
