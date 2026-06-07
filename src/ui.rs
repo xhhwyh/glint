@@ -7,7 +7,7 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::{app::App, message::Role};
+use crate::{agent::AgentStatus, app::App, message::Role};
 
 struct Document {
     lines: Vec<Line<'static>>,
@@ -38,11 +38,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn document(app: &App, width: u16) -> Document {
-    let mut lines = vec![
-        Line::from(box_top("idle", width)),
-        Line::from(box_empty(width)),
-        Line::from(box_bottom(width)),
-    ];
+    let mut lines = idle_panel_lines(app, width);
 
     lines.extend(transcript_lines(app, width));
     if !app.messages.is_empty() {
@@ -57,7 +53,7 @@ fn document(app: &App, width: u16) -> Document {
             .map(|row| Line::from(box_body(&row, width))),
     );
     lines.push(Line::from(box_bottom(width)));
-    lines.push(Line::from(info_line(app)));
+    lines.push(info_line(app));
 
     let (cursor_x, cursor_row) = input_cursor_position(app, width);
     Document {
@@ -65,6 +61,99 @@ fn document(app: &App, width: u16) -> Document {
         cursor_x,
         cursor_y: input_y + cursor_row + 1,
     }
+}
+
+fn idle_panel_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    const PANEL_HEIGHT: usize = 7;
+    const MIN_SPLIT_WIDTH: usize = 56;
+    const LEFT_MIN_WIDTH: usize = 26;
+    const GUTTER_WIDTH: usize = 3;
+
+    let width = width as usize;
+    if width < 4 {
+        return vec![Line::from("─".repeat(width))];
+    }
+
+    let inner_width = width.saturating_sub(2);
+    let has_split = inner_width >= MIN_SPLIT_WIDTH;
+    let left_width = if has_split {
+        ((inner_width.saturating_sub(GUTTER_WIDTH)) * 45 / 100).max(LEFT_MIN_WIDTH)
+    } else {
+        inner_width
+    };
+    let right_width = inner_width.saturating_sub(left_width + GUTTER_WIDTH);
+
+    let mut lines = vec![Line::from(box_top("session", width as u16))];
+    for row in 0..PANEL_HEIGHT {
+        let left = idle_left_content(app, row);
+        if has_split && right_width > 0 {
+            let right = idle_right_content(row);
+            lines.push(Line::from(format!(
+                "│{} │ {}│",
+                fit_text(&left, left_width),
+                fit_text(&right, right_width)
+            )));
+        } else {
+            lines.push(Line::from(format!("│{}│", fit_text(&left, inner_width))));
+        }
+    }
+    lines.push(Line::from(box_bottom(width as u16)));
+    lines
+}
+
+fn idle_left_content(app: &App, row: usize) -> String {
+    match row {
+        0 => " ✦ TUI Agent".to_owned(),
+        1 => format!("   status  {}", status_label(app.status)),
+        2 => format!("   model   {}", app.config.llm.model),
+        3 => format!("   cwd     {}", app.current_dir),
+        4 => "".to_owned(),
+        5 => "   Enter to send · Shift+Enter newline".to_owned(),
+        _ => "   Ctrl+C quit · mouse wheel scroll".to_owned(),
+    }
+}
+
+fn idle_right_content(row: usize) -> String {
+    match row {
+        0 => " Recent conversations".to_owned(),
+        1 => "   reserved".to_owned(),
+        2 => "".to_owned(),
+        3 => " Updates".to_owned(),
+        4 => "   reserved".to_owned(),
+        _ => "".to_owned(),
+    }
+}
+
+fn status_label(status: AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::Idle => "idle",
+        AgentStatus::Thinking => "thinking",
+        AgentStatus::Responding => "responding",
+    }
+}
+
+fn fit_text(text: &str, width: usize) -> String {
+    let text_width = text.width();
+    if text_width <= width {
+        return format!("{text}{}", " ".repeat(width - text_width));
+    }
+
+    if width <= 1 {
+        return "…".repeat(width);
+    }
+
+    let mut trimmed = String::new();
+    let mut trimmed_width = 0;
+    for char in text.chars() {
+        let char_width = char.width().unwrap_or(0);
+        if trimmed_width + char_width > width - 1 {
+            break;
+        }
+        trimmed.push(char);
+        trimmed_width += char_width;
+    }
+
+    format!("{trimmed}…{}", " ".repeat(width - trimmed_width - 1))
 }
 
 fn transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
@@ -162,14 +251,19 @@ fn input_content_width(width: u16) -> usize {
     width.saturating_sub(6).max(1) as usize
 }
 
-fn info_line(app: &App) -> String {
-    format!(
-        "model: {} · cwd: {}",
-        app.config.llm.model,
-        std::env::current_dir()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|_| "?".to_owned())
-    )
+fn info_line(app: &App) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("model ", Style::default().fg(Color::Blue)),
+        Span::styled(
+            app.config.llm.model.clone(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+        Span::styled("cwd ", Style::default().fg(Color::Cyan)),
+        Span::styled(app.current_dir.clone(), Style::default().fg(Color::White)),
+    ])
 }
 
 fn box_top(title: &str, width: u16) -> String {
@@ -179,15 +273,6 @@ fn box_top(title: &str, width: u16) -> String {
     }
 
     format!("┌ {title} {}┐", "─".repeat(width - title.len() - 4))
-}
-
-fn box_empty(width: u16) -> String {
-    let width = width as usize;
-    if width < 2 {
-        return "│".repeat(width);
-    }
-
-    format!("│{}│", " ".repeat(width - 2))
 }
 
 fn box_body(text: &str, width: u16) -> String {

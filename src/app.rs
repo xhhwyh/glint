@@ -16,6 +16,7 @@ pub struct App {
     pub scroll: u16,
     pub agent_events: Receiver<AgentEvent>,
     pub config: Config,
+    pub current_dir: String,
     agent_tx: mpsc::Sender<AgentEvent>,
 }
 
@@ -30,6 +31,7 @@ impl App {
             scroll: 0,
             agent_events,
             config,
+            current_dir: current_dir_label(),
             agent_tx,
         }
     }
@@ -109,4 +111,10 @@ impl App {
             message.content.push_str(delta);
         }
     }
+}
+
+fn current_dir_label() -> String {
+    std::env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "?".to_owned())
 }
