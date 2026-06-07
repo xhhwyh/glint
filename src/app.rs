@@ -46,11 +46,22 @@ impl App {
         match key {
             KeyAction::Quit => self.should_quit = true,
             KeyAction::Submit if self.status == AgentStatus::Idle => self.submit(),
+            KeyAction::Newline if self.status == AgentStatus::Idle => self.input.newline(),
             KeyAction::Char(char) if self.status == AgentStatus::Idle => self.input.push(char),
             KeyAction::Backspace if self.status == AgentStatus::Idle => self.input.backspace(),
-            KeyAction::ScrollUp => self.scroll = self.scroll.saturating_add(1),
-            KeyAction::ScrollDown => self.scroll = self.scroll.saturating_sub(1),
-            KeyAction::None | KeyAction::Submit | KeyAction::Char(_) | KeyAction::Backspace => {}
+            KeyAction::Left if self.status == AgentStatus::Idle => self.input.move_left(),
+            KeyAction::Right if self.status == AgentStatus::Idle => self.input.move_right(),
+            KeyAction::Up if self.status == AgentStatus::Idle => self.input.move_up(),
+            KeyAction::Down if self.status == AgentStatus::Idle => self.input.move_down(),
+            KeyAction::Up => self.scroll = self.scroll.saturating_add(1),
+            KeyAction::Down => self.scroll = self.scroll.saturating_sub(1),
+            KeyAction::None
+            | KeyAction::Submit
+            | KeyAction::Newline
+            | KeyAction::Char(_)
+            | KeyAction::Backspace
+            | KeyAction::Left
+            | KeyAction::Right => {}
         }
     }
 

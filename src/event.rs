@@ -10,10 +10,13 @@ pub enum AppEvent {
 pub enum KeyAction {
     Quit,
     Submit,
+    Newline,
     Char(char),
     Backspace,
-    ScrollUp,
-    ScrollDown,
+    Left,
+    Right,
+    Up,
+    Down,
     None,
 }
 
@@ -23,10 +26,13 @@ impl From<KeyEvent> for KeyAction {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Self::Quit,
             KeyCode::Char('q') if key.modifiers.is_empty() => Self::Quit,
             KeyCode::Char(char) => Self::Char(char),
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => Self::Newline,
             KeyCode::Enter => Self::Submit,
             KeyCode::Backspace => Self::Backspace,
-            KeyCode::Up | KeyCode::PageUp => Self::ScrollUp,
-            KeyCode::Down | KeyCode::PageDown => Self::ScrollDown,
+            KeyCode::Left => Self::Left,
+            KeyCode::Right => Self::Right,
+            KeyCode::Up | KeyCode::PageUp => Self::Up,
+            KeyCode::Down | KeyCode::PageDown => Self::Down,
             _ => Self::None,
         }
     }
