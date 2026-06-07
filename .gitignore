@@ -1,0 +1,10 @@
+/target/
+
+# Local Claude Code permissions/settings
+.claude/settings.local.json
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
