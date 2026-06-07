@@ -38,6 +38,39 @@ Key pieces:
 - `src/input.rs` holds the simple input buffer behavior.
 - `src/agent/` contains the agent-facing event types and the current fake streaming loop. Future real model/tool integration should extend `AgentEvent` rather than coupling provider logic directly into the UI loop.
 
+## Code Style
+
+Keep this codebase intentionally simple and easy to change:
+
+- Prefer concise, direct code over broad abstractions.
+- Do not add defensive handling for states that cannot occur in the current design.
+- Keep rendering, state updates, input mapping, and agent events separated.
+- Add dependencies only when they clearly reduce complexity.
+- Use idiomatic Rust: `cargo fmt`, `cargo clippy -- -D warnings`, `Result` with `?`, and no `unwrap()` in production paths unless the state is genuinely unreachable.
+
+## Git Commit Convention
+
+Use this commit message shape:
+
+```text
+<type>(<topic>): <abstract>
+
+- describe the first meaningful change
+- describe the second meaningful change
+```
+
+Examples:
+
+```text
+feat(init): bootstrap agent tui
+fix(input): handle backspace on empty buffer
+refactor(agent): split streaming loop events
+```
+
+Common types: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `perf`, `ci`.
+
+Keep the first line short and specific. Use bullet points in the body when a commit includes multiple meaningful changes.
+
 ## Extension Notes
 
 The current agent event model is the intended seam for future work. Add new states/events there for features such as cancellation, real model streaming, tool request/approval, tool start/finish, and failures. Keep the same separation: terminal events and agent events update `App`; `ui::render` only displays `App`.
