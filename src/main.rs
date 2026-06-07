@@ -3,6 +3,7 @@ mod app;
 mod config;
 mod event;
 mod input;
+mod markdown;
 mod message;
 mod ui;
 

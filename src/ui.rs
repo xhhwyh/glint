@@ -7,7 +7,7 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::{app::App, message::Role};
+use crate::{app::App, markdown, message::Role};
 
 struct Document {
     lines: Vec<Line<'static>>,
@@ -83,11 +83,7 @@ fn transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                     Style::default().fg(Color::DarkGray),
                 )));
             } else {
-                lines.extend(
-                    wrap_text(&message.content, width)
-                        .into_iter()
-                        .map(Line::from),
-                );
+                lines.extend(markdown::render_markdown(&message.content, width));
             }
             lines
         })
