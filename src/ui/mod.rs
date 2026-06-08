@@ -12,6 +12,8 @@ use crate::{app::App, message::Role};
 mod markdown;
 mod star;
 
+const WELCOME_TEXT: &str = "Catch the glint. Shape the work.";
+
 struct Document {
     lines: Vec<Line<'static>>,
     cursor_x: u16,
@@ -69,8 +71,7 @@ fn document(app: &App, width: u16) -> Document {
 
 fn idle_panel_lines(_app: &App, width: u16) -> Vec<Line<'static>> {
     const ICON_PADDING_X: usize = 4;
-    const LEFT_WIDTH: usize = star::STAR_WIDTH + ICON_PADDING_X * 2;
-    const MIN_SPLIT_WIDTH: usize = LEFT_WIDTH + GUTTER_WIDTH + RIGHT_MIN_WIDTH + 2;
+    const WELCOME_PADDING_X: usize = 2;
     const RIGHT_MIN_WIDTH: usize = 32;
     const GUTTER_WIDTH: usize = 3;
 
@@ -83,28 +84,28 @@ fn idle_panel_lines(_app: &App, width: u16) -> Vec<Line<'static>> {
     }
 
     let inner_width = width.saturating_sub(2);
-    let has_split = inner_width >= MIN_SPLIT_WIDTH;
-    let left_width = if has_split { LEFT_WIDTH } else { inner_width };
+    let left_min_width =
+        (star::STAR_WIDTH + ICON_PADDING_X * 2).max(WELCOME_TEXT.width() + WELCOME_PADDING_X * 2);
+    let has_split = inner_width >= left_min_width + GUTTER_WIDTH + RIGHT_MIN_WIDTH + 2;
+    let left_width = if has_split {
+        left_min_width
+    } else {
+        inner_width
+    };
     let right_width = inner_width.saturating_sub(left_width + GUTTER_WIDTH);
-    let star_rows = star::glint_star_rows();
+    let left_rows = idle_left_rows();
 
     let mut lines = vec![dashboard_top(width as u16)];
-    for (row, left_spans) in star_rows.into_iter().enumerate() {
+    for (row, left_spans) in left_rows.into_iter().enumerate() {
         let mut row_spans = vec![Span::styled("┃", Style::default().fg(Color::Blue))];
 
         if has_split && right_width > 0 {
             let right_spans = idle_right_spans(row);
-            row_spans.extend(pad_spans(
-                padded_icon_spans(left_spans, ICON_PADDING_X),
-                left_width,
-            ));
+            row_spans.extend(center_spans(left_spans, left_width));
             row_spans.push(Span::styled(" ┃ ", Style::default().fg(Color::Blue)));
             row_spans.extend(pad_spans(right_spans, right_width));
         } else {
-            row_spans.extend(pad_spans(
-                padded_icon_spans(left_spans, ICON_PADDING_X),
-                inner_width,
-            ));
+            row_spans.extend(center_spans(left_spans, inner_width));
         }
 
         row_spans.push(Span::styled("┃", Style::default().fg(Color::Blue)));
@@ -114,12 +115,15 @@ fn idle_panel_lines(_app: &App, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-fn padded_icon_spans(mut spans: Vec<Span<'static>>, padding: usize) -> Vec<Span<'static>> {
-    let mut padded = Vec::with_capacity(spans.len() + 2);
-    padded.push(Span::raw(" ".repeat(padding)));
-    padded.append(&mut spans);
-    padded.push(Span::raw(" ".repeat(padding)));
-    padded
+fn idle_left_rows() -> Vec<Vec<Span<'static>>> {
+    let mut rows = star::glint_star_rows();
+    rows.push(vec![Span::styled(
+        WELCOME_TEXT,
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    )]);
+    rows
 }
 
 fn idle_right_spans(row: usize) -> Vec<Span<'static>> {
@@ -194,6 +198,21 @@ fn pad_spans(mut spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> 
         spans = truncated;
     }
     spans
+}
+
+fn center_spans(mut spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    let current_width: usize = spans.iter().map(|s| s.width()).sum();
+    if current_width >= width {
+        return pad_spans(spans, width);
+    }
+
+    let left_padding = (width - current_width) / 2;
+    let right_padding = width - current_width - left_padding;
+    let mut centered = Vec::with_capacity(spans.len() + 2);
+    centered.push(Span::raw(" ".repeat(left_padding)));
+    centered.append(&mut spans);
+    centered.push(Span::raw(" ".repeat(right_padding)));
+    centered
 }
 
 fn transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
