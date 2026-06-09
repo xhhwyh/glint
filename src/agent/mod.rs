@@ -9,6 +9,14 @@ mod tools;
 pub use context::RuntimeContext;
 pub use runner::{AgentRunInput, spawn_agent_loop};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_prompt_tokens: Option<u64>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum AgentStatus {
     Idle,
@@ -20,6 +28,7 @@ pub enum AgentStatus {
 pub enum AgentEvent {
     Started,
     AssistantDelta(String),
+    Usage(TokenUsage),
     ToolStarted {
         id: String,
         name: String,

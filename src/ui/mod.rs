@@ -78,7 +78,7 @@ fn document(app: &App, width: u16) -> Document {
     );
     lines.push(box_bottom(width));
     lines.push(info_line(app, width));
-    lines.push(context_line(width));
+    lines.push(context_line(app, width));
     lines.push(permission_line(app));
 
     let (input_cursor_x, input_cursor_row) = input_cursor_position(app, width);
@@ -515,19 +515,18 @@ fn info_line(app: &App, _width: u16) -> Line<'static> {
     ])
 }
 
-fn context_line(_width: u16) -> Line<'static> {
-    const CONTEXT_PERCENT: u8 = 0;
-    const CACHE_PERCENT: u8 = 0;
-    const TOKEN_COUNT: u64 = 0;
+fn context_line(app: &App, _width: u16) -> Line<'static> {
+    let context_percent = app.usage.context_percent(app.config.llm.context_window);
+    let cache_percent = app.usage.cache_percent();
 
     let mut spans = vec![
         metric_label("CONTEXT"),
         Span::styled(
-            progress_bar(CONTEXT_PERCENT, 12),
+            progress_bar(context_percent.unwrap_or(0), 12),
             Style::default().fg(Color::Rgb(34, 211, 238)),
         ),
         Span::styled(
-            format!(" {CONTEXT_PERCENT}%"),
+            percent_text(context_percent),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
@@ -535,7 +534,7 @@ fn context_line(_width: u16) -> Line<'static> {
         Span::raw("  "),
         metric_label("CACHE"),
         Span::styled(
-            format!("{CACHE_PERCENT}%"),
+            percent_text(cache_percent).trim().to_owned(),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
@@ -545,7 +544,7 @@ fn context_line(_width: u16) -> Line<'static> {
     spans.push(Span::raw("      "));
     spans.push(metric_label("TOKENS"));
     spans.push(Span::styled(
-        TOKEN_COUNT.to_string(),
+        app.usage.total_tokens.to_string(),
         Style::default()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
@@ -576,6 +575,12 @@ fn permission_line(app: &App) -> Line<'static> {
             ),
         ])
     }
+}
+
+fn percent_text(percent: Option<u8>) -> String {
+    percent
+        .map(|percent| format!(" {percent}%"))
+        .unwrap_or_else(|| " —".to_owned())
 }
 
 fn metric_label(text: &'static str) -> Span<'static> {

@@ -6,8 +6,11 @@ use serde_json::Value;
 
 use crate::config::LlmConfig;
 
-use super::provider::{
-    FinishReason, ModelMessage, ModelProvider, ModelRequest, ModelResponse, ToolCall, ToolSpec,
+use super::{
+    TokenUsage,
+    provider::{
+        FinishReason, ModelMessage, ModelProvider, ModelRequest, ModelResponse, ToolCall, ToolSpec,
+    },
 };
 
 const MAX_STREAM_TOOL_CALLS: usize = 16;
@@ -45,6 +48,8 @@ struct ChatRequest {
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ChatTool>>,
 }
@@ -86,14 +91,22 @@ struct ChatToolCallFunction {
     arguments: String,
 }
 
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
+}
+
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    usage: Option<OpenAiUsage>,
 }
 
 #[derive(Deserialize)]
 struct StreamResponse {
+    #[serde(default)]
     choices: Vec<StreamChoice>,
+    usage: Option<OpenAiUsage>,
 }
 
 #[derive(Deserialize)]
@@ -122,12 +135,44 @@ struct StreamToolCallFunction {
     arguments: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct OpenAiUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+}
+
+impl From<OpenAiUsage> for TokenUsage {
+    fn from(usage: OpenAiUsage) -> Self {
+        Self {
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            cached_prompt_tokens: usage
+                .prompt_tokens_details
+                .map(|details| details.cached_tokens),
+        }
+    }
+}
+
 #[derive(Default)]
 struct StreamingState {
     saw_done: bool,
     assistant_text: String,
     tool_calls: Vec<StreamingToolCall>,
     finish_reason: Option<String>,
+    usage: Option<TokenUsage>,
 }
 
 #[derive(Default)]
@@ -161,6 +206,7 @@ fn complete_chat(config: &LlmConfig, request: ModelRequest) -> Result<ModelRespo
         temperature: config.temperature,
         max_tokens: config.max_tokens,
         stream: None,
+        stream_options: None,
         tools: chat_tools(request.tools),
     };
 
@@ -178,7 +224,7 @@ fn complete_chat(config: &LlmConfig, request: ModelRequest) -> Result<ModelRespo
         .next()
         .context("response did not include a choice")?;
 
-    model_response_from_choice(choice)
+    model_response_from_choice(choice, response.usage.map(TokenUsage::from))
 }
 
 fn stream_chat(
@@ -196,6 +242,9 @@ fn stream_chat(
         temperature: config.temperature,
         max_tokens: config.max_tokens,
         stream: Some(true),
+        stream_options: Some(StreamOptions {
+            include_usage: true,
+        }),
         tools: chat_tools(request.tools),
     };
 
@@ -285,7 +334,7 @@ fn chat_tools(tools: Vec<ToolSpec>) -> Option<Vec<ChatTool>> {
     )
 }
 
-fn model_response_from_choice(choice: Choice) -> Result<ModelResponse> {
+fn model_response_from_choice(choice: Choice, usage: Option<TokenUsage>) -> Result<ModelResponse> {
     let tool_calls = choice
         .message
         .tool_calls
@@ -298,6 +347,7 @@ fn model_response_from_choice(choice: Choice) -> Result<ModelResponse> {
         assistant_text: choice.message.content,
         tool_calls,
         finish_reason: finish_reason(choice.finish_reason),
+        usage,
     })
 }
 
@@ -322,6 +372,10 @@ impl StreamingState {
         chunk: StreamResponse,
         on_delta: &mut dyn FnMut(String),
     ) -> Result<()> {
+        if let Some(usage) = chunk.usage {
+            self.usage = Some(usage.into());
+        }
+
         let Some(choice) = chunk.choices.into_iter().next() else {
             return Ok(());
         };
@@ -392,6 +446,7 @@ impl StreamingState {
             assistant_text,
             tool_calls,
             finish_reason,
+            usage: self.usage,
         })
     }
 
@@ -476,6 +531,62 @@ mod tests {
         assert_eq!(deltas, vec!["hel", "lo"]);
         assert_eq!(response.assistant_text.as_deref(), Some("hello"));
         assert_eq!(response.finish_reason, FinishReason::Stop);
+        assert_eq!(response.usage, None);
+    }
+
+    #[test]
+    fn streaming_state_records_usage_chunk_without_choices() {
+        let mut state = StreamingState::default();
+        let mut deltas = Vec::new();
+
+        state
+            .apply_chunk(
+                StreamResponse {
+                    choices: Vec::new(),
+                    usage: Some(OpenAiUsage {
+                        prompt_tokens: 100,
+                        completion_tokens: 25,
+                        total_tokens: 125,
+                        prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: 40 }),
+                    }),
+                },
+                &mut |delta| deltas.push(delta),
+            )
+            .unwrap();
+
+        let response = state.into_model_response().unwrap();
+        assert!(deltas.is_empty());
+        assert_eq!(
+            response.usage.map(|usage| usage.cached_prompt_tokens),
+            Some(Some(40))
+        );
+    }
+
+    #[test]
+    fn streaming_state_records_usage_without_cache_details() {
+        let mut state = StreamingState::default();
+        let mut deltas = Vec::new();
+
+        state
+            .apply_chunk(
+                StreamResponse {
+                    choices: Vec::new(),
+                    usage: Some(OpenAiUsage {
+                        prompt_tokens: 100,
+                        completion_tokens: 25,
+                        total_tokens: 125,
+                        prompt_tokens_details: None,
+                    }),
+                },
+                &mut |delta| deltas.push(delta),
+            )
+            .unwrap();
+
+        let response = state.into_model_response().unwrap();
+        assert_eq!(
+            response.usage.map(|usage| usage.cached_prompt_tokens),
+            Some(None)
+        );
     }
 
     #[test]
@@ -528,6 +639,7 @@ mod tests {
                 },
                 finish_reason: finish_reason.map(str::to_owned),
             }],
+            usage: None,
         }
     }
 
@@ -555,6 +667,7 @@ mod tests {
                 },
                 finish_reason: finish_reason.map(str::to_owned),
             }],
+            usage: None,
         }
     }
 }

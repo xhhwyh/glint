@@ -99,6 +99,7 @@ pub struct ModelResponse {
     pub assistant_text: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: FinishReason,
+    pub usage: Option<super::TokenUsage>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

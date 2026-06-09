@@ -106,6 +106,10 @@ fn run_model_turns(
             )
             .context("model request failed")?;
 
+        if let Some(usage) = response.usage {
+            tx.send(AgentEvent::Usage(usage)).ok();
+        }
+
         if !response.tool_calls.is_empty() {
             tool_iterations += 1;
             if tool_iterations > MAX_TOOL_ITERATIONS {
@@ -445,6 +449,7 @@ mod tests {
                 model: "test-model".to_owned(),
                 temperature: 0.0,
                 max_tokens: 100,
+                context_window: Some(1000),
                 api_key: "test-key".to_owned(),
             },
             system_prompt: "system".to_owned(),
@@ -467,6 +472,7 @@ mod tests {
             assistant_text: Some(text.to_owned()),
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
+            usage: None,
         }
     }
 
@@ -479,6 +485,7 @@ mod tests {
                 arguments: json!({ "path": "Cargo.toml" }),
             }],
             finish_reason: FinishReason::ToolCalls,
+            usage: None,
         }
     }
 

@@ -89,9 +89,10 @@ fn requires_path_approval(call: &ToolCall) -> bool {
     let path = string_arg(call, "file_path").or_else(|| string_arg(call, "path"));
     path.is_some_and(|path| {
         is_protected_path(path)
-            || workspace_path(path)
-                .ok()
-                .is_some_and(|path| is_protected_path(&path.display().to_string()))
+            || (Path::new(path).is_absolute()
+                && workspace_path(path)
+                    .ok()
+                    .is_some_and(|path| is_protected_path(&path.display().to_string())))
     })
 }
 

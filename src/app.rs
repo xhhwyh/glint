@@ -1,7 +1,7 @@
 use std::sync::mpsc::{self, Receiver};
 
 use crate::{
-    agent::{self, AgentEvent, AgentRunInput, AgentStatus, RuntimeContext},
+    agent::{self, AgentEvent, AgentRunInput, AgentStatus, RuntimeContext, TokenUsage},
     approval::{AgentControl, ApprovalFocus, ApprovalPrompt, ConversationPermissions},
     config::Config,
     event::{AppEvent, KeyAction, MouseAction},
@@ -15,6 +15,7 @@ pub struct App {
     pub input: InputState,
     pub status: AgentStatus,
     pub scroll: u16,
+    pub usage: ConversationUsage,
     pub agent_events: Receiver<AgentEvent>,
     pub config: Config,
     pub current_dir: String,
@@ -23,6 +24,45 @@ pub struct App {
     pub conversation_permissions: ConversationPermissions,
     agent_control_tx: Option<mpsc::Sender<AgentControl>>,
     agent_tx: mpsc::Sender<AgentEvent>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConversationUsage {
+    pub last_usage: Option<TokenUsage>,
+    pub total_prompt_tokens: u64,
+    pub total_completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+impl ConversationUsage {
+    pub fn record(self, usage: TokenUsage) -> Self {
+        Self {
+            last_usage: Some(usage),
+            total_prompt_tokens: self.total_prompt_tokens + usage.prompt_tokens,
+            total_completion_tokens: self.total_completion_tokens + usage.completion_tokens,
+            total_tokens: self.total_tokens + usage.total_tokens,
+        }
+    }
+
+    pub fn context_percent(self, context_window: Option<u64>) -> Option<u8> {
+        let prompt_tokens = self.last_usage?.prompt_tokens;
+        let context_window = context_window.filter(|window| *window > 0)?;
+        Some(percent(prompt_tokens, context_window))
+    }
+
+    pub fn cache_percent(self) -> Option<u8> {
+        let usage = self.last_usage?;
+        let cached_prompt_tokens = usage.cached_prompt_tokens?;
+        if usage.prompt_tokens == 0 {
+            return None;
+        }
+
+        Some(percent(cached_prompt_tokens, usage.prompt_tokens))
+    }
+}
+
+fn percent(value: u64, total: u64) -> u8 {
+    (value.saturating_mul(100) / total).min(100) as u8
 }
 
 impl App {
@@ -34,6 +74,7 @@ impl App {
             input: InputState::default(),
             status: AgentStatus::Idle,
             scroll: 0,
+            usage: ConversationUsage::default(),
             agent_events,
             config,
             current_dir: current_dir_label(),
@@ -190,6 +231,7 @@ impl App {
                 self.agent_activity = None;
                 self.append_assistant_delta(&delta);
             }
+            AgentEvent::Usage(usage) => self.usage = self.usage.record(usage),
             AgentEvent::ToolStarted {
                 id,
                 name,
@@ -293,4 +335,100 @@ fn current_dir_label() -> String {
     std::env::current_dir()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| "?".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_latest_usage_and_accumulates_totals() {
+        let usage = ConversationUsage::default()
+            .record(TokenUsage {
+                prompt_tokens: 100,
+                completion_tokens: 25,
+                total_tokens: 125,
+                cached_prompt_tokens: Some(40),
+            })
+            .record(TokenUsage {
+                prompt_tokens: 200,
+                completion_tokens: 50,
+                total_tokens: 250,
+                cached_prompt_tokens: Some(100),
+            });
+
+        assert_eq!(usage.total_prompt_tokens, 300);
+        assert_eq!(usage.total_completion_tokens, 75);
+        assert_eq!(usage.total_tokens, 375);
+        assert_eq!(usage.last_usage.map(|last| last.prompt_tokens), Some(200));
+    }
+
+    #[test]
+    fn computes_context_percent_from_latest_prompt_tokens() {
+        let usage = ConversationUsage::default().record(TokenUsage {
+            prompt_tokens: 375,
+            completion_tokens: 25,
+            total_tokens: 400,
+            cached_prompt_tokens: Some(40),
+        });
+
+        assert_eq!(usage.context_percent(Some(1000)), Some(37));
+        assert_eq!(usage.context_percent(Some(0)), None);
+        assert_eq!(usage.context_percent(None), None);
+    }
+
+    #[test]
+    fn caps_context_percent_at_one_hundred() {
+        let usage = ConversationUsage::default().record(TokenUsage {
+            prompt_tokens: 1200,
+            completion_tokens: 25,
+            total_tokens: 1225,
+            cached_prompt_tokens: Some(40),
+        });
+
+        assert_eq!(usage.context_percent(Some(1000)), Some(100));
+    }
+
+    #[test]
+    fn computes_cache_percent_when_cached_tokens_are_reported() {
+        let usage = ConversationUsage::default().record(TokenUsage {
+            prompt_tokens: 300,
+            completion_tokens: 25,
+            total_tokens: 325,
+            cached_prompt_tokens: Some(140),
+        });
+
+        assert_eq!(usage.cache_percent(), Some(46));
+    }
+
+    #[test]
+    fn returns_no_cache_percent_without_cache_data_or_prompt_tokens() {
+        let missing_cache = ConversationUsage::default().record(TokenUsage {
+            prompt_tokens: 300,
+            completion_tokens: 25,
+            total_tokens: 325,
+            cached_prompt_tokens: None,
+        });
+        let zero_prompt = ConversationUsage::default().record(TokenUsage {
+            prompt_tokens: 0,
+            completion_tokens: 25,
+            total_tokens: 25,
+            cached_prompt_tokens: Some(10),
+        });
+
+        assert_eq!(missing_cache.cache_percent(), None);
+        assert_eq!(zero_prompt.cache_percent(), None);
+    }
+
+    #[test]
+    fn caps_cache_percent_at_one_hundred() {
+        let usage = ConversationUsage::default().record(TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 25,
+            total_tokens: 125,
+            cached_prompt_tokens: Some(140),
+        });
+
+        assert_eq!(usage.cache_percent(), Some(100));
+    }
 }

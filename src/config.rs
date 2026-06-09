@@ -13,6 +13,7 @@ pub struct LlmConfig {
     pub model: String,
     pub temperature: f32,
     pub max_tokens: u32,
+    pub context_window: Option<u64>,
     pub api_key: String,
 }
 
@@ -28,6 +29,7 @@ struct FileLlmConfig {
     api_key_env: String,
     temperature: f32,
     max_tokens: u32,
+    context_window: Option<u64>,
 }
 
 impl Config {
@@ -45,6 +47,7 @@ impl Config {
                 model: config.llm.model,
                 temperature: config.llm.temperature,
                 max_tokens: config.llm.max_tokens,
+                context_window: config.llm.context_window,
                 api_key,
             },
             system_prompt,
