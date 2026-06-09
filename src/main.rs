@@ -1,9 +1,11 @@
 mod agent;
 mod app;
+mod approval;
 mod config;
 mod event;
 mod input;
 mod message;
+mod settings;
 mod ui;
 
 use std::{io, time::Duration};

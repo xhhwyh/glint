@@ -1,4 +1,4 @@
-#[derive(Default)]
+#[derive(Default, Clone, Debug)]
 pub struct InputState {
     pub value: String,
     pub cursor: usize,

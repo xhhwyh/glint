@@ -4,6 +4,7 @@ use serde::Deserialize;
 #[derive(Clone)]
 pub struct Config {
     pub llm: LlmConfig,
+    pub system_prompt: String,
 }
 
 #[derive(Clone)]
@@ -33,6 +34,8 @@ impl Config {
     pub fn load() -> Result<Self> {
         let file = std::fs::read_to_string("config.toml").context("failed to read config.toml")?;
         let config: FileConfig = toml::from_str(&file).context("failed to parse config.toml")?;
+        let system_prompt = std::fs::read_to_string("prompts/system.md")
+            .context("failed to read prompts/system.md")?;
         let api_key = std::env::var(&config.llm.api_key_env)
             .with_context(|| format!("{} must be set", config.llm.api_key_env))?;
 
@@ -44,6 +47,7 @@ impl Config {
                 max_tokens: config.llm.max_tokens,
                 api_key,
             },
+            system_prompt,
         })
     }
 }

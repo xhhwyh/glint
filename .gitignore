@@ -2,6 +2,9 @@
 
 env.sh
 
+# Local Glint permissions/settings
+.glint/settings.local.json
+
 # Local Claude Code permissions/settings
 .claude/settings.local.json
 

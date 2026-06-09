@@ -14,6 +14,7 @@ pub enum MouseAction {
     None,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyAction {
     Quit,
     Submit,
@@ -24,6 +25,8 @@ pub enum KeyAction {
     Right,
     Up,
     Down,
+    Tab,
+    CancelConversationPermission,
     None,
 }
 
@@ -31,9 +34,13 @@ impl From<KeyEvent> for KeyAction {
     fn from(key: KeyEvent) -> Self {
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Self::Quit,
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Self::CancelConversationPermission
+            }
             KeyCode::Char(char) => Self::Char(char),
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => Self::Newline,
             KeyCode::Enter => Self::Submit,
+            KeyCode::Tab => Self::Tab,
             KeyCode::Backspace => Self::Backspace,
             KeyCode::Left => Self::Left,
             KeyCode::Right => Self::Right,

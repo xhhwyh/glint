@@ -7,7 +7,11 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::{app::App, message::Role};
+use crate::{
+    app::App,
+    approval::{ApprovalChoice, ApprovalFocus},
+    message::Role,
+};
 
 mod markdown;
 mod star;
@@ -50,6 +54,21 @@ fn document(app: &App, width: u16) -> Document {
         lines.push(Line::from(""));
     }
 
+    let mut approval_cursor = None;
+    if app.approval.is_some() {
+        lines.extend(approval_lines(app, width));
+        if matches!(
+            app.approval.as_ref().map(|approval| &approval.focus),
+            Some(ApprovalFocus::Feedback)
+        ) {
+            approval_cursor = Some((
+                approval_feedback_cursor_x(app, width),
+                lines.len() as u16 - 2,
+            ));
+        }
+        lines.push(Line::from(""));
+    }
+
     let input_y = lines.len() as u16;
     lines.push(box_top("INPUT", width));
     lines.extend(
@@ -60,12 +79,15 @@ fn document(app: &App, width: u16) -> Document {
     lines.push(box_bottom(width));
     lines.push(info_line(app, width));
     lines.push(context_line(width));
+    lines.push(permission_line(app));
 
-    let (cursor_x, cursor_row) = input_cursor_position(app, width);
+    let (input_cursor_x, input_cursor_row) = input_cursor_position(app, width);
+    let (cursor_x, cursor_y) =
+        approval_cursor.unwrap_or((input_cursor_x, input_y + input_cursor_row + 1));
     Document {
         lines,
         cursor_x,
-        cursor_y: input_y + cursor_row + 1,
+        cursor_y,
     }
 }
 
@@ -215,10 +237,107 @@ fn center_spans(mut spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static
     centered
 }
 
+fn approval_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let Some(approval) = &app.approval else {
+        return Vec::new();
+    };
+
+    let mut lines = vec![box_top("APPROVAL", width)];
+    lines.extend(
+        wrap_text(&approval.request.command, width.saturating_sub(6))
+            .into_iter()
+            .map(|row| {
+                box_body_styled(
+                    &format!("$ {row}"),
+                    width,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                )
+            }),
+    );
+    lines.extend(
+        wrap_text(&approval.request.explanation, width.saturating_sub(6))
+            .into_iter()
+            .map(|row| box_body_styled(&row, width, Style::default().fg(Color::DarkGray))),
+    );
+    lines.push(box_body_styled("", width, Style::default()));
+
+    for choice in [
+        ApprovalChoice::Yes,
+        ApprovalChoice::Always,
+        ApprovalChoice::No,
+    ] {
+        let label = match choice {
+            ApprovalChoice::Yes => "yes",
+            ApprovalChoice::Always => approval.always_label(),
+            ApprovalChoice::No => "no",
+        };
+        let selected = approval.selected == choice;
+        let style = if selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(box_body_styled(
+            &format!("{} {label}", if selected { "›" } else { " " }),
+            width,
+            style,
+        ));
+        if choice == ApprovalChoice::No {
+            let feedback = if approval.feedback.value.is_empty() {
+                "feedback: ".to_owned()
+            } else {
+                format!("feedback: {}", approval.feedback.value)
+            };
+            let style = if approval.focus == ApprovalFocus::Feedback {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            lines.push(box_body_styled(&format!("  {feedback}"), width, style));
+        }
+    }
+
+    lines.push(box_bottom(width));
+    lines
+}
+
+fn approval_feedback_cursor_x(app: &App, width: u16) -> u16 {
+    let Some(approval) = &app.approval else {
+        return 0;
+    };
+    let prefix_width = "  feedback: ".width();
+    let value_width = approval.feedback.value[..approval.feedback.cursor].width();
+    (prefix_width + value_width + 2).min(width.saturating_sub(1) as usize) as u16
+}
+
+fn box_body_styled(text: &str, width: u16, style: Style) -> Line<'static> {
+    let width = width as usize;
+    if width < 4 {
+        return Line::from(Span::styled(text.to_owned(), style));
+    }
+
+    let text_width = text.width();
+    let padding = width.saturating_sub(text_width + 4);
+    Line::from(vec![
+        Span::styled("┃ ", Style::default().fg(Color::Blue)),
+        Span::styled(text.to_owned(), style),
+        Span::raw(" ".repeat(padding)),
+        Span::styled(" ┃", Style::default().fg(Color::Blue)),
+    ])
+}
+
 fn transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     app.messages
         .iter()
         .flat_map(|message| {
+            if message.role == Role::Tool {
+                return tool_message_lines(message, width);
+            }
+
             let role = match message.role {
                 Role::User => Line::from(vec![Span::styled(
                     " YOU ",
@@ -234,14 +353,19 @@ fn transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                         .bg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 )]),
+                Role::Tool => unreachable!(),
             };
 
             let mut lines = vec![Line::from(""), role, Line::from("")];
             if message.role == Role::Assistant && message.content.is_empty() {
+                let activity = app
+                    .agent_activity
+                    .clone()
+                    .unwrap_or_else(|| "Processing...".to_owned());
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
                     Span::styled(
-                        "Processing...",
+                        activity,
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::RAPID_BLINK | Modifier::ITALIC),
@@ -259,6 +383,60 @@ fn transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             lines
         })
         .collect()
+}
+
+fn tool_message_lines(message: &crate::message::Message, width: u16) -> Vec<Line<'static>> {
+    let name = message.tool_name.as_deref().unwrap_or("Tool");
+    let input = message.tool_input.as_deref().unwrap_or("");
+
+    let mut lines = vec![Line::from("")];
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("◇ {name}"),
+            Style::default()
+                .fg(Color::Rgb(96, 165, 250))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {input}"),
+            Style::default().fg(Color::Rgb(147, 197, 253)),
+        ),
+    ]));
+
+    if name == "Read" {
+        return lines;
+    }
+
+    let result = if message.content.is_empty() && !message.tool_finished {
+        Some("Tooling...")
+    } else if message.content.is_empty() {
+        None
+    } else {
+        Some(message.content.as_str())
+    };
+
+    let Some(result) = result else {
+        return lines;
+    };
+
+    for row in wrap_text(result, width.saturating_sub(6)) {
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(
+                row,
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(if !message.tool_finished {
+                        Modifier::ITALIC
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+        ]));
+    }
+
+    lines
 }
 
 fn wrap_text(text: &str, width: u16) -> Vec<String> {
@@ -374,6 +552,30 @@ fn context_line(_width: u16) -> Line<'static> {
     ));
 
     Line::from(spans)
+}
+
+fn permission_line(app: &App) -> Line<'static> {
+    if app.conversation_permissions.edit_always_allowed {
+        Line::from(vec![
+            metric_label("PERMS"),
+            Span::styled(
+                "Edit auto-approved for this conversation",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled("[CTRL+K] cancel", Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        Line::from(vec![
+            metric_label("PERMS"),
+            Span::styled(
+                "standard approval policy",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    }
 }
 
 fn metric_label(text: &'static str) -> Span<'static> {
