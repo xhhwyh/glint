@@ -1,5 +1,5 @@
 [llm]
-provider="ftai"
+provider="deepseek"
 temperature = 0.7
 max_tokens = 8196
 

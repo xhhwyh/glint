@@ -1,4 +1,7 @@
 /target/
+.worktree/
+
+docs/
 
 env.sh
 
