@@ -25,18 +25,25 @@ There are currently no committed tests, so `cargo test` should report zero tests
 
 ## Runtime Configuration
 
-`Config::load` reads `config.toml` from the current working directory at startup. The config shape is:
+`Config::load` reads `config.toml`, `model-info.toml`, and `prompts/system.md` from the current working directory. The selected `llm.provider` must match an entry under `llm.providers`, and the selected `llm.model` must be listed in that provider's `models`:
 
 ```toml
 [llm]
-base_url = "https://example.com/v1"
+provider = "default"
 model = "model-name"
-api_key_env = "LLM_API_KEY"
 temperature = 0.7
 max_tokens = 8196
+context_window = 65536 # optional
+
+[llm.providers.default]
+base_url = "https://example.com/v1"
+models = ["model-name", "other-model"]
+api_key_env = "LLM_API_KEY"
 ```
 
-The API key itself must come from the environment variable named by `api_key_env`; do not hardcode secrets in source or docs. The current HTTP client targets the OpenAI-compatible `POST {base_url}/chat/completions` endpoint and expects a response with `choices[0].message.content`.
+Provider entries own `base_url`, `models`, and `api_key_env`; global LLM settings own the selected `provider`, selected `model`, `temperature`, `max_tokens`, and optional `context_window`. API keys must come from the environment variable named by `api_key_env`; do not hardcode secrets in source or docs. The HTTP client targets `POST {base_url}/chat/completions` and expects `choices[0].message.content`.
+
+`model-info.toml` stores display-only metadata for the `/model` picker: provider summaries and model positioning/context/pricing notes. It should not contain secrets.
 
 ## Architecture
 

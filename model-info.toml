@@ -1,0 +1,105 @@
+[providers.ftai]
+summary = "Internal proxy for shared model access"
+
+[providers.deepseek]
+summary = "DeepSeek official OpenAI-compatible endpoint"
+
+[providers.volcengine]
+summary = "Volcengine Ark endpoint for hosted model deployments"
+
+[providers.zhipu]
+summary = "Zhipu GLM endpoint for general Chinese and bilingual work"
+
+[providers.kimi]
+summary = "Moonshot Kimi endpoint with long-context options"
+
+[providers.dashscope]
+summary = "Alibaba DashScope compatible-mode endpoint for Qwen models"
+
+[providers.openrouter]
+summary = "OpenRouter gateway for multiple upstream model families"
+
+[models.deepseek-v4-flash]
+positioning = "Fast general-purpose DeepSeek-style chat"
+context = "Provider-defined"
+price = "Provider billing"
+
+[models.deepseek-chat]
+positioning = "General chat and coding"
+context = "DeepSeek context policy"
+price = "Provider billing"
+
+[models.deepseek-reasoner]
+positioning = "Reasoning-focused DeepSeek model"
+context = "DeepSeek context policy"
+price = "Provider billing"
+
+[models.deepseek-v3-250324]
+positioning = "Hosted DeepSeek V3 deployment"
+context = "Deployment-defined"
+price = "Volcengine billing"
+
+[models.deepseek-r1-250120]
+positioning = "Hosted DeepSeek R1 reasoning deployment"
+context = "Deployment-defined"
+price = "Volcengine billing"
+
+[models.glm-4-flash]
+positioning = "Fast GLM model for lightweight chat"
+context = "Zhipu context policy"
+price = "Zhipu billing"
+
+[models.glm-4-plus]
+positioning = "Higher-capability GLM model"
+context = "Zhipu context policy"
+price = "Zhipu billing"
+
+[models.moonshot-v1-8k]
+positioning = "Kimi short-context chat"
+context = "8K"
+price = "Moonshot billing"
+
+[models.moonshot-v1-32k]
+positioning = "Kimi medium-context chat"
+context = "32K"
+price = "Moonshot billing"
+
+[models.moonshot-v1-128k]
+positioning = "Kimi long-context chat"
+context = "128K"
+price = "Moonshot billing"
+
+[models.qwen-plus]
+positioning = "Balanced Qwen model"
+context = "DashScope policy"
+price = "DashScope billing"
+
+[models.qwen-turbo]
+positioning = "Fast Qwen model"
+context = "DashScope policy"
+price = "DashScope billing"
+
+[models.qwen-max]
+positioning = "Higher-capability Qwen model"
+context = "DashScope policy"
+price = "DashScope billing"
+
+[models."deepseek/deepseek-chat"]
+positioning = "OpenRouter routed DeepSeek chat"
+context = "Upstream-defined"
+price = "OpenRouter billing"
+
+[models."openai/gpt-4.1-mini"]
+positioning = "Compact OpenAI model for fast general work"
+context = "Upstream-defined"
+price = "OpenRouter billing"
+
+[models."anthropic/claude-3.5-sonnet"]
+positioning = "Anthropic Sonnet model for reasoning and writing"
+context = "Upstream-defined"
+price = "OpenRouter billing"
+
+[models.gpt-4.1-mini]
+positioning = "Compact OpenAI model for fast general work"
+context = "Provider-defined"
+price = "Provider billing"

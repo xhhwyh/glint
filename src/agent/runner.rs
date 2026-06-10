@@ -411,7 +411,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::agent::provider::{ModelRole, ToolResult};
+    use crate::{
+        agent::provider::{ModelRole, ToolResult},
+        config::LlmProviderConfig,
+    };
 
     struct FakeProvider {
         responses: VecDeque<ModelResponse>,
@@ -450,8 +453,15 @@ mod tests {
     fn input() -> AgentRunInput {
         AgentRunInput {
             llm: LlmConfig {
+                provider: "test".to_owned(),
                 base_url: "http://localhost".to_owned(),
                 model: "test-model".to_owned(),
+                providers: vec![LlmProviderConfig {
+                    name: "test".to_owned(),
+                    base_url: "http://localhost".to_owned(),
+                    models: vec!["test-model".to_owned()],
+                    api_key_env: "TEST_API_KEY".to_owned(),
+                }],
                 temperature: 0.0,
                 max_tokens: 100,
                 context_window: Some(1000),

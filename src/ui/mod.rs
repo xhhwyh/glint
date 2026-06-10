@@ -8,7 +8,7 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    app::App,
+    app::{App, ModelPickerStage},
     approval::{ApprovalChoice, ApprovalFocus},
     message::Role,
 };
@@ -77,9 +77,15 @@ fn document(app: &App, width: u16) -> Document {
             .map(|row| box_input_body(&row, width)),
     );
     lines.push(box_bottom(width));
-    lines.push(info_line(app, width));
-    lines.push(context_line(app, width));
-    lines.push(permission_line(app));
+    if app.model_picker.is_some() {
+        lines.extend(model_picker_lines(app, width));
+    } else if app.slash_menu_visible() {
+        lines.extend(slash_command_lines(app, width));
+    } else {
+        lines.push(info_line(app, width));
+        lines.push(context_line(app, width));
+        lines.push(permission_line(app));
+    }
 
     let (input_cursor_x, input_cursor_row) = input_cursor_position(app, width);
     let (cursor_x, cursor_y) =
@@ -338,25 +344,11 @@ fn transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 return tool_message_lines(message, width);
             }
 
-            let role = match message.role {
-                Role::User => Line::from(vec![Span::styled(
-                    " YOU ",
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(Color::Blue)
-                        .add_modifier(Modifier::BOLD),
-                )]),
-                Role::Assistant => Line::from(vec![Span::styled(
-                    " AGENT ",
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )]),
-                Role::Tool => unreachable!(),
-            };
+            if message.role == Role::User {
+                return user_message_lines(message, width);
+            }
 
-            let mut lines = vec![Line::from(""), role, Line::from("")];
+            let mut lines = vec![Line::from("")];
             if message.role == Role::Assistant && message.content.is_empty() {
                 let activity = app
                     .agent_activity
@@ -383,6 +375,43 @@ fn transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             lines
         })
         .collect()
+}
+
+fn user_message_lines(message: &crate::message::Message, width: u16) -> Vec<Line<'static>> {
+    let rule = user_rule(width);
+    let mut lines = vec![Line::from(""), rule.clone()];
+    let mut markdown_lines =
+        markdown::render_markdown(&message.content, width.saturating_sub(4));
+    trim_empty_lines(&mut markdown_lines);
+
+    for (index, mut line) in markdown_lines.into_iter().enumerate() {
+        let prefix = if index == 0 { "  ▶ " } else { "    " };
+        let mut spans = vec![Span::raw(prefix)];
+        spans.append(&mut line.spans);
+        lines.push(Line::from(spans));
+    }
+    lines.push(rule);
+    lines
+}
+
+fn trim_empty_lines(lines: &mut Vec<Line<'static>>) {
+    while lines.last().is_some_and(line_is_empty) {
+        lines.pop();
+    }
+    while lines.first().is_some_and(line_is_empty) {
+        lines.remove(0);
+    }
+}
+
+fn line_is_empty(line: &Line<'static>) -> bool {
+    line.spans.iter().all(|span| span.content.is_empty())
+}
+
+fn user_rule(width: u16) -> Line<'static> {
+    Line::from(Span::styled(
+        "─".repeat(width as usize),
+        Style::default().fg(Color::DarkGray),
+    ))
 }
 
 fn tool_message_lines(message: &crate::message::Message, width: u16) -> Vec<Line<'static>> {
@@ -498,6 +527,188 @@ fn input_cursor_position(app: &App, width: u16) -> (u16, u16) {
 
 fn input_content_width(width: u16) -> usize {
     width.saturating_sub(6).max(1) as usize
+}
+
+fn slash_command_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
+    let matches = app.slash_command_matches();
+    if matches.is_empty() {
+        return vec![Line::from(vec![
+            Span::raw("  "),
+            Span::styled("No matching slash command", Style::default().fg(Color::DarkGray)),
+        ])];
+    }
+
+    matches
+        .iter()
+        .enumerate()
+        .map(|(index, command)| {
+            let selected = index == app.slash_command_selection;
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(if selected { "› " } else { "  " }, style),
+                Span::styled(command.name, style),
+                Span::styled("  ", style),
+                Span::styled(command.description, style),
+            ])
+        })
+        .collect()
+}
+
+fn model_picker_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
+    let Some(picker) = &app.model_picker else {
+        return Vec::new();
+    };
+
+    let title = match picker.stage {
+        ModelPickerStage::Provider => "Select Provider",
+        ModelPickerStage::Model => "Select Model",
+    };
+    let help = match picker.stage {
+        ModelPickerStage::Provider => {
+            "Choose a provider endpoint. Enter continues to model selection; Backspace cancels."
+        }
+        ModelPickerStage::Model => {
+            "Choose a model for the selected provider. Enter switches; Backspace returns."
+        }
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(help, Style::default().fg(Color::DarkGray))),
+    ];
+
+    match picker.stage {
+        ModelPickerStage::Provider => {
+            let name_width = app
+                .config
+                .llm
+                .providers
+                .iter()
+                .map(|provider| provider.name.width())
+                .max()
+                .unwrap_or(0);
+            for (index, provider) in app.config.llm.providers.iter().enumerate() {
+                let selected = index == picker.selected_provider;
+                let style = if selected {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(if selected { "› " } else { "  " }, style),
+                    Span::styled(pad_to_width(&provider.name, name_width), style),
+                    Span::styled("  ", style),
+                    Span::styled(
+                        provider_summary(app, provider),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        }
+        ModelPickerStage::Model => {
+            let Some(provider) = app.config.llm.providers.get(picker.selected_provider) else {
+                return lines;
+            };
+            lines.push(Line::from(vec![
+                Span::styled("Provider ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    provider.name.clone(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+
+            let name_width = provider
+                .models
+                .iter()
+                .map(|model| model.width())
+                .max()
+                .unwrap_or(0);
+            for (model_index, model) in provider.models.iter().enumerate() {
+                let selected = model_index == picker.selected_model;
+                let current =
+                    provider.name == app.config.llm.provider && model == &app.config.llm.model;
+                let style = if selected {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let current_marker = if current { " current" } else { "" };
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(if selected { "› " } else { "  " }, style),
+                    Span::styled(pad_to_width(model, name_width), style),
+                    Span::styled("  ", style),
+                    Span::styled(
+                        model_summary(app, model),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        current_marker,
+                        Style::default().fg(Color::Rgb(147, 197, 253)),
+                    ),
+                ]));
+            }
+        }
+    }
+
+    lines
+}
+
+fn provider_summary(app: &App, provider: &crate::config::LlmProviderConfig) -> String {
+    app.config
+        .model_catalog
+        .providers
+        .get(&provider.name)
+        .map(|entry| entry.summary.as_str())
+        .filter(|summary| !summary.is_empty())
+        .unwrap_or(&provider.base_url)
+        .to_owned()
+}
+
+fn model_summary(app: &App, model: &str) -> String {
+    let Some(entry) = app.config.model_catalog.models.get(model) else {
+        return "No model metadata".to_owned();
+    };
+
+    let mut parts = Vec::new();
+    if !entry.positioning.is_empty() {
+        parts.push(entry.positioning.clone());
+    }
+    if !entry.context.is_empty() {
+        parts.push(format!("ctx {}", entry.context));
+    }
+    if !entry.price.is_empty() {
+        parts.push(entry.price.clone());
+    }
+
+    if parts.is_empty() {
+        "No model metadata".to_owned()
+    } else {
+        parts.join(" | ")
+    }
+}
+
+fn pad_to_width(text: &str, width: usize) -> String {
+    let padding = width.saturating_sub(text.width());
+    format!("{text}{}", " ".repeat(padding))
 }
 
 fn info_line(app: &App, _width: u16) -> Line<'static> {

@@ -26,6 +26,12 @@ impl InputState {
         self.push('\n');
     }
 
+    pub fn set(&mut self, value: impl Into<String>) {
+        self.value = value.into();
+        self.cursor = self.value.len();
+        self.history_index = None;
+    }
+
     pub fn move_left(&mut self) {
         if let Some((index, _)) = self.value[..self.cursor].char_indices().next_back() {
             self.cursor = index;

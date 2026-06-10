@@ -16,6 +16,8 @@ pub struct App {
     pub status: AgentStatus,
     pub scroll: u16,
     pub usage: ConversationUsage,
+    pub slash_command_selection: usize,
+    pub model_picker: Option<ModelPicker>,
     pub agent_events: Receiver<AgentEvent>,
     pub config: Config,
     pub current_dir: String,
@@ -24,6 +26,37 @@ pub struct App {
     pub conversation_permissions: ConversationPermissions,
     agent_control_tx: Option<mpsc::Sender<AgentControl>>,
     agent_tx: mpsc::Sender<AgentEvent>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlashCommand {
+    pub name: &'static str,
+    pub description: &'static str,
+    kind: SlashCommandKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlashCommandKind {
+    Model,
+}
+
+const SLASH_COMMANDS: [SlashCommand; 1] = [SlashCommand {
+    name: "/model",
+    description: "Switch provider and model",
+    kind: SlashCommandKind::Model,
+}];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelPicker {
+    pub stage: ModelPickerStage,
+    pub selected_provider: usize,
+    pub selected_model: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelPickerStage {
+    Provider,
+    Model,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -75,6 +108,8 @@ impl App {
             status: AgentStatus::Idle,
             scroll: 0,
             usage: ConversationUsage::default(),
+            slash_command_selection: 0,
+            model_picker: None,
             agent_events,
             config,
             current_dir: current_dir_label(),
@@ -107,6 +142,16 @@ impl App {
             self.update_approval_key(key);
             return;
         }
+        if self.model_picker.is_some() {
+            self.update_model_picker_key(key);
+            return;
+        }
+        if self.slash_menu_visible()
+            && matches!(key, KeyAction::Submit | KeyAction::Up | KeyAction::Down)
+        {
+            self.update_slash_menu_key(key);
+            return;
+        }
 
         match key {
             KeyAction::Quit => self.should_quit = true,
@@ -129,6 +174,234 @@ impl App {
             | KeyAction::Right
             | KeyAction::Tab
             | KeyAction::CancelConversationPermission => {}
+        }
+        self.clamp_slash_command_selection();
+    }
+
+    pub fn slash_query(&self) -> Option<&str> {
+        if self.status != AgentStatus::Idle || self.model_picker.is_some() {
+            return None;
+        }
+        let value = self.input.value.as_str();
+        let query = value.strip_prefix('/')?;
+        if query.contains(char::is_whitespace) {
+            return None;
+        }
+        Some(query)
+    }
+
+    pub fn slash_command_matches(&self) -> Vec<SlashCommand> {
+        let Some(query) = self.slash_query() else {
+            return Vec::new();
+        };
+        SLASH_COMMANDS
+            .into_iter()
+            .filter(|command| command.name[1..].starts_with(query))
+            .take(5)
+            .collect()
+    }
+
+    pub fn slash_menu_visible(&self) -> bool {
+        self.slash_query().is_some()
+    }
+
+    fn update_slash_menu_key(&mut self, key: KeyAction) {
+        let matches = self.slash_command_matches();
+        match key {
+            KeyAction::Submit => {
+                if let Some(command) = matches
+                    .get(self.slash_command_selection.min(matches.len().saturating_sub(1)))
+                {
+                    self.run_slash_command(*command);
+                } else {
+                    self.submit_unknown_slash_command();
+                }
+            }
+            KeyAction::Up if !matches.is_empty() => {
+                self.slash_command_selection = self.slash_command_selection.saturating_sub(1);
+            }
+            KeyAction::Down if !matches.is_empty() => {
+                self.slash_command_selection =
+                    (self.slash_command_selection + 1).min(matches.len() - 1);
+            }
+            _ => {}
+        }
+    }
+
+    fn run_slash_command(&mut self, command: SlashCommand) {
+        match command.kind {
+            SlashCommandKind::Model => self.open_model_picker(),
+        }
+    }
+
+    fn submit_unknown_slash_command(&mut self) {
+        let command = self.input.take_trimmed();
+        if command.is_empty() {
+            return;
+        }
+        self.messages.push(Message::user(command.clone()));
+        self.messages
+            .push(Message::assistant(format!("Unknown slash command `{command}`")));
+        self.scroll = 0;
+    }
+
+    fn open_model_picker(&mut self) {
+        self.input.set("/model");
+        let selected_provider = self
+            .config
+            .llm
+            .providers
+            .iter()
+            .position(|provider| provider.name == self.config.llm.provider)
+            .unwrap_or(0);
+        let selected_model = self
+            .config
+            .llm
+            .providers
+            .get(selected_provider)
+            .and_then(|provider| {
+                provider
+                    .models
+                    .iter()
+                    .position(|model| model == &self.config.llm.model)
+            })
+            .unwrap_or(0);
+        self.model_picker = Some(ModelPicker {
+            stage: ModelPickerStage::Provider,
+            selected_provider,
+            selected_model,
+        });
+    }
+
+    fn update_model_picker_key(&mut self, key: KeyAction) {
+        match key {
+            KeyAction::Submit => self.confirm_model_picker(),
+            KeyAction::Backspace => self.back_out_of_model_picker(),
+            KeyAction::Up => self.move_model_picker(-1),
+            KeyAction::Down => self.move_model_picker(1),
+            _ => {}
+        }
+    }
+
+    fn confirm_model_picker(&mut self) {
+        let Some(stage) = self.model_picker.as_ref().map(|picker| picker.stage) else {
+            return;
+        };
+
+        match stage {
+            ModelPickerStage::Provider => {
+                let selected_provider = self
+                    .model_picker
+                    .as_ref()
+                    .map(|picker| picker.selected_provider)
+                    .unwrap_or(0);
+                let selected_model = self
+                    .config
+                    .llm
+                    .providers
+                    .get(selected_provider)
+                    .and_then(|provider| {
+                        provider
+                            .models
+                            .iter()
+                            .position(|model| model == &self.config.llm.model)
+                    })
+                    .unwrap_or(0);
+                if let Some(picker) = self.model_picker.as_mut() {
+                    picker.stage = ModelPickerStage::Model;
+                    picker.selected_model = selected_model;
+                }
+            }
+            ModelPickerStage::Model => self.switch_selected_model(),
+        }
+    }
+
+    fn switch_selected_model(&mut self) {
+        let Some(picker) = self.model_picker.take() else {
+            return;
+        };
+        let Some((provider_name, model_name)) =
+            self.config
+                .llm
+                .providers
+                .get(picker.selected_provider)
+                .and_then(|provider| {
+                    provider
+                        .models
+                        .get(picker.selected_model)
+                        .map(|model| (provider.name.clone(), model.clone()))
+                })
+        else {
+            return;
+        };
+
+        let command = self.input.take_trimmed();
+        let command = if command.is_empty() {
+            "/model".to_owned()
+        } else {
+            command
+        };
+        self.messages.push(Message::user(command));
+
+        let result = match self
+            .config
+            .llm
+            .switch_model(&provider_name, &model_name, |api_key_env| {
+                std::env::var(api_key_env).ok()
+            }) {
+            Ok(()) => format!("Switch model to `{model_name}` provided by `{provider_name}`"),
+            Err(error) => format!("Failed to switch model: {error:#}"),
+        };
+        self.messages.push(Message::assistant(result));
+        self.scroll = 0;
+    }
+
+    fn back_out_of_model_picker(&mut self) {
+        let Some(picker) = self.model_picker.as_mut() else {
+            return;
+        };
+
+        if picker.stage == ModelPickerStage::Model {
+            picker.stage = ModelPickerStage::Provider;
+        } else {
+            self.model_picker = None;
+            self.input.set("");
+        }
+    }
+
+    fn move_model_picker(&mut self, direction: isize) {
+        let Some(picker) = self.model_picker.as_mut() else {
+            return;
+        };
+
+        match picker.stage {
+            ModelPickerStage::Provider => {
+                picker.selected_provider = move_index(
+                    picker.selected_provider,
+                    direction,
+                    self.config.llm.providers.len(),
+                );
+                picker.selected_model = 0;
+            }
+            ModelPickerStage::Model => {
+                let model_count = self
+                    .config
+                    .llm
+                    .providers
+                    .get(picker.selected_provider)
+                    .map(|provider| provider.models.len())
+                    .unwrap_or(0);
+                picker.selected_model = move_index(picker.selected_model, direction, model_count);
+            }
+        }
+    }
+
+    fn clamp_slash_command_selection(&mut self) {
+        let matches = self.slash_command_matches();
+        if matches.is_empty() {
+            self.slash_command_selection = 0;
+        } else {
+            self.slash_command_selection = self.slash_command_selection.min(matches.len() - 1);
         }
     }
 
@@ -329,6 +602,13 @@ impl App {
             message.role == Role::Tool && message.tool_call_id.as_deref() == Some(id)
         })
     }
+}
+
+fn move_index(index: usize, direction: isize, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    index.saturating_add_signed(direction).min(len - 1)
 }
 
 fn current_dir_label() -> String {
