@@ -372,6 +372,7 @@ fn string_arg<'a>(call: &'a ToolCall, name: &str) -> Option<&'a str> {
 fn display_path(path: &str) -> String {
     let path = Path::new(path);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -382,11 +383,11 @@ fn display_path(path: &str) -> String {
     display_path
         .strip_prefix(&cwd)
         .map(display_relative_path)
-        .unwrap_or_else(|_| display_path.display().to_string())
+        .unwrap_or_else(|_| display_path_string(&display_path))
 }
 
 fn display_relative_path(path: &Path) -> String {
-    let display = path.display().to_string();
+    let display = display_path_string(path);
     if display.is_empty() {
         return ".".to_owned();
     }
@@ -396,6 +397,10 @@ fn display_relative_path(path: &Path) -> String {
         .unwrap_or(&display)
         .trim_end_matches('/')
         .to_owned()
+}
+
+fn display_path_string(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
 }
 
 #[cfg(test)]

@@ -1,6 +1,39 @@
 [llm]
-base_url = "https://llm-proxy.ftai.chat/v1"
-model = "deepseek-v4-flash"
-api_key_env = "LLM_API_KEY"
+provider="ftai"
 temperature = 0.7
 max_tokens = 8196
+
+[llm.providers.ftai]
+base_url = "https://llm-proxy.ftai.chat/v1"
+model = "deepseek-v4-flash"
+api_key_env = "FTAI_API_KEY"
+
+[llm.providers.deepseek]
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[llm.providers.volcengine]
+base_url = "https://ark.cn-beijing.volces.com/api/v3"
+model = "deepseek-v4-flash"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[llm.providers.zhipu]
+base_url = "https://open.bigmodel.cn/api/paas/v4/"
+model = "deepseek-v4-flash"
+api_key_env = "ZHIPU_API_KEY"
+
+[llm.providers.kimi]
+base_url = "https://api.moonshot.ai/v1/"
+model = "deepseek-v4-flash"
+api_key_env = "KIMI_API_KEY"
+
+[llm.providers.dashscope]
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+model = "deepseek-v4-flash"
+api_key_env = "DASHSCOPE_API_KEY"
+
+[llm.providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+model = "deepseek-v4-flash"
+api_key_env = "OPENROUTER_API_KEY"
