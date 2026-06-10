@@ -1,4 +1,5 @@
 use std::{
+    env,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -155,6 +156,10 @@ fn glob(call: &ToolCall) -> ToolResult {
     let Ok(path) = workspace_path(path) else {
         return error(call, format!("path is outside the workspace: {path}"));
     };
+    if !program_in_path("rg") {
+        return missing_ripgrep(call);
+    }
+
     command_result(
         call,
         Command::new("rg")
@@ -332,6 +337,62 @@ fn command_result(call: &ToolCall, command: &mut Command) -> ToolResult {
     }
 }
 
+fn missing_ripgrep(call: &ToolCall) -> ToolResult {
+    error(
+        call,
+        "Missing dependency: ripgrep (`rg`) is required for Glob but was not found in PATH."
+            .to_owned(),
+    )
+}
+
+fn program_in_path(program: &str) -> bool {
+    let names = program_names(program);
+    env::var_os("PATH").is_some_and(|path| {
+        env::split_paths(&path).any(|dir| {
+            names
+                .iter()
+                .any(|name| is_executable_file(&dir.join(name)))
+        })
+    })
+}
+
+#[cfg(windows)]
+fn program_names(program: &str) -> Vec<String> {
+    if Path::new(program).extension().is_some() {
+        return vec![program.to_owned()];
+    }
+
+    env::var_os("PATHEXT")
+        .map(|extensions| {
+            extensions
+                .to_string_lossy()
+                .split(';')
+                .filter(|extension| !extension.is_empty())
+                .map(|extension| format!("{program}{extension}"))
+                .chain(std::iter::once(program.to_owned()))
+                .collect()
+        })
+        .unwrap_or_else(|| vec![format!("{program}.exe"), program.to_owned()])
+}
+
+#[cfg(not(windows))]
+fn program_names(program: &str) -> Vec<String> {
+    vec![program.to_owned()]
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
 fn slice_lines(content: String, call: &ToolCall) -> String {
     let offset = usize_arg(call, "offset").unwrap_or(0);
     let limit = usize_arg(call, "limit").unwrap_or(usize::MAX);
@@ -468,5 +529,21 @@ mod tests {
         };
 
         assert!(registry.requires_approval(&call, false, false));
+    }
+
+    #[test]
+    fn missing_ripgrep_reports_dependency_error() {
+        let result = missing_ripgrep(&ToolCall {
+            id: "glob".to_owned(),
+            name: "Glob".to_owned(),
+            arguments: json!({ "pattern": "Cargo.toml" }),
+        });
+
+        assert_eq!(result.call_id, "glob");
+        assert!(result.is_error);
+        assert_eq!(
+            result.content,
+            "Missing dependency: ripgrep (`rg`) is required for Glob but was not found in PATH."
+        );
     }
 }
