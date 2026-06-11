@@ -9,7 +9,7 @@ Glint is a Rust 2024 TUI for chatting with an OpenAI-compatible LLM endpoint. It
 ## Commands
 
 ```bash
-cargo run                         # Run TUI; requires config.toml and API key env var
+cargo run                         # Run TUI; requires config.yaml and API key env var
 cargo build                       # Build debug binary
 cargo fmt                         # Format Rust code
 cargo check                       # Fast compile check
@@ -40,25 +40,32 @@ Use `git branch -d` so Git verifies the branch has merged. If merge happened via
 
 ## Runtime Config
 
-`Config::load` reads `config.toml`, `model-info.toml`, and `prompts/system.md` from the current working directory. The selected `llm.provider` must match an entry under `llm.providers`, and the selected `llm.model` must be listed in that provider's `models`:
+`Config::load` reads `config.yaml` and `prompts/system.md` from the current working directory. The selected `llm.provider` must match an entry under `llm.providers`, and the selected `llm.model` must be listed in that provider's `models`:
 
-```toml
-[llm]
-provider = "default"
-model = "model-name"
-temperature = 0.7
-max_tokens = 8196
-context_window = 65536 # optional
-
-[llm.providers.default]
-base_url = "https://example.com/v1"
-models = ["model-name", "other-model"]
-api_key_env = "LLM_API_KEY"
+```yaml
+llm:
+  provider: default
+  model: model-name
+  temperature: 0.7
+  max_tokens: 8196
+  context_window: 65536 # optional
+  providers:
+    default:
+      description: Default OpenAI-compatible endpoint
+      base_url: https://example.com/v1
+      models:
+        - name: model-name
+          positioning: General-purpose chat
+          input: 1.00
+          output: 2.00
+          cache_read: 0.02
+          context: 1000000
+          max_tokens: 384000
+        - other-model
+      api_key_env: LLM_API_KEY
 ```
 
-Provider entries own `base_url`, `models`, and `api_key_env`; global LLM settings own the selected `provider`, selected `model`, `temperature`, `max_tokens`, and optional `context_window`. API keys must come from the environment variable named by `api_key_env`; never hardcode or leak secrets. The HTTP client trims trailing slashes from `base_url`, posts to `{base_url}/chat/completions`, and expects `choices[0].message.content`.
-
-`model-info.toml` stores display-only metadata for the `/model` picker: provider summaries and model positioning/context/pricing notes. It should not contain secrets.
+Provider entries own `description`, `base_url`, `models`, and `api_key_env`; global LLM settings own the selected `provider`, selected `model`, `temperature`, `max_tokens`, and optional `context_window`. A model entry can be a plain model name or an object with `name`, `positioning`, `input`, `output`, `cache_read`, `cache_write`, `context`, `max_tokens`, or `price` for `/model` picker display. Numeric model `context` values are also used as the status-bar context window, with global `context_window` as fallback. API keys must come from the environment variable named by `api_key_env`; never hardcode or leak secrets. The HTTP client trims trailing slashes from `base_url`, posts to `{base_url}/chat/completions`, and expects `choices[0].message.content`.
 
 ## Architecture
 
@@ -68,7 +75,7 @@ agent thread -> AgentEvent -> AppEvent::Agent -> App::update -> ui::render
 ```
 
 - `src/main.rs`: config load, terminal lifecycle, render loop, Crossterm polling, agent event draining.
-- `src/config.rs`: TOML load, base URL trim, API key env resolution.
+- `src/config.rs`: YAML config and model metadata load, base URL trim, API key env resolution.
 - `src/app.rs`: central state machine; route state changes through `App::update`.
 - `src/event.rs`: map Crossterm input to `KeyAction`/`MouseAction`.
 - `src/input.rs`: editable multiline buffer and cursor behavior.

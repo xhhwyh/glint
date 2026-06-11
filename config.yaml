@@ -1,0 +1,78 @@
+llm:
+  provider: deepseek
+  model: deepseek-v4-flash
+  temperature: 0.7
+  max_tokens: 8196
+  providers:
+  
+    deepseek:
+      description: DeepSeek official OpenAI-compatible endpoint
+      base_url: https://api.deepseek.com
+      models:
+        - name: deepseek-v4-flash
+          positioning: Fast general-purpose DeepSeek-style chat
+          input: 1.00
+          output: 2.00
+          cache_read: 0.02
+          context: 1000000
+          max_tokens: 384000
+        - name: deepseek-v4-pro
+          input: 3.00
+          output: 6.00
+          cache_read: 0.025
+          context: 1000000
+          max_tokens: 384000
+      api_key_env: DEEPSEEK_API_KEY
+
+    volcengine:
+      description: Volcengine Ark endpoint for hosted model deployments
+      base_url: https://ark.cn-beijing.volces.com/api/v3
+      models:
+        - deepseek-v4-flash-260425
+        - deepseek-v4-pro-260425
+        - doubao-seed-2-0-code-preview-260215
+        - doubao-seed-2-0-mini-260428
+        - doubao-seed-2-0-lite-260428
+        - doubao-seed-2-0-pro-260215
+      api_key_env: VOLCENGINE_API_KEY
+
+    zhipu:
+      description: Zhipu GLM endpoint for general Chinese and bilingual work
+      base_url: https://open.bigmodel.cn/api/paas/v4/
+      models:
+        - glm-5.1
+        - glm-5
+        - glm-5-turbo
+        - glm-4.7
+        - glm-4.7-flash
+      api_key_env: ZHIPU_API_KEY
+
+    kimi:
+      description: Moonshot Kimi endpoint with long-context options
+      base_url: https://api.moonshot.ai/v1/
+      models:
+        - kimi-k2.6
+        - kimi-k2.5
+      api_key_env: KIMI_API_KEY
+
+    dashscope:
+      description: Alibaba DashScope compatible-mode endpoint for Qwen models
+      base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+      models:
+        - qwen3.7-max
+        - qwen3.7-plus
+        - qwen3.6-flash
+        - deepseek-v4-pro
+        - deepseek-v4-flash
+        - glm-5.1
+        - kimi-k2.6
+        - minimax-m2.5
+        - mimo-v2.5-pro
+      api_key_env: DASHSCOPE_API_KEY
+
+    openrouter:
+      description: OpenRouter gateway for multiple upstream model families
+      base_url: https://openrouter.ai/api/v1
+      models:
+        - deepseek/deepseek-v4-flash
+      api_key_env: OPENROUTER_API_KEY

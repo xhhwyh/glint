@@ -33,6 +33,7 @@ pub enum AgentEvent {
         id: String,
         name: String,
         input_summary: String,
+        input_description: Option<String>,
     },
     ToolFinished {
         id: String,

@@ -1,6 +1,5 @@
 use std::{
-    env,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -25,17 +24,17 @@ impl ToolRegistry {
             ),
             spec(
                 "Glob",
-                "List files matching a glob pattern inside the workspace, respecting ignore files where possible.",
+                "Find files by glob pattern inside the workspace.",
                 &["pattern"],
             ),
             spec(
                 "Grep",
-                "Search file contents for a text or regex pattern inside the workspace.",
+                "Search workspace file contents by text or regex pattern.",
                 &["pattern"],
             ),
             spec(
                 "Bash",
-                "Run a read-only or non-destructive shell command. Commands that can modify files require approval.",
+                "Run shell-only commands such as git, build/test, package, environment, and process commands.",
                 &["command"],
             ),
             spec(
@@ -68,9 +67,10 @@ impl ToolRegistry {
         }
         match call.name.as_str() {
             "Bash" => string_arg(call, "command").is_none_or(|command| {
-                command_has_sensitive_path(command)
-                    || (bash_requires_approval(command)
-                        && (!bash_prefix_allowed || contains_shell_control(command)))
+                dedicated_tool_replacement(command).is_none()
+                    && (command_has_sensitive_path(command)
+                        || (bash_requires_approval(command)
+                            && (!bash_prefix_allowed || contains_shell_control(command))))
             }),
             "Edit" => !edit_allowed,
             _ => false,
@@ -110,22 +110,36 @@ fn is_protected_path(path: &str) -> bool {
 }
 
 fn spec(name: &str, description: &str, required: &[&str]) -> ToolSpec {
+    let mut properties = json!({
+        "file_path": { "type": "string" },
+        "pattern": { "type": "string" },
+        "path": { "type": "string" },
+        "glob": { "type": "string" },
+        "command": { "type": "string", "description": "Shell-only command. Do not use for file reading, listing, searching, or edits." },
+        "old_string": { "type": "string" },
+        "new_string": { "type": "string" },
+        "offset": { "type": "integer", "minimum": 0 },
+        "limit": { "type": "integer", "minimum": 1 }
+    });
+
+    if name == "Bash" {
+        if let Value::Object(properties) = &mut properties {
+            properties.insert(
+                "description".to_owned(),
+                json!({
+                    "type": "string",
+                    "description": "Brief user-facing label for this command in active voice."
+                }),
+            );
+        }
+    }
+
     ToolSpec {
         name: name.to_owned(),
         description: description.to_owned(),
         parameters: json!({
             "type": "object",
-            "properties": {
-                "file_path": { "type": "string" },
-                "pattern": { "type": "string" },
-                "path": { "type": "string" },
-                "glob": { "type": "string" },
-                "command": { "type": "string", "description": "Read-only or non-destructive shell command; modifying commands require approval." },
-                "old_string": { "type": "string" },
-                "new_string": { "type": "string" },
-                "offset": { "type": "integer", "minimum": 0 },
-                "limit": { "type": "integer", "minimum": 1 }
-            },
+            "properties": properties,
             "required": required,
             "additionalProperties": false
         }),
@@ -211,6 +225,15 @@ fn bash_approved(call: &ToolCall) -> ToolResult {
 }
 
 fn run_bash(call: &ToolCall, command: &str) -> ToolResult {
+    if let Some(replacement) = dedicated_tool_replacement(command) {
+        return error(
+            call,
+            format!(
+                "Bash command was not run because a dedicated tool should handle this action. {replacement}"
+            ),
+        );
+    }
+
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_owned());
     command_result(call, Command::new(shell).args(["-lc", command]))
 }
@@ -255,7 +278,7 @@ fn edit_approved(call: &ToolCall) -> ToolResult {
 }
 
 fn bash_requires_approval(command: &str) -> bool {
-    !is_preapproved_read_only_command(command)
+    dedicated_tool_replacement(command).is_none() && !is_preapproved_read_only_command(command)
 }
 
 fn command_has_sensitive_path(command: &str) -> bool {
@@ -318,6 +341,54 @@ fn contains_shell_control(command: &str) -> bool {
         || command.contains("\n")
 }
 
+fn dedicated_tool_replacement(command: &str) -> Option<&'static str> {
+    let words = command_words(command).collect::<Vec<_>>();
+    for (index, word) in words.iter().enumerate() {
+        let program = program_name(word);
+        let next = words.get(index + 1).map(|word| program_name(word));
+
+        match program {
+            "cat" | "head" | "tail" | "less" | "more" => {
+                return Some("Use Read to inspect file contents.");
+            }
+            "sed" | "awk" => {
+                return Some("Use Read for inspection or Edit for file modifications.");
+            }
+            "find" | "fd" | "ls" | "tree" => return Some("Use Glob to find or list files."),
+            "grep" | "rg" => return Some("Use Grep to search file contents."),
+            "git" if next == Some("grep") => return Some("Use Grep to search file contents."),
+            "echo" | "printf" if command.contains('>') || command.contains("<<") => {
+                return Some("Use Edit for file modifications.");
+            }
+            "echo" | "printf" => {
+                return Some("Output text directly to the user instead of running echo or printf.");
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn command_words(command: &str) -> impl Iterator<Item = &str> {
+    command
+        .split(|ch: char| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '|' | '&' | ';' | '(' | ')' | '<' | '>' | '"' | '\'' | '`'
+                )
+        })
+        .filter(|word| !word.is_empty())
+}
+
+fn program_name(word: &str) -> &str {
+    Path::new(word)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(word)
+}
+
 fn command_result(call: &ToolCall, command: &mut Command) -> ToolResult {
     match command.output() {
         Ok(output) => {
@@ -348,11 +419,8 @@ fn missing_ripgrep(call: &ToolCall) -> ToolResult {
 fn program_in_path(program: &str) -> bool {
     let names = program_names(program);
     env::var_os("PATH").is_some_and(|path| {
-        env::split_paths(&path).any(|dir| {
-            names
-                .iter()
-                .any(|name| is_executable_file(&dir.join(name)))
-        })
+        env::split_paths(&path)
+            .any(|dir| names.iter().any(|name| is_executable_file(&dir.join(name))))
     })
 }
 
@@ -466,6 +534,22 @@ mod tests {
     }
 
     #[test]
+    fn bash_schema_includes_user_facing_description() {
+        let specs = ToolRegistry::new().specs();
+        let bash = specs
+            .iter()
+            .find(|spec| spec.name == "Bash")
+            .expect("Bash spec should exist");
+        let read = specs
+            .iter()
+            .find(|spec| spec.name == "Read")
+            .expect("Read spec should exist");
+
+        assert!(bash.parameters["properties"]["description"].is_object());
+        assert!(read.parameters["properties"]["description"].is_null());
+    }
+
+    #[test]
     fn bash_allows_read_only_commands_without_approval() {
         assert!(!bash_requires_approval("git status --short"));
         assert!(!bash_requires_approval("pwd"));
@@ -476,7 +560,6 @@ mod tests {
     fn bash_requires_approval_for_commands_that_can_modify_files() {
         assert!(bash_requires_approval("cargo fmt"));
         assert!(bash_requires_approval("cargo test"));
-        assert!(bash_requires_approval("echo hi > file.txt"));
         assert!(bash_requires_approval("rm -rf target"));
         assert!(bash_requires_approval("rm file.txt"));
         assert!(bash_requires_approval("mv a b"));
@@ -485,18 +568,42 @@ mod tests {
         assert!(bash_requires_approval("mkdir tmp"));
         assert!(bash_requires_approval("touch file"));
         assert!(bash_requires_approval("git diff --output=file.patch"));
-        assert!(bash_requires_approval("cat ~/.ssh/id_rsa"));
-        assert!(bash_requires_approval("grep -R . ~/.ssh"));
-        assert!(bash_requires_approval("ls $HOME/.ssh"));
-        assert!(bash_requires_approval("rg PRIVATE $HOME/.ssh/*"));
-        assert!(bash_requires_approval("rg SECRET .env.local"));
-        assert!(bash_requires_approval("rg --hidden --no-ignore TOKEN ."));
-        assert!(bash_requires_approval("grep -R TOKEN ."));
         assert!(bash_requires_approval("git show HEAD:.env.local"));
-        assert!(bash_requires_approval("echo ok; rm -rf target"));
         assert!(bash_requires_approval(
             "python3 -c 'open(\"x\",\"w\").write(\"y\")'"
         ));
+    }
+
+    #[test]
+    fn bash_refuses_commands_covered_by_dedicated_tools_without_approval() {
+        let registry = ToolRegistry::new();
+
+        for (command, expected) in [
+            ("rg TODO src", "Use Grep"),
+            ("grep -R TODO src", "Use Grep"),
+            ("find . -name '*.rs'", "Use Glob"),
+            ("ls src", "Use Glob"),
+            ("cat src/main.rs", "Use Read"),
+            ("sed -n '1,20p' src/main.rs", "Use Read"),
+            ("git grep TODO", "Use Grep"),
+            ("echo hello", "Output text directly"),
+            ("echo hi > file.txt", "Use Edit"),
+            ("pwd && ls -la", "Use Glob"),
+            ("pwd; find . -name '*.rs'", "Use Glob"),
+            ("git status && rg TODO src", "Use Grep"),
+            ("pwd && cat Cargo.toml", "Use Read"),
+        ] {
+            let call = ToolCall {
+                id: "bash".to_owned(),
+                name: "Bash".to_owned(),
+                arguments: json!({ "command": command }),
+            };
+
+            assert!(!registry.requires_approval(&call, false, false));
+            let result = registry.execute_approved(&call);
+            assert!(result.is_error);
+            assert!(result.content.contains(expected));
+        }
     }
 
     #[test]

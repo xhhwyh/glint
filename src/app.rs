@@ -1,4 +1,7 @@
-use std::sync::mpsc::{self, Receiver};
+use std::{
+    path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver},
+};
 
 use crate::{
     agent::{self, AgentEvent, AgentRunInput, AgentStatus, RuntimeContext, TokenUsage},
@@ -75,12 +78,6 @@ impl ConversationUsage {
             total_completion_tokens: self.total_completion_tokens + usage.completion_tokens,
             total_tokens: self.total_tokens + usage.total_tokens,
         }
-    }
-
-    pub fn context_percent(self, context_window: Option<u64>) -> Option<u8> {
-        let prompt_tokens = self.last_usage?.prompt_tokens;
-        let context_window = context_window.filter(|window| *window > 0)?;
-        Some(percent(prompt_tokens, context_window))
     }
 
     pub fn cache_percent(self) -> Option<u8> {
@@ -209,9 +206,10 @@ impl App {
         let matches = self.slash_command_matches();
         match key {
             KeyAction::Submit => {
-                if let Some(command) = matches
-                    .get(self.slash_command_selection.min(matches.len().saturating_sub(1)))
-                {
+                if let Some(command) = matches.get(
+                    self.slash_command_selection
+                        .min(matches.len().saturating_sub(1)),
+                ) {
                     self.run_slash_command(*command);
                 } else {
                     self.submit_unknown_slash_command();
@@ -240,8 +238,9 @@ impl App {
             return;
         }
         self.messages.push(Message::user(command.clone()));
-        self.messages
-            .push(Message::assistant(format!("Unknown slash command `{command}`")));
+        self.messages.push(Message::assistant(format!(
+            "Unknown slash command `{command}`"
+        )));
         self.scroll = 0;
     }
 
@@ -320,17 +319,17 @@ impl App {
         let Some(picker) = self.model_picker.take() else {
             return;
         };
-        let Some((provider_name, model_name)) =
-            self.config
-                .llm
-                .providers
-                .get(picker.selected_provider)
-                .and_then(|provider| {
-                    provider
-                        .models
-                        .get(picker.selected_model)
-                        .map(|model| (provider.name.clone(), model.clone()))
-                })
+        let Some((provider_name, model_name)) = self
+            .config
+            .llm
+            .providers
+            .get(picker.selected_provider)
+            .and_then(|provider| {
+                provider
+                    .models
+                    .get(picker.selected_model)
+                    .map(|model| (provider.name.clone(), model.clone()))
+            })
         else {
             return;
         };
@@ -343,15 +342,16 @@ impl App {
         };
         self.messages.push(Message::user(command));
 
-        let result = match self
-            .config
-            .llm
-            .switch_model(&provider_name, &model_name, |api_key_env| {
-                std::env::var(api_key_env).ok()
-            }) {
-            Ok(()) => format!("Switch model to `{model_name}` provided by `{provider_name}`"),
-            Err(error) => format!("Failed to switch model: {error:#}"),
-        };
+        let result =
+            match self
+                .config
+                .llm
+                .switch_model(&provider_name, &model_name, |api_key_env| {
+                    std::env::var(api_key_env).ok()
+                }) {
+                Ok(()) => format!("Switch model to `{model_name}` provided by `{provider_name}`"),
+                Err(error) => format!("Failed to switch model: {error:#}"),
+            };
         self.messages.push(Message::assistant(result));
         self.scroll = 0;
     }
@@ -509,13 +509,19 @@ impl App {
                 id,
                 name,
                 input_summary,
+                input_description,
             } => {
                 self.agent_activity = Some(format!("Running {name}: {input_summary}"));
                 self.remove_empty_assistant_tail();
                 if name == "Read" && self.merge_read_tool(&input_summary) {
                     return;
                 }
-                self.messages.push(Message::tool(id, name, input_summary));
+                self.messages.push(Message::tool_with_description(
+                    id,
+                    name,
+                    input_summary,
+                    input_description,
+                ));
             }
             AgentEvent::ToolFinished {
                 id,
@@ -613,8 +619,24 @@ fn move_index(index: usize, direction: isize, len: usize) -> usize {
 
 fn current_dir_label() -> String {
     std::env::current_dir()
-        .map(|path| path.display().to_string())
+        .map(|path| home_relative_path(&path))
         .unwrap_or_else(|_| "?".to_owned())
+}
+
+fn home_relative_path(path: &Path) -> String {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return path.display().to_string();
+    };
+
+    if path == home {
+        return "~".to_owned();
+    }
+
+    path.strip_prefix(&home)
+        .ok()
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .map(|relative| format!("~/{}", relative.display()))
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 #[cfg(test)]
@@ -641,32 +663,6 @@ mod tests {
         assert_eq!(usage.total_completion_tokens, 75);
         assert_eq!(usage.total_tokens, 375);
         assert_eq!(usage.last_usage.map(|last| last.prompt_tokens), Some(200));
-    }
-
-    #[test]
-    fn computes_context_percent_from_latest_prompt_tokens() {
-        let usage = ConversationUsage::default().record(TokenUsage {
-            prompt_tokens: 375,
-            completion_tokens: 25,
-            total_tokens: 400,
-            cached_prompt_tokens: Some(40),
-        });
-
-        assert_eq!(usage.context_percent(Some(1000)), Some(37));
-        assert_eq!(usage.context_percent(Some(0)), None);
-        assert_eq!(usage.context_percent(None), None);
-    }
-
-    #[test]
-    fn caps_context_percent_at_one_hundred() {
-        let usage = ConversationUsage::default().record(TokenUsage {
-            prompt_tokens: 1200,
-            completion_tokens: 25,
-            total_tokens: 1225,
-            cached_prompt_tokens: Some(40),
-        });
-
-        assert_eq!(usage.context_percent(Some(1000)), Some(100));
     }
 
     #[test]
@@ -710,5 +706,18 @@ mod tests {
         });
 
         assert_eq!(usage.cache_percent(), Some(100));
+    }
+
+    #[test]
+    fn current_dir_label_uses_home_prefix() {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return;
+        };
+
+        assert_eq!(home_relative_path(&home), "~");
+        assert_eq!(
+            home_relative_path(&home.join("projects/glint")),
+            "~/projects/glint"
+        );
     }
 }

@@ -84,7 +84,9 @@ fn document(app: &App, width: u16) -> Document {
     } else {
         lines.push(info_line(app, width));
         lines.push(context_line(app, width));
-        lines.push(permission_line(app));
+        if let Some(line) = permission_line(app) {
+            lines.push(line);
+        }
     }
 
     let (input_cursor_x, input_cursor_row) = input_cursor_position(app, width);
@@ -380,8 +382,7 @@ fn transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
 fn user_message_lines(message: &crate::message::Message, width: u16) -> Vec<Line<'static>> {
     let rule = user_rule(width);
     let mut lines = vec![Line::from(""), rule.clone()];
-    let mut markdown_lines =
-        markdown::render_markdown(&message.content, width.saturating_sub(4));
+    let mut markdown_lines = markdown::render_markdown(&message.content, width.saturating_sub(4));
     trim_empty_lines(&mut markdown_lines);
 
     for (index, mut line) in markdown_lines.into_iter().enumerate() {
@@ -432,6 +433,15 @@ fn tool_message_lines(message: &crate::message::Message, width: u16) -> Vec<Line
             Style::default().fg(Color::Rgb(147, 197, 253)),
         ),
     ]));
+
+    if let Some(description) = message.tool_description.as_deref() {
+        for row in wrap_text(description, width.saturating_sub(6)) {
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(row, Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    }
 
     if name == "Read" {
         return lines;
@@ -534,7 +544,10 @@ fn slash_command_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
     if matches.is_empty() {
         return vec![Line::from(vec![
             Span::raw("  "),
-            Span::styled("No matching slash command", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "No matching slash command",
+                Style::default().fg(Color::DarkGray),
+            ),
         ])];
     }
 
@@ -657,7 +670,7 @@ fn model_picker_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
                     Span::styled(pad_to_width(model, name_width), style),
                     Span::styled("  ", style),
                     Span::styled(
-                        model_summary(app, model),
+                        model_summary(app, &provider.name, model),
                         Style::default().fg(Color::DarkGray),
                     ),
                     Span::styled(
@@ -677,14 +690,20 @@ fn provider_summary(app: &App, provider: &crate::config::LlmProviderConfig) -> S
         .model_catalog
         .providers
         .get(&provider.name)
-        .map(|entry| entry.summary.as_str())
-        .filter(|summary| !summary.is_empty())
+        .map(|entry| entry.description.as_str())
+        .filter(|description| !description.is_empty())
         .unwrap_or(&provider.base_url)
         .to_owned()
 }
 
-fn model_summary(app: &App, model: &str) -> String {
-    let Some(entry) = app.config.model_catalog.models.get(model) else {
+fn model_summary(app: &App, provider: &str, model: &str) -> String {
+    let Some(entry) = app
+        .config
+        .model_catalog
+        .models
+        .get(provider)
+        .and_then(|models| models.get(model))
+    else {
         return "No model metadata".to_owned();
     };
 
@@ -695,8 +714,28 @@ fn model_summary(app: &App, model: &str) -> String {
     if !entry.context.is_empty() {
         parts.push(format!("ctx {}", entry.context));
     }
+    if !entry.max_tokens.is_empty() {
+        parts.push(format!("max {}", entry.max_tokens));
+    }
     if !entry.price.is_empty() {
         parts.push(entry.price.clone());
+    } else {
+        let mut price = Vec::new();
+        if !entry.input.is_empty() {
+            price.push(format!("input {}", entry.input));
+        }
+        if !entry.output.is_empty() {
+            price.push(format!("output {}", entry.output));
+        }
+        if !entry.cache_read.is_empty() {
+            price.push(format!("cache read {}", entry.cache_read));
+        }
+        if !entry.cache_write.is_empty() {
+            price.push(format!("cache write {}", entry.cache_write));
+        }
+        if !price.is_empty() {
+            parts.push(price.join(", "));
+        }
     }
 
     if parts.is_empty() {
@@ -711,103 +750,194 @@ fn pad_to_width(text: &str, width: usize) -> String {
     format!("{text}{}", " ".repeat(padding))
 }
 
-fn info_line(app: &App, _width: u16) -> Line<'static> {
+fn truncate_start_to_width(text: &str, width: usize) -> String {
+    const PREFIX: &str = "...";
+    let text_width = text.width();
+    if text_width <= width {
+        return text.to_owned();
+    }
+    if width <= PREFIX.width() {
+        return PREFIX.chars().take(width).collect();
+    }
+
+    let mut suffix = String::new();
+    let mut suffix_width = 0;
+    let available = width - PREFIX.width();
+    for char in text.chars().rev() {
+        let char_width = char.width().unwrap_or(0);
+        if suffix_width + char_width > available {
+            break;
+        }
+        suffix.insert(0, char);
+        suffix_width += char_width;
+    }
+
+    format!("{PREFIX}{suffix}")
+}
+
+fn info_line(app: &App, width: u16) -> Line<'static> {
+    let left_width = format!("{} · {}", app.config.llm.model, app.config.llm.provider).width();
+    let cwd_limit = (width as usize).saturating_sub(left_width + 2);
+    let cwd = if cwd_limit == 0 {
+        String::new()
+    } else {
+        truncate_start_to_width(&app.current_dir, cwd_limit)
+    };
+    let spacer = (width as usize).saturating_sub(left_width + cwd.width());
+
     Line::from(vec![
-        metric_label("MODEL"),
         Span::styled(
             app.config.llm.model.clone(),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  "),
-        metric_label("CWD"),
-        Span::styled(app.current_dir.clone(), Style::default().fg(Color::White)),
+        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            app.config.llm.provider.clone(),
+            Style::default()
+                .fg(ACCENT_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" ".repeat(spacer)),
+        Span::styled(cwd, Style::default().fg(MUTED_TEXT_COLOR)),
     ])
 }
 
 fn context_line(app: &App, _width: u16) -> Line<'static> {
-    let context_percent = app.usage.context_percent(app.config.llm.context_window);
     let cache_percent = app.usage.cache_percent();
+    let context_tokens = app
+        .usage
+        .last_usage
+        .map(|usage| usage.prompt_tokens)
+        .unwrap_or(0);
 
-    let mut spans = vec![
-        metric_label("CONTEXT"),
-        Span::styled(
-            progress_bar(context_percent.unwrap_or(0), 12),
-            Style::default().fg(Color::Rgb(34, 211, 238)),
-        ),
-        Span::styled(
-            percent_text(context_percent),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        metric_label("CACHE"),
-        Span::styled(
-            percent_text(cache_percent).trim().to_owned(),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
-
-    spans.push(Span::raw("      "));
-    spans.push(metric_label("TOKENS"));
+    let mut spans = vec![Span::styled(
+        "Context ",
+        Style::default().fg(MUTED_TEXT_COLOR),
+    )];
+    spans.extend(progress_bar_spans(
+        context_bar_percent(context_tokens, app.config.llm.context_window),
+        CONTEXT_BAR_WIDTH,
+    ));
     spans.push(Span::styled(
-        app.usage.total_tokens.to_string(),
+        context_usage_label(context_tokens, app.config.llm.context_window),
         Style::default()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
     ));
 
+    if let Some(usage) = app.usage.last_usage {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(
+            "Input Tokens ",
+            Style::default().fg(MUTED_TEXT_COLOR),
+        ));
+        spans.push(Span::styled(
+            usage.prompt_tokens.to_string(),
+            Style::default()
+                .fg(Color::Rgb(250, 204, 21))
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            cached_suffix(cache_percent),
+            Style::default().fg(Color::Rgb(74, 222, 128)),
+        ));
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(
+            "Output Tokens ",
+            Style::default().fg(MUTED_TEXT_COLOR),
+        ));
+        spans.push(Span::styled(
+            usage.completion_tokens.to_string(),
+            Style::default()
+                .fg(Color::Rgb(216, 180, 254))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     Line::from(spans)
 }
 
-fn permission_line(app: &App) -> Line<'static> {
+fn permission_line(app: &App) -> Option<Line<'static>> {
     if app.conversation_permissions.edit_always_allowed {
-        Line::from(vec![
-            metric_label("PERMS"),
+        Some(Line::from(vec![
             Span::styled(
-                "Edit auto-approved for this conversation",
+                "Permissions ",
+                Style::default()
+                    .fg(Color::Rgb(147, 197, 253))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "edit auto-approved for this conversation",
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             Span::styled("[CTRL+K] cancel", Style::default().fg(Color::DarkGray)),
-        ])
+        ]))
     } else {
-        Line::from(vec![
-            metric_label("PERMS"),
-            Span::styled(
-                "standard approval policy",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])
+        None
     }
 }
 
-fn percent_text(percent: Option<u8>) -> String {
+fn cached_suffix(percent: Option<u8>) -> String {
     percent
-        .map(|percent| format!(" {percent}%"))
-        .unwrap_or_else(|| " —".to_owned())
+        .map(|percent| format!("({percent}% cached)"))
+        .unwrap_or_else(|| "(— cached)".to_owned())
 }
 
-fn metric_label(text: &'static str) -> Span<'static> {
-    const LABEL_WIDTH: usize = 8;
+const ACCENT_COLOR: Color = Color::Rgb(34, 211, 238);
+const MUTED_TEXT_COLOR: Color = Color::Rgb(148, 163, 184);
+const CONTEXT_BAR_WIDTH: usize = 24;
 
-    Span::styled(
-        format!("{text:<LABEL_WIDTH$}"),
-        Style::default()
-            .fg(Color::Rgb(147, 197, 253))
-            .add_modifier(Modifier::BOLD),
+fn context_usage_label(tokens: u64, context_window: Option<u64>) -> String {
+    let Some(window) = context_window.filter(|window| *window > 0) else {
+        return "—".to_owned();
+    };
+
+    format!(
+        "{:.1}% of {}",
+        context_percent(tokens, window),
+        compact_context_window(window)
     )
 }
 
-fn progress_bar(percent: u8, width: usize) -> String {
+fn context_percent(tokens: u64, context_window: u64) -> f64 {
+    ((tokens as f64 * 100.0) / context_window as f64).min(100.0)
+}
+
+fn context_bar_percent(tokens: u64, context_window: Option<u64>) -> u8 {
+    let Some(window) = context_window.filter(|window| *window > 0) else {
+        return 0;
+    };
+
+    ((tokens.saturating_mul(100) / window).min(100)) as u8
+}
+
+fn progress_bar_spans(percent: u8, width: usize) -> Vec<Span<'static>> {
     let filled = width * percent.min(100) as usize / 100;
-    format!("[{}{}]", "█".repeat(filled), "░".repeat(width - filled))
+    vec![
+        Span::styled("[".to_owned(), Style::default().fg(ACCENT_COLOR)),
+        Span::styled("█".repeat(filled), Style::default().fg(ACCENT_COLOR)),
+        Span::styled(
+            "░".repeat(width - filled),
+            Style::default().fg(ACCENT_COLOR),
+        ),
+        Span::styled("] ".to_owned(), Style::default().fg(ACCENT_COLOR)),
+    ]
+}
+
+fn compact_context_window(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{}M", tokens / 1_000_000)
+    } else if tokens >= 1_000 {
+        format!("{}K", tokens / 1_000)
+    } else {
+        tokens.to_string()
+    }
 }
 
 fn dashboard_top(width: u16) -> Line<'static> {
@@ -886,4 +1016,34 @@ fn box_bottom(width: u16) -> Line<'static> {
         Span::styled("━".repeat(width - 2), Style::default().fg(Color::Blue)),
         Span::styled("┛", Style::default().fg(Color::Blue)),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_labels_show_cached_percentage() {
+        assert_eq!(cached_suffix(Some(46)), "(46% cached)");
+        assert_eq!(cached_suffix(None), "(— cached)");
+        assert_eq!(context_usage_label(8_000, Some(1_000_000)), "0.8% of 1M");
+        assert_eq!(context_usage_label(1_280, Some(256_000)), "0.5% of 256K");
+        assert_eq!(context_usage_label(37_500, Some(100_000)), "37.5% of 100K");
+        assert_eq!(context_usage_label(1_000, Some(65_536)), "1.5% of 65K");
+        assert_eq!(context_usage_label(1, None), "—");
+        assert_eq!(context_bar_percent(37_500, Some(100_000)), 37);
+        assert_eq!(context_bar_percent(1, None), 0);
+    }
+
+    #[test]
+    fn truncates_paths_from_the_start() {
+        assert_eq!(
+            truncate_start_to_width("~/projects/glint", 16),
+            "~/projects/glint"
+        );
+        assert_eq!(
+            truncate_start_to_width("~/projects/glint", 10),
+            "...s/glint"
+        );
+    }
 }

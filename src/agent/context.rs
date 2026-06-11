@@ -4,6 +4,8 @@ use crate::message::{Message, Role};
 
 use super::provider::ModelMessage;
 
+const TOOL_MODE_CONTEXT: &str = "available tools: Read, Glob, Grep, Bash, Edit. Use Read for file contents, Glob for file discovery, Grep for content search, and Edit for file changes. Use Bash only for shell-only commands such as git, build/test, package manager, environment, and process commands.";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeContext {
     pub current_time: String,
@@ -22,7 +24,7 @@ impl RuntimeContext {
             shell: std::env::var("SHELL").unwrap_or_else(|_| "unknown".to_owned()),
             app_name: env!("CARGO_PKG_NAME").to_owned(),
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
-            tool_mode: "available tools: Read, Glob, Grep, Bash, Edit. Bash can run read-only or non-destructive commands without approval; modifying commands require approval. Edit always requires approval.".to_owned(),
+            tool_mode: TOOL_MODE_CONTEXT.to_owned(),
         }
     }
 
@@ -86,7 +88,7 @@ mod tests {
             shell: "/bin/zsh".to_owned(),
             app_name: "glint".to_owned(),
             app_version: "0.1.0".to_owned(),
-            tool_mode: "available tools: Read, Glob, Grep, Bash, Edit. Bash can run read-only or non-destructive commands without approval; modifying commands require approval. Edit always requires approval.".to_owned(),
+            tool_mode: TOOL_MODE_CONTEXT.to_owned(),
         }
     }
 
@@ -109,7 +111,12 @@ mod tests {
     fn preserves_prior_visible_history_then_current_user_once() {
         let conversation = vec![
             Message::new(Role::User, "first user"),
-            Message::tool("tool-one", "Read", r#"{"file_path":"src/main.rs"}"#),
+            Message::tool_with_description(
+                "tool-one",
+                "Read",
+                r#"{"file_path":"src/main.rs"}"#,
+                None,
+            ),
             Message::new(Role::Assistant, "first assistant"),
         ];
 

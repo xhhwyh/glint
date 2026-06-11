@@ -152,6 +152,7 @@ fn append_tool_turn(
             id: call.id.clone(),
             name: call.name.clone(),
             input_summary: summarize_tool_input(&call),
+            input_description: summarize_tool_description(&call),
         })
         .ok();
 
@@ -330,6 +331,13 @@ fn summarize_tool_input(call: &ToolCall) -> String {
     truncate_summary(&summary)
 }
 
+fn summarize_tool_description(call: &ToolCall) -> Option<String> {
+    match call.name.as_str() {
+        "Bash" => string_arg(call, "description").map(truncate_summary),
+        _ => None,
+    }
+}
+
 fn summarize_tool_output(output: &str) -> String {
     truncate_summary(output)
 }
@@ -460,12 +468,14 @@ mod tests {
                     name: "test".to_owned(),
                     base_url: "http://localhost".to_owned(),
                     models: vec!["test-model".to_owned()],
+                    model_context_windows: Default::default(),
                     api_key_env: "TEST_API_KEY".to_owned(),
                 }],
                 temperature: 0.0,
                 max_tokens: 100,
                 context_window: Some(1000),
                 api_key: "test-key".to_owned(),
+                default_context_window: Some(1000),
             },
             system_prompt: "system".to_owned(),
             runtime_context: RuntimeContext {
@@ -612,11 +622,45 @@ mod tests {
         );
         assert_eq!(
             summarize_tool_input(&ToolCall {
+                id: "bash".to_owned(),
+                name: "Bash".to_owned(),
+                arguments: json!({
+                    "command": "cargo test --lib",
+                    "description": "Run library tests"
+                }),
+            }),
+            "cargo test --lib"
+        );
+        assert_eq!(
+            summarize_tool_input(&ToolCall {
                 id: "edit".to_owned(),
                 name: "Edit".to_owned(),
                 arguments: json!({ "file_path": "src/main.rs" }),
             }),
             "src/main.rs"
+        );
+    }
+
+    #[test]
+    fn summarizes_bash_description_separately_from_command() {
+        assert_eq!(
+            summarize_tool_description(&ToolCall {
+                id: "bash".to_owned(),
+                name: "Bash".to_owned(),
+                arguments: json!({
+                    "command": "cargo test --lib",
+                    "description": "Run library tests"
+                }),
+            }),
+            Some("Run library tests".to_owned())
+        );
+        assert_eq!(
+            summarize_tool_description(&ToolCall {
+                id: "read".to_owned(),
+                name: "Read".to_owned(),
+                arguments: json!({ "file_path": "src/main.rs" }),
+            }),
+            None
         );
     }
 
