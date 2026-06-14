@@ -1,4 +1,5 @@
 use crate::approval::ApprovalRequest;
+use serde::{Deserialize, Serialize};
 
 mod context;
 mod openai;
@@ -9,7 +10,7 @@ mod tools;
 pub use context::RuntimeContext;
 pub use runner::{AgentRunInput, spawn_agent_loop};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct TokenUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -28,7 +29,11 @@ pub enum AgentStatus {
 pub enum AgentEvent {
     Started,
     AssistantDelta(String),
-    Usage(TokenUsage),
+    AssistantTurn {
+        usage: Option<TokenUsage>,
+        finish_reason: provider::FinishReason,
+        tool_calls: Vec<provider::ToolCall>,
+    },
     ToolStarted {
         id: String,
         name: String,
@@ -38,6 +43,8 @@ pub enum AgentEvent {
     ToolFinished {
         id: String,
         name: String,
+        output: String,
+        is_error: bool,
         output_summary: String,
     },
     ToolApprovalRequested(ApprovalRequest),

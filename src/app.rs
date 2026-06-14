@@ -1,15 +1,22 @@
 use std::{
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
+    time::{Duration, Instant},
 };
 
+use anyhow::Result;
+
 use crate::{
-    agent::{self, AgentEvent, AgentRunInput, AgentStatus, RuntimeContext, TokenUsage},
+    agent::{
+        self, AgentEvent, AgentRunInput, AgentStatus, RuntimeContext, TokenUsage,
+        provider::FinishReason,
+    },
     approval::{AgentControl, ApprovalFocus, ApprovalPrompt, ConversationPermissions},
     config::Config,
     event::{AppEvent, KeyAction, MouseAction},
     input::InputState,
     message::{Message, Role},
+    transcript::{AssistantTranscript, TranscriptSessionSummary, TranscriptStore},
 };
 
 pub struct App {
@@ -21,12 +28,17 @@ pub struct App {
     pub usage: ConversationUsage,
     pub slash_command_selection: usize,
     pub model_picker: Option<ModelPicker>,
+    pub resume_picker: Option<ResumePicker>,
     pub agent_events: Receiver<AgentEvent>,
     pub config: Config,
     pub current_dir: String,
     pub agent_activity: Option<String>,
+    pub run_notice: Option<String>,
     pub approval: Option<ApprovalPrompt>,
     pub conversation_permissions: ConversationPermissions,
+    turn_started_at: Option<Instant>,
+    transcript: TranscriptStore,
+    transcript_cwd: String,
     agent_control_tx: Option<mpsc::Sender<AgentControl>>,
     agent_tx: mpsc::Sender<AgentEvent>,
 }
@@ -41,13 +53,21 @@ pub struct SlashCommand {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SlashCommandKind {
     Model,
+    Resume,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 1] = [SlashCommand {
-    name: "/model",
-    description: "Switch provider and model",
-    kind: SlashCommandKind::Model,
-}];
+const SLASH_COMMANDS: [SlashCommand; 2] = [
+    SlashCommand {
+        name: "/model",
+        description: "Switch provider and model",
+        kind: SlashCommandKind::Model,
+    },
+    SlashCommand {
+        name: "/resume",
+        description: "Resume a saved session",
+        kind: SlashCommandKind::Resume,
+    },
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelPicker {
@@ -60,6 +80,12 @@ pub struct ModelPicker {
 pub enum ModelPickerStage {
     Provider,
     Model,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResumePicker {
+    pub sessions: Vec<TranscriptSessionSummary>,
+    pub selected: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -95,27 +121,52 @@ fn percent(value: u64, total: u64) -> u8 {
     (value.saturating_mul(100) / total).min(100) as u8
 }
 
+fn usage_from_transcript(transcript: &TranscriptStore) -> ConversationUsage {
+    transcript
+        .token_usages()
+        .fold(ConversationUsage::default(), |usage, item| {
+            usage.record(item)
+        })
+}
+
 impl App {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config) -> Result<Self> {
         let (agent_tx, agent_events) = mpsc::channel();
-        Self {
+        let current_dir = current_dir_label();
+        let transcript_cwd = std::env::current_dir()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| current_dir.clone());
+        let transcript = TranscriptStore::load_or_create(
+            &transcript_cwd,
+            &config.llm.provider,
+            &config.llm.model,
+        )?;
+        let messages = transcript.ui_messages();
+        let usage = usage_from_transcript(&transcript);
+
+        Ok(Self {
             should_quit: false,
-            messages: Vec::new(),
+            messages,
             input: InputState::default(),
             status: AgentStatus::Idle,
             scroll: 0,
-            usage: ConversationUsage::default(),
+            usage,
             slash_command_selection: 0,
             model_picker: None,
+            resume_picker: None,
             agent_events,
             config,
-            current_dir: current_dir_label(),
+            current_dir,
             agent_activity: None,
+            run_notice: None,
             approval: None,
             conversation_permissions: ConversationPermissions::default(),
+            turn_started_at: None,
+            transcript,
+            transcript_cwd,
             agent_control_tx: None,
             agent_tx,
-        }
+        })
     }
 
     pub fn update(&mut self, event: AppEvent) {
@@ -126,9 +177,17 @@ impl App {
         }
     }
 
+    pub fn processing_elapsed(&self) -> Option<Duration> {
+        self.turn_started_at.map(|started_at| started_at.elapsed())
+    }
+
     fn update_key(&mut self, key: KeyAction) {
         if key == KeyAction::Quit {
-            self.should_quit = true;
+            if self.status == AgentStatus::Idle {
+                self.should_quit = true;
+            } else {
+                self.cancel_current_turn();
+            }
             return;
         }
         if key == KeyAction::CancelConversationPermission {
@@ -137,6 +196,10 @@ impl App {
         }
         if self.approval.is_some() {
             self.update_approval_key(key);
+            return;
+        }
+        if self.resume_picker.is_some() {
+            self.update_resume_picker_key(key);
             return;
         }
         if self.model_picker.is_some() {
@@ -170,13 +233,17 @@ impl App {
             | KeyAction::Left
             | KeyAction::Right
             | KeyAction::Tab
+            | KeyAction::Escape
             | KeyAction::CancelConversationPermission => {}
         }
         self.clamp_slash_command_selection();
     }
 
     pub fn slash_query(&self) -> Option<&str> {
-        if self.status != AgentStatus::Idle || self.model_picker.is_some() {
+        if self.status != AgentStatus::Idle
+            || self.model_picker.is_some()
+            || self.resume_picker.is_some()
+        {
             return None;
         }
         let value = self.input.value.as_str();
@@ -229,6 +296,7 @@ impl App {
     fn run_slash_command(&mut self, command: SlashCommand) {
         match command.kind {
             SlashCommandKind::Model => self.open_model_picker(),
+            SlashCommandKind::Resume => self.open_resume_picker(),
         }
     }
 
@@ -237,10 +305,11 @@ impl App {
         if command.is_empty() {
             return;
         }
+        self.record_user(command.clone());
         self.messages.push(Message::user(command.clone()));
-        self.messages.push(Message::assistant(format!(
-            "Unknown slash command `{command}`"
-        )));
+        let response = format!("Unknown slash command `{command}`");
+        self.record_assistant(response.clone(), Vec::new(), None, FinishReason::Stop, None);
+        self.messages.push(Message::assistant(response));
         self.scroll = 0;
     }
 
@@ -340,6 +409,7 @@ impl App {
         } else {
             command
         };
+        self.record_user(command.clone());
         self.messages.push(Message::user(command));
 
         let result =
@@ -352,6 +422,7 @@ impl App {
                 Ok(()) => format!("Switch model to `{model_name}` provided by `{provider_name}`"),
                 Err(error) => format!("Failed to switch model: {error:#}"),
             };
+        self.record_assistant(result.clone(), Vec::new(), None, FinishReason::Stop, None);
         self.messages.push(Message::assistant(result));
         self.scroll = 0;
     }
@@ -394,6 +465,58 @@ impl App {
                 picker.selected_model = move_index(picker.selected_model, direction, model_count);
             }
         }
+    }
+
+    fn open_resume_picker(&mut self) {
+        self.input.set("/resume");
+        let sessions = TranscriptStore::sessions(&self.transcript_cwd).unwrap_or_default();
+        self.resume_picker = Some(ResumePicker {
+            sessions,
+            selected: 0,
+        });
+    }
+
+    fn update_resume_picker_key(&mut self, key: KeyAction) {
+        match key {
+            KeyAction::Submit => self.confirm_resume_picker(),
+            KeyAction::Escape => self.close_resume_picker(),
+            KeyAction::Up | KeyAction::Left => self.move_resume_picker(-1),
+            KeyAction::Down | KeyAction::Right => self.move_resume_picker(1),
+            _ => {}
+        }
+    }
+
+    fn confirm_resume_picker(&mut self) {
+        let Some(path) = self
+            .resume_picker
+            .as_ref()
+            .and_then(|picker| picker.sessions.get(picker.selected))
+            .map(|session| session.path.clone())
+        else {
+            self.close_resume_picker();
+            return;
+        };
+        let Ok(transcript) = TranscriptStore::load_path(path) else {
+            self.close_resume_picker();
+            return;
+        };
+        self.messages = transcript.ui_messages();
+        self.usage = usage_from_transcript(&transcript);
+        self.transcript = transcript;
+        self.scroll = 0;
+        self.close_resume_picker();
+    }
+
+    fn close_resume_picker(&mut self) {
+        self.resume_picker = None;
+        self.input.set("");
+    }
+
+    fn move_resume_picker(&mut self, direction: isize) {
+        let Some(picker) = self.resume_picker.as_mut() else {
+            return;
+        };
+        picker.selected = move_index(picker.selected, direction, picker.sessions.len());
     }
 
     fn clamp_slash_command_selection(&mut self) {
@@ -470,9 +593,20 @@ impl App {
             return;
         }
 
-        let conversation = self.messages.clone();
+        self.run_notice = None;
+        self.reset_agent_channel();
+        let conversation = self.transcript.model_history();
+        self.transcript
+            .start_turn(
+                self.transcript_cwd.clone(),
+                self.config.llm.provider.clone(),
+                self.config.llm.model.clone(),
+            )
+            .ok();
+        self.record_user(prompt.clone());
         self.messages.push(Message::user(prompt.clone()));
         self.status = AgentStatus::Thinking;
+        self.turn_started_at = Some(Instant::now());
         self.scroll = 0;
         self.agent_activity = None;
 
@@ -504,7 +638,22 @@ impl App {
                 self.agent_activity = None;
                 self.append_assistant_delta(&delta);
             }
-            AgentEvent::Usage(usage) => self.usage = self.usage.record(usage),
+            AgentEvent::AssistantTurn {
+                usage,
+                finish_reason,
+                tool_calls,
+            } => {
+                if let Some(usage) = usage {
+                    self.usage = self.usage.record(usage);
+                }
+                self.record_assistant(
+                    self.current_assistant_content(),
+                    tool_calls,
+                    usage,
+                    finish_reason,
+                    None,
+                );
+            }
             AgentEvent::ToolStarted {
                 id,
                 name,
@@ -526,9 +675,12 @@ impl App {
             AgentEvent::ToolFinished {
                 id,
                 name,
+                output,
+                is_error,
                 output_summary,
             } => {
                 self.agent_activity = Some(format!("Finished {name}: {output_summary}"));
+                self.record_tool(id.clone(), output.clone(), is_error);
                 if name == "Read" {
                     if let Some(message) = self.find_tool_message(&id) {
                         message.tool_finished = true;
@@ -539,7 +691,7 @@ impl App {
                 if let Some(message) = self.messages.iter_mut().rev().find(|message| {
                     message.role == Role::Tool && message.tool_call_id.as_deref() == Some(&id)
                 }) {
-                    message.content = output_summary;
+                    message.content = output;
                     message.tool_finished = true;
                 }
             }
@@ -554,14 +706,25 @@ impl App {
                 self.conversation_permissions.edit_always_allowed = edit_always_allowed;
             }
             AgentEvent::AssistantFinished => {
+                self.transcript.complete_turn().ok();
                 self.status = AgentStatus::Idle;
+                self.turn_started_at = None;
                 self.agent_activity = None;
                 self.agent_control_tx = None;
                 self.approval = None;
             }
             AgentEvent::Failed(error) => {
                 self.append_assistant_delta(&error);
+                self.record_assistant(
+                    self.current_assistant_content(),
+                    Vec::new(),
+                    None,
+                    FinishReason::Other("error".to_owned()),
+                    Some(error.clone()),
+                );
+                self.transcript.abort_turn(error).ok();
                 self.status = AgentStatus::Idle;
+                self.turn_started_at = None;
                 self.agent_activity = None;
                 self.agent_control_tx = None;
                 self.approval = None;
@@ -577,6 +740,64 @@ impl App {
         if let Some(message) = self.messages.last_mut() {
             message.content.push_str(delta);
         }
+    }
+
+    fn current_assistant_content(&self) -> String {
+        self.messages
+            .last()
+            .filter(|message| message.role == Role::Assistant)
+            .map(|message| message.content.clone())
+            .unwrap_or_default()
+    }
+
+    fn record_user(&mut self, content: String) {
+        self.transcript.append_user(content).ok();
+    }
+
+    fn record_assistant(
+        &mut self,
+        content: String,
+        tool_calls: Vec<agent::provider::ToolCall>,
+        usage: Option<TokenUsage>,
+        finish_reason: FinishReason,
+        error: Option<String>,
+    ) {
+        self.transcript
+            .append_assistant(AssistantTranscript {
+                content,
+                provider: self.config.llm.provider.clone(),
+                model: self.config.llm.model.clone(),
+                tool_calls,
+                usage,
+                finish_reason,
+                error,
+            })
+            .ok();
+    }
+
+    fn record_tool(&mut self, call_id: String, content: String, is_error: bool) {
+        self.transcript.append_tool(call_id, content, is_error).ok();
+    }
+
+    fn cancel_current_turn(&mut self) {
+        if let Some(tx) = &self.agent_control_tx {
+            tx.send(AgentControl::Cancel).ok();
+        }
+        self.reset_agent_channel();
+        self.transcript.abort_turn("cancelled".to_owned()).ok();
+        self.status = AgentStatus::Idle;
+        self.turn_started_at = None;
+        self.agent_activity = None;
+        self.agent_control_tx = None;
+        self.approval = None;
+        self.remove_empty_assistant_tail();
+        self.run_notice = Some("Stopped this turn.".to_owned());
+    }
+
+    fn reset_agent_channel(&mut self) {
+        let (agent_tx, agent_events) = mpsc::channel();
+        self.agent_tx = agent_tx;
+        self.agent_events = agent_events;
     }
 
     fn remove_empty_assistant_tail(&mut self) {

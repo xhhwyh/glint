@@ -94,6 +94,7 @@ agent thread -> AgentEvent -> AppEvent::Agent -> App::update -> ui::render
 ## Style
 
 - Prefer concise, direct code; add abstractions or dependencies only when they reduce real complexity.
+- Do not make unrequested changes, refactors, or design additions; keep edits scoped to the user's requested outcome.
 - Keep rendering, state updates, input mapping, config loading, and agent events separated.
 - Do not add defensive handling for states that cannot occur in the current design.
 - Use idiomatic Rust: `?`, `cargo fmt`, `cargo clippy -- -D warnings`, and no production `unwrap()` unless unreachable.

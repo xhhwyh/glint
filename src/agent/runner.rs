@@ -9,7 +9,6 @@ use anyhow::{Context, Result, bail};
 use crate::{
     approval::{AgentControl, ApprovalDecision, ApprovalRequest, ConversationPermissions},
     config::LlmConfig,
-    message::Message,
     settings::ProjectSettings,
 };
 
@@ -29,7 +28,7 @@ pub struct AgentRunInput {
     pub system_prompt: String,
     pub runtime_context: RuntimeContext,
     pub conversation_permissions: ConversationPermissions,
-    pub conversation: Vec<Message>,
+    pub conversation: Vec<ModelMessage>,
     pub current_user_message: String,
 }
 
@@ -93,6 +92,9 @@ fn run_model_turns(
     let mut conversation_permissions = initial_permissions;
 
     loop {
+        if drain_control_messages(control_rx, tx, &mut conversation_permissions) {
+            bail!("cancelled");
+        }
         let mut on_delta = |delta: String| {
             tx.send(AgentEvent::AssistantDelta(delta)).ok();
         };
@@ -106,9 +108,16 @@ fn run_model_turns(
             )
             .context("model request failed")?;
 
-        if let Some(usage) = response.usage {
-            tx.send(AgentEvent::Usage(usage)).ok();
+        if drain_control_messages(control_rx, tx, &mut conversation_permissions) {
+            bail!("cancelled");
         }
+
+        tx.send(AgentEvent::AssistantTurn {
+            usage: response.usage,
+            finish_reason: response.finish_reason.clone(),
+            tool_calls: response.tool_calls.clone(),
+        })
+        .ok();
 
         if !response.tool_calls.is_empty() {
             tool_iterations += 1;
@@ -148,6 +157,9 @@ fn append_tool_turn(
     ));
 
     for call in response.tool_calls {
+        if drain_control_messages(control_rx, tx, conversation_permissions) {
+            bail!("cancelled");
+        }
         tx.send(AgentEvent::ToolStarted {
             id: call.id.clone(),
             name: call.name.clone(),
@@ -168,6 +180,8 @@ fn append_tool_turn(
         tx.send(AgentEvent::ToolFinished {
             id: call.id.clone(),
             name: call.name,
+            output: result.content.clone(),
+            is_error: result.is_error,
             output_summary: summarize_tool_output(&result.content),
         })
         .ok();
@@ -185,7 +199,9 @@ fn execute_tool_with_approval(
     project_settings: &mut ProjectSettings,
     conversation_permissions: &mut ConversationPermissions,
 ) -> Result<super::provider::ToolResult> {
-    drain_control_messages(control_rx, tx, conversation_permissions);
+    if drain_control_messages(control_rx, tx, conversation_permissions) {
+        bail!("cancelled");
+    }
     let bash_prefix_allowed = call
         .arguments
         .get("command")
@@ -197,7 +213,13 @@ fn execute_tool_with_approval(
         conversation_permissions.edit_always_allowed,
     );
     if !requires_approval {
-        return Ok(registry.execute_approved(&call));
+        return execute_approved_cancellable(
+            registry,
+            call,
+            tx,
+            control_rx,
+            conversation_permissions,
+        );
     }
 
     let request = ApprovalRequest {
@@ -217,6 +239,7 @@ fn execute_tool_with_approval(
                     call,
                     decision,
                     tx,
+                    control_rx,
                     project_settings,
                     conversation_permissions,
                 );
@@ -228,6 +251,7 @@ fn execute_tool_with_approval(
                 })
                 .ok();
             }
+            AgentControl::Cancel => bail!("cancelled"),
             AgentControl::ApprovalDecision { .. } => {}
         }
     }
@@ -237,7 +261,8 @@ fn drain_control_messages(
     control_rx: &Receiver<AgentControl>,
     tx: &Sender<AgentEvent>,
     conversation_permissions: &mut ConversationPermissions,
-) {
+) -> bool {
+    let mut cancelled = false;
     while let Ok(message) = control_rx.try_recv() {
         match message {
             AgentControl::ClearConversationEditPermission => {
@@ -247,9 +272,13 @@ fn drain_control_messages(
                 })
                 .ok();
             }
+            AgentControl::Cancel => {
+                cancelled = true;
+            }
             AgentControl::ApprovalDecision { .. } => {}
         }
     }
+    cancelled
 }
 
 fn handle_approval_decision(
@@ -257,11 +286,14 @@ fn handle_approval_decision(
     call: ToolCall,
     decision: ApprovalDecision,
     tx: &Sender<AgentEvent>,
+    control_rx: &Receiver<AgentControl>,
     project_settings: &mut ProjectSettings,
     conversation_permissions: &mut ConversationPermissions,
 ) -> Result<super::provider::ToolResult> {
     match decision {
-        ApprovalDecision::AllowOnce => Ok(registry.execute_approved(&call)),
+        ApprovalDecision::AllowOnce => {
+            execute_approved_cancellable(registry, call, tx, control_rx, conversation_permissions)
+        }
         ApprovalDecision::AllowProjectPrefix => {
             if let Some(command) = call
                 .arguments
@@ -270,7 +302,7 @@ fn handle_approval_decision(
             {
                 project_settings.allow_bash_prefix(command)?;
             }
-            Ok(registry.execute_approved(&call))
+            execute_approved_cancellable(registry, call, tx, control_rx, conversation_permissions)
         }
         ApprovalDecision::AllowConversation => {
             conversation_permissions.edit_always_allowed = true;
@@ -278,7 +310,7 @@ fn handle_approval_decision(
                 edit_always_allowed: true,
             })
             .ok();
-            Ok(registry.execute_approved(&call))
+            execute_approved_cancellable(registry, call, tx, control_rx, conversation_permissions)
         }
         ApprovalDecision::Deny { feedback } => Ok(super::provider::ToolResult {
             call_id: call.id,
@@ -290,6 +322,31 @@ fn handle_approval_decision(
             is_error: true,
         }),
     }
+}
+
+fn execute_approved_cancellable(
+    registry: &ToolRegistry,
+    call: ToolCall,
+    tx: &Sender<AgentEvent>,
+    control_rx: &Receiver<AgentControl>,
+    conversation_permissions: &mut ConversationPermissions,
+) -> Result<super::provider::ToolResult> {
+    let mut cancelled = false;
+    let result = {
+        let mut is_cancelled = || {
+            if !cancelled {
+                cancelled = drain_control_messages(control_rx, tx, conversation_permissions);
+            }
+            cancelled
+        };
+        registry.execute_approved_with_cancel(&call, &mut is_cancelled)
+    };
+
+    if cancelled || drain_control_messages(control_rx, tx, conversation_permissions) {
+        bail!("cancelled");
+    }
+
+    Ok(result)
 }
 
 fn approval_explanation(call: &ToolCall) -> String {

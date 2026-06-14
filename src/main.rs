@@ -6,6 +6,7 @@ mod event;
 mod input;
 mod message;
 mod settings;
+mod transcript;
 mod ui;
 
 use std::{io, time::Duration};
@@ -51,7 +52,7 @@ fn main() -> Result<()> {
 }
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) -> Result<()> {
-    let mut app = App::new(config);
+    let mut app = App::new(config)?;
 
     while !app.should_quit {
         terminal.draw(|frame| ui::render(frame, &app))?;

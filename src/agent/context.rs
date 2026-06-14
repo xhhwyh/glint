@@ -1,7 +1,5 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::message::{Message, Role};
-
 use super::provider::ModelMessage;
 
 const TOOL_MODE_CONTEXT: &str = "available tools: Read, Glob, Grep, Bash, Edit. Use Read for file contents, Glob for file discovery, Grep for content search, and Edit for file changes. Use Bash only for shell-only commands such as git, build/test, package manager, environment, and process commands.";
@@ -44,7 +42,7 @@ impl RuntimeContext {
 pub fn build_initial_messages(
     system_prompt: &str,
     runtime_context: &RuntimeContext,
-    conversation: &[Message],
+    conversation: &[ModelMessage],
     current_user_message: &str,
 ) -> Vec<ModelMessage> {
     let mut messages = vec![
@@ -52,20 +50,9 @@ pub fn build_initial_messages(
         runtime_context.to_model_message(),
     ];
 
-    messages.extend(conversation.iter().filter_map(model_message_from_visible));
+    messages.extend(conversation.iter().cloned());
     messages.push(ModelMessage::user(current_user_message.to_owned()));
     messages
-}
-
-fn model_message_from_visible(message: &Message) -> Option<ModelMessage> {
-    match message.role {
-        Role::User => Some(ModelMessage::user(message.content.clone())),
-        Role::Assistant => Some(ModelMessage::assistant(
-            Some(message.content.clone()),
-            Vec::new(),
-        )),
-        Role::Tool => None,
-    }
 }
 
 fn current_time_label() -> String {
@@ -78,8 +65,7 @@ fn current_time_label() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::Message;
-    use crate::message::Role;
+    use crate::agent::provider::{ModelRole, ToolResult};
 
     fn runtime_context() -> RuntimeContext {
         RuntimeContext {
@@ -110,28 +96,26 @@ mod tests {
     #[test]
     fn preserves_prior_visible_history_then_current_user_once() {
         let conversation = vec![
-            Message::new(Role::User, "first user"),
-            Message::tool_with_description(
-                "tool-one",
-                "Read",
-                r#"{"file_path":"src/main.rs"}"#,
-                None,
-            ),
-            Message::new(Role::Assistant, "first assistant"),
+            ModelMessage::user("first user"),
+            ModelMessage::tool_result(&ToolResult {
+                call_id: "tool-one".to_owned(),
+                content: "tool output".to_owned(),
+                is_error: false,
+            }),
+            ModelMessage::assistant(Some("first assistant".to_owned()), Vec::new()),
         ];
 
         let messages =
             build_initial_messages("system", &runtime_context(), &conversation, "second user");
 
-        assert_eq!(messages[2].role, super::super::provider::ModelRole::User);
+        assert_eq!(messages[2].role, ModelRole::User);
         assert_eq!(messages[2].content.as_deref(), Some("first user"));
-        assert_eq!(
-            messages[3].role,
-            super::super::provider::ModelRole::Assistant
-        );
-        assert_eq!(messages[3].content.as_deref(), Some("first assistant"));
-        assert_eq!(messages[4].role, super::super::provider::ModelRole::User);
-        assert_eq!(messages[4].content.as_deref(), Some("second user"));
+        assert_eq!(messages[3].role, ModelRole::Tool);
+        assert_eq!(messages[3].content.as_deref(), Some("tool output"));
+        assert_eq!(messages[4].role, ModelRole::Assistant);
+        assert_eq!(messages[4].content.as_deref(), Some("first assistant"));
+        assert_eq!(messages[5].role, ModelRole::User);
+        assert_eq!(messages[5].content.as_deref(), Some("second user"));
         assert_eq!(
             messages
                 .iter()

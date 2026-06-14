@@ -26,6 +26,7 @@ pub enum KeyAction {
     Up,
     Down,
     Tab,
+    Escape,
     CancelConversationPermission,
     None,
 }
@@ -41,6 +42,7 @@ impl From<KeyEvent> for KeyAction {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => Self::Newline,
             KeyCode::Enter => Self::Submit,
             KeyCode::Tab => Self::Tab,
+            KeyCode::Esc => Self::Escape,
             KeyCode::Backspace => Self::Backspace,
             KeyCode::Left => Self::Left,
             KeyCode::Right => Self::Right,

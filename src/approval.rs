@@ -102,6 +102,7 @@ pub enum ApprovalDecision {
 pub enum AgentControl {
     ApprovalDecision { id: u64, decision: ApprovalDecision },
     ClearConversationEditPermission,
+    Cancel,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

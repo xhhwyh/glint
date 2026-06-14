@@ -94,7 +94,7 @@ struct FileProviderConfig {
 #[serde(untagged)]
 enum FileModelConfig {
     Name(String),
-    Details(FileModelDetails),
+    Details(Box<FileModelDetails>),
 }
 
 #[derive(Deserialize)]

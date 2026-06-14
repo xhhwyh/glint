@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use ratatui::{
     Frame,
     layout::Position,
@@ -8,7 +10,7 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    app::{App, ModelPickerStage},
+    app::{App, ModelPickerStage, ResumePicker},
     approval::{ApprovalChoice, ApprovalFocus},
     message::Role,
 };
@@ -25,6 +27,11 @@ struct Document {
 }
 
 pub fn render(frame: &mut Frame, app: &App) {
+    if let Some(picker) = &app.resume_picker {
+        render_resume_picker(frame, picker);
+        return;
+    }
+
     let width = frame.area().width.max(1);
     let document = document(app, width);
     let max_scroll = document
@@ -44,6 +51,87 @@ pub fn render(frame: &mut Frame, app: &App) {
             document.cursor_y - scroll,
         ));
     }
+}
+
+fn render_resume_picker(frame: &mut Frame, picker: &ResumePicker) {
+    let width = frame.area().width.max(1) as usize;
+    let height = frame.area().height as usize;
+    let now = now();
+    let mut lines = Vec::new();
+
+    lines.push(Line::from(Span::styled(
+        "Resume a session",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    let footer_rows = 2;
+    let list_height = height.saturating_sub(lines.len() + footer_rows);
+    if picker.sessions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No saved sessions for this workspace",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else if list_height > 0 {
+        let start = resume_window_start(picker.selected, picker.sessions.len(), list_height);
+        let end = (start + list_height).min(picker.sessions.len());
+        let age_width = picker.sessions[start..end]
+            .iter()
+            .map(|session| age_label(now.saturating_sub(session.last_timestamp)).width())
+            .max()
+            .unwrap_or(0)
+            .max("time".width());
+
+        for (offset, session) in picker.sessions[start..end].iter().enumerate() {
+            let index = start + offset;
+            let selected = index == picker.selected;
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let age = pad_to_width(
+                &age_label(now.saturating_sub(session.last_timestamp)),
+                age_width,
+            );
+            let title_limit = width.saturating_sub(age_width + 6).max(1);
+            lines.push(Line::from(vec![
+                Span::styled(if selected { "› " } else { "  " }, style),
+                Span::styled(age, style),
+                Span::raw("  "),
+                Span::styled(truncate_end_to_width(&session.title, title_limit), style),
+            ]));
+        }
+    }
+
+    while lines.len() + footer_rows < height {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        "─".repeat(width),
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(vec![
+        Span::styled("Enter", Style::default().fg(Color::Cyan)),
+        Span::styled(" select  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("↑/↓ ←/→", Style::default().fg(Color::Cyan)),
+        Span::styled(" switch  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Esc", Style::default().fg(Color::Cyan)),
+        Span::styled(" exit", Style::default().fg(Color::DarkGray)),
+    ]));
+
+    frame.render_widget(Paragraph::new(lines), frame.area());
+}
+
+fn resume_window_start(selected: usize, len: usize, height: usize) -> usize {
+    if len <= height {
+        return 0;
+    }
+    selected.saturating_sub(height / 2).min(len - height)
 }
 
 fn document(app: &App, width: u16) -> Document {
@@ -67,6 +155,12 @@ fn document(app: &App, width: u16) -> Document {
             ));
         }
         lines.push(Line::from(""));
+    }
+
+    if let Some(elapsed) = app.processing_elapsed() {
+        lines.push(processing_line(elapsed));
+    } else if let Some(notice) = app.run_notice.as_deref() {
+        lines.push(notice_line(notice));
     }
 
     let input_y = lines.len() as u16;
@@ -350,33 +444,49 @@ fn transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 return user_message_lines(message, width);
             }
 
-            let mut lines = vec![Line::from("")];
             if message.role == Role::Assistant && message.content.is_empty() {
-                let activity = app
-                    .agent_activity
-                    .clone()
-                    .unwrap_or_else(|| "Processing...".to_owned());
-                lines.push(Line::from(vec![
-                    Span::styled("  ", Style::default()),
-                    Span::styled(
-                        activity,
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::RAPID_BLINK | Modifier::ITALIC),
-                    ),
-                ]));
-            } else {
-                let markdown_lines =
-                    markdown::render_markdown(&message.content, width.saturating_sub(2));
-                for mut line in markdown_lines {
-                    let mut spans = vec![Span::raw("  ")];
-                    spans.append(&mut line.spans);
-                    lines.push(Line::from(spans));
-                }
+                return Vec::new();
+            }
+
+            let mut lines = vec![Line::from("")];
+            let markdown_lines =
+                markdown::render_markdown(&message.content, width.saturating_sub(2));
+            for mut line in markdown_lines {
+                let mut spans = vec![Span::raw("  ")];
+                spans.append(&mut line.spans);
+                lines.push(Line::from(spans));
             }
             lines
         })
         .collect()
+}
+
+fn processing_line(elapsed: std::time::Duration) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "Processing...",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD | Modifier::ITALIC | Modifier::RAPID_BLINK),
+        ),
+        Span::styled(
+            format!(" ({})", duration_label(elapsed.as_secs())),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+}
+
+fn notice_line(message: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            message.to_owned(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
 }
 
 fn user_message_lines(message: &crate::message::Message, width: u16) -> Vec<Line<'static>> {
@@ -459,7 +569,7 @@ fn tool_message_lines(message: &crate::message::Message, width: u16) -> Vec<Line
         return lines;
     };
 
-    for row in wrap_text(result, width.saturating_sub(6)) {
+    for row in wrap_text(&tool_output_preview(result), width.saturating_sub(6)) {
         lines.push(Line::from(vec![
             Span::raw("    "),
             Span::styled(
@@ -476,6 +586,20 @@ fn tool_message_lines(message: &crate::message::Message, width: u16) -> Vec<Line
     }
 
     lines
+}
+
+fn tool_output_preview(output: &str) -> String {
+    const VISIBLE_LINES: usize = 3;
+
+    let lines = output.lines().collect::<Vec<_>>();
+    if lines.len() <= VISIBLE_LINES {
+        return output.to_owned();
+    }
+
+    let omitted = lines.len() - VISIBLE_LINES;
+    let mut preview = lines[..VISIBLE_LINES].join("\n");
+    preview.push_str(&format!("\n...+{omitted} lines omitted"));
+    preview
 }
 
 fn wrap_text(text: &str, width: u16) -> Vec<String> {
@@ -750,6 +874,31 @@ fn pad_to_width(text: &str, width: usize) -> String {
     format!("{text}{}", " ".repeat(padding))
 }
 
+fn truncate_end_to_width(text: &str, width: usize) -> String {
+    const SUFFIX: &str = "...";
+    let text_width = text.width();
+    if text_width <= width {
+        return text.to_owned();
+    }
+    if width <= SUFFIX.width() {
+        return SUFFIX.chars().take(width).collect();
+    }
+
+    let mut truncated = String::new();
+    let mut truncated_width = 0;
+    let available = width - SUFFIX.width();
+    for char in text.chars() {
+        let char_width = char.width().unwrap_or(0);
+        if truncated_width + char_width > available {
+            break;
+        }
+        truncated.push(char);
+        truncated_width += char_width;
+    }
+    truncated.push_str(SUFFIX);
+    truncated
+}
+
 fn truncate_start_to_width(text: &str, width: usize) -> String {
     const PREFIX: &str = "...";
     let text_width = text.width();
@@ -773,6 +922,42 @@ fn truncate_start_to_width(text: &str, width: usize) -> String {
     }
 
     format!("{PREFIX}{suffix}")
+}
+
+fn age_label(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s ago")
+    } else if seconds < 60 * 60 {
+        format!("{}m ago", seconds / 60)
+    } else if seconds < 60 * 60 * 24 {
+        format!("{}h ago", seconds / (60 * 60))
+    } else {
+        format!("{}d ago", seconds / (60 * 60 * 24))
+    }
+}
+
+fn duration_label(seconds: u64) -> String {
+    let days = seconds / (60 * 60 * 24);
+    let hours = (seconds / (60 * 60)) % 24;
+    let minutes = (seconds / 60) % 60;
+    let seconds = seconds % 60;
+
+    if days > 0 {
+        format!("{days}d {hours}h {minutes}m {seconds}s")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }
 
 fn info_line(app: &App, width: u16) -> Line<'static> {
@@ -1044,6 +1229,15 @@ mod tests {
         assert_eq!(
             truncate_start_to_width("~/projects/glint", 10),
             "...s/glint"
+        );
+    }
+
+    #[test]
+    fn previews_tool_output_with_omitted_line_count() {
+        assert_eq!(tool_output_preview("one\ntwo\nthree"), "one\ntwo\nthree");
+        assert_eq!(
+            tool_output_preview("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight"),
+            "one\ntwo\nthree\n...+5 lines omitted"
         );
     }
 }

@@ -1,7 +1,9 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    thread,
+    time::Duration,
 };
 
 use serde_json::{Value, json};
@@ -45,12 +47,21 @@ impl ToolRegistry {
         ]
     }
 
+    #[cfg(test)]
     pub fn execute(&self, call: &ToolCall) -> ToolResult {
+        self.execute_with_cancel(call, &mut || false)
+    }
+
+    pub fn execute_with_cancel(
+        &self,
+        call: &ToolCall,
+        is_cancelled: &mut dyn FnMut() -> bool,
+    ) -> ToolResult {
         match call.name.as_str() {
             "Read" => read(call),
-            "Glob" => glob(call),
-            "Grep" => grep(call),
-            "Bash" => bash(call),
+            "Glob" => glob(call, is_cancelled),
+            "Grep" => grep(call, is_cancelled),
+            "Bash" => bash(call, is_cancelled),
             "Edit" => edit(call),
             _ => error(call, format!("Tool '{}' is not registered.", call.name)),
         }
@@ -77,11 +88,20 @@ impl ToolRegistry {
         }
     }
 
+    #[cfg(test)]
     pub fn execute_approved(&self, call: &ToolCall) -> ToolResult {
+        self.execute_approved_with_cancel(call, &mut || false)
+    }
+
+    pub fn execute_approved_with_cancel(
+        &self,
+        call: &ToolCall,
+        is_cancelled: &mut dyn FnMut() -> bool,
+    ) -> ToolResult {
         match call.name.as_str() {
-            "Bash" => bash_approved(call),
+            "Bash" => bash_approved(call, is_cancelled),
             "Edit" => edit_approved(call),
-            _ => self.execute(call),
+            _ => self.execute_with_cancel(call, is_cancelled),
         }
     }
 }
@@ -122,16 +142,16 @@ fn spec(name: &str, description: &str, required: &[&str]) -> ToolSpec {
         "limit": { "type": "integer", "minimum": 1 }
     });
 
-    if name == "Bash" {
-        if let Value::Object(properties) = &mut properties {
-            properties.insert(
-                "description".to_owned(),
-                json!({
-                    "type": "string",
-                    "description": "Brief user-facing label for this command in active voice."
-                }),
-            );
-        }
+    if name == "Bash"
+        && let Value::Object(properties) = &mut properties
+    {
+        properties.insert(
+            "description".to_owned(),
+            json!({
+                "type": "string",
+                "description": "Brief user-facing label for this command in active voice."
+            }),
+        );
     }
 
     ToolSpec {
@@ -161,7 +181,7 @@ fn read(call: &ToolCall) -> ToolResult {
     }
 }
 
-fn glob(call: &ToolCall) -> ToolResult {
+fn glob(call: &ToolCall, is_cancelled: &mut dyn FnMut() -> bool) -> ToolResult {
     let Some(pattern) = string_arg(call, "pattern") else {
         return missing_arg(call, "pattern");
     };
@@ -179,10 +199,11 @@ fn glob(call: &ToolCall) -> ToolResult {
         Command::new("rg")
             .args(["--files", "-g", pattern])
             .arg(path),
+        is_cancelled,
     )
 }
 
-fn grep(call: &ToolCall) -> ToolResult {
+fn grep(call: &ToolCall, is_cancelled: &mut dyn FnMut() -> bool) -> ToolResult {
     let Some(pattern) = string_arg(call, "pattern") else {
         return missing_arg(call, "pattern");
     };
@@ -198,10 +219,10 @@ fn grep(call: &ToolCall) -> ToolResult {
     if let Some(glob) = string_arg(call, "glob") {
         command.args(["-g", glob]);
     }
-    command_result(call, &mut command)
+    command_result(call, &mut command, is_cancelled)
 }
 
-fn bash(call: &ToolCall) -> ToolResult {
+fn bash(call: &ToolCall, is_cancelled: &mut dyn FnMut() -> bool) -> ToolResult {
     let Some(command) = string_arg(call, "command") else {
         return missing_arg(call, "command");
     };
@@ -213,18 +234,18 @@ fn bash(call: &ToolCall) -> ToolResult {
         );
     }
 
-    run_bash(call, command)
+    run_bash(call, command, is_cancelled)
 }
 
-fn bash_approved(call: &ToolCall) -> ToolResult {
+fn bash_approved(call: &ToolCall, is_cancelled: &mut dyn FnMut() -> bool) -> ToolResult {
     let Some(command) = string_arg(call, "command") else {
         return missing_arg(call, "command");
     };
 
-    run_bash(call, command)
+    run_bash(call, command, is_cancelled)
 }
 
-fn run_bash(call: &ToolCall, command: &str) -> ToolResult {
+fn run_bash(call: &ToolCall, command: &str, is_cancelled: &mut dyn FnMut() -> bool) -> ToolResult {
     if let Some(replacement) = dedicated_tool_replacement(command) {
         return error(
             call,
@@ -235,7 +256,11 @@ fn run_bash(call: &ToolCall, command: &str) -> ToolResult {
     }
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_owned());
-    command_result(call, Command::new(shell).args(["-lc", command]))
+    command_result(
+        call,
+        Command::new(shell).args(["-lc", command]),
+        is_cancelled,
+    )
 }
 
 fn edit(call: &ToolCall) -> ToolResult {
@@ -389,8 +414,37 @@ fn program_name(word: &str) -> &str {
         .unwrap_or(word)
 }
 
-fn command_result(call: &ToolCall, command: &mut Command) -> ToolResult {
-    match command.output() {
+fn command_result(
+    call: &ToolCall,
+    command: &mut Command,
+    is_cancelled: &mut dyn FnMut() -> bool,
+) -> ToolResult {
+    prepare_killable_command(command);
+    let mut child = match command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => return error(call, format!("failed to run command: {err}")),
+    };
+
+    loop {
+        if is_cancelled() {
+            kill_child_tree(&mut child);
+            return error(call, "cancelled".to_owned());
+        }
+
+        match child.try_wait() {
+            Ok(Some(_)) => return child_output(call, child),
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(err) => return error(call, format!("failed to wait for command: {err}")),
+        }
+    }
+}
+
+fn child_output(call: &ToolCall, child: std::process::Child) -> ToolResult {
+    match child.wait_with_output() {
         Ok(output) => {
             let mut content = String::new();
             content.push_str(&String::from_utf8_lossy(&output.stdout));
@@ -404,8 +458,36 @@ fn command_result(call: &ToolCall, command: &mut Command) -> ToolResult {
                 is_error: !output.status.success(),
             }
         }
-        Err(err) => error(call, format!("failed to run command: {err}")),
+        Err(err) => error(call, format!("failed to collect command output: {err}")),
     }
+}
+
+#[cfg(unix)]
+fn prepare_killable_command(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn prepare_killable_command(_command: &mut Command) {}
+
+#[cfg(unix)]
+fn kill_child_tree(child: &mut std::process::Child) {
+    let pgid = child.id() as libc::pid_t;
+    // The child was started in its own process group, so this kills the shell
+    // and any subprocesses it spawned for this tool call.
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[cfg(not(unix))]
+fn kill_child_tree(child: &mut std::process::Child) {
+    child.kill().ok();
+    child.wait().ok();
 }
 
 fn missing_ripgrep(call: &ToolCall) -> ToolResult {
@@ -604,6 +686,21 @@ mod tests {
             assert!(result.is_error);
             assert!(result.content.contains(expected));
         }
+    }
+
+    #[test]
+    fn bash_command_can_be_cancelled() {
+        let registry = ToolRegistry::new();
+        let call = ToolCall {
+            id: "bash".to_owned(),
+            name: "Bash".to_owned(),
+            arguments: json!({ "command": "sleep 5" }),
+        };
+
+        let result = registry.execute_approved_with_cancel(&call, &mut || true);
+
+        assert!(result.is_error);
+        assert_eq!(result.content, "cancelled");
     }
 
     #[test]
