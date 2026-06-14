@@ -204,7 +204,7 @@ fn complete_chat(config: &LlmConfig, request: ModelRequest) -> Result<ModelRespo
             .map(chat_message_from_model)
             .collect::<Result<Vec<_>>>()?,
         temperature: config.temperature,
-        max_tokens: config.max_tokens,
+        max_tokens: request.max_tokens.unwrap_or(config.max_tokens),
         stream: None,
         stream_options: None,
         tools: chat_tools(request.tools),
@@ -240,7 +240,7 @@ fn stream_chat(
             .map(chat_message_from_model)
             .collect::<Result<Vec<_>>>()?,
         temperature: config.temperature,
-        max_tokens: config.max_tokens,
+        max_tokens: request.max_tokens.unwrap_or(config.max_tokens),
         stream: Some(true),
         stream_options: Some(StreamOptions {
             include_usage: true,
