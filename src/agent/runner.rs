@@ -120,6 +120,7 @@ fn run_model_turns(
                 ModelRequest {
                     messages: messages.clone(),
                     tools: registry.specs(),
+                    max_tokens: None,
                 },
                 &mut on_delta,
             )

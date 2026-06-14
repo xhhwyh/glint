@@ -1,6 +1,7 @@
 use crate::approval::ApprovalRequest;
 use serde::{Deserialize, Serialize};
 
+mod compact;
 mod context;
 mod openai;
 pub(crate) mod provider;
@@ -8,6 +9,7 @@ mod runner;
 mod tool_results;
 mod tools;
 
+pub use compact::{CompactRunInput, should_auto_compact, spawn_compact_loop};
 pub use context::RuntimeContext;
 pub use runner::{AgentRunInput, spawn_agent_loop};
 
@@ -19,10 +21,11 @@ pub struct TokenUsage {
     pub cached_prompt_tokens: Option<u64>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentStatus {
     Idle,
     Thinking,
+    Compacting,
     Responding,
     AwaitingApproval,
 }
@@ -52,6 +55,12 @@ pub enum AgentEvent {
     ConversationPermissionChanged {
         edit_always_allowed: bool,
     },
+    CompactStarted,
+    CompactFinished {
+        summary: String,
+        pre_prompt_tokens: Option<u64>,
+    },
+    CompactFailed(String),
     AssistantFinished,
     Failed(String),
 }

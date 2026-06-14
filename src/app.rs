@@ -8,7 +8,7 @@ use anyhow::Result;
 
 use crate::{
     agent::{
-        self, AgentEvent, AgentRunInput, AgentStatus, RuntimeContext, TokenUsage,
+        self, AgentEvent, AgentRunInput, AgentStatus, CompactRunInput, RuntimeContext, TokenUsage,
         provider::FinishReason,
     },
     approval::{AgentControl, ApprovalFocus, ApprovalPrompt, ConversationPermissions},
@@ -16,7 +16,7 @@ use crate::{
     event::{AppEvent, KeyAction, MouseAction},
     input::InputState,
     message::{Message, Role},
-    transcript::{AssistantTranscript, TranscriptSessionSummary, TranscriptStore},
+    transcript::{AssistantTranscript, CompactTrigger, TranscriptSessionSummary, TranscriptStore},
 };
 
 pub struct App {
@@ -41,6 +41,8 @@ pub struct App {
     transcript_cwd: String,
     agent_control_tx: Option<mpsc::Sender<AgentControl>>,
     agent_tx: mpsc::Sender<AgentEvent>,
+    pending_prompt_after_compact: Option<String>,
+    auto_compact_failures: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,11 +54,17 @@ pub struct SlashCommand {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SlashCommandKind {
+    Compact,
     Model,
     Resume,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 2] = [
+const SLASH_COMMANDS: [SlashCommand; 3] = [
+    SlashCommand {
+        name: "/compact",
+        description: "Summarize earlier conversation and continue compacted",
+        kind: SlashCommandKind::Compact,
+    },
     SlashCommand {
         name: "/model",
         description: "Switch provider and model",
@@ -162,6 +170,8 @@ impl App {
             transcript_cwd,
             agent_control_tx: None,
             agent_tx,
+            pending_prompt_after_compact: None,
+            auto_compact_failures: 0,
         })
     }
 
@@ -291,6 +301,7 @@ impl App {
 
     fn run_slash_command(&mut self, command: SlashCommand) {
         match command.kind {
+            SlashCommandKind::Compact => self.run_compact(),
             SlashCommandKind::Model => self.open_model_picker(),
             SlashCommandKind::Resume => self.open_resume_picker(),
         }
@@ -583,13 +594,82 @@ impl App {
         }
     }
 
+    fn run_compact(&mut self) {
+        let _command = self.input.take_trimmed();
+        self.run_notice = None;
+        self.pending_prompt_after_compact = None;
+        self.reset_agent_channel();
+        let conversation = self.transcript.model_history();
+        if conversation.is_empty() {
+            self.run_notice = Some("No messages to compact.".to_owned());
+            return;
+        }
+
+        self.status = AgentStatus::Compacting;
+        self.turn_started_at = Some(Instant::now());
+        self.agent_activity = Some("Compacting conversation".to_owned());
+        self.scroll = 0;
+        self.agent_control_tx = None;
+
+        agent::spawn_compact_loop(
+            CompactRunInput {
+                llm: self.config.llm.clone(),
+                conversation,
+                pre_prompt_tokens: self.usage.last_usage.map(|usage| usage.prompt_tokens),
+            },
+            self.agent_tx.clone(),
+        );
+    }
+
     fn submit(&mut self) {
         let prompt = self.input.take_trimmed();
         if prompt.is_empty() {
             return;
         }
 
+        if agent::should_auto_compact(
+            &self.config.llm,
+            self.usage.last_usage.map(|usage| usage.prompt_tokens),
+            self.auto_compact_failures,
+        ) {
+            let conversation = self.transcript.model_history();
+            if !conversation.is_empty() {
+                self.start_auto_compact(prompt, conversation);
+                return;
+            }
+        }
+
+        self.submit_prompt(prompt, true);
+    }
+
+    fn start_auto_compact(
+        &mut self,
+        prompt: String,
+        conversation: Vec<agent::provider::ModelMessage>,
+    ) {
         self.run_notice = None;
+        self.reset_agent_channel();
+        self.pending_prompt_after_compact = Some(prompt);
+        self.status = AgentStatus::Compacting;
+        self.turn_started_at = Some(Instant::now());
+        self.agent_activity = Some("Auto-compacting conversation".to_owned());
+        self.scroll = 0;
+        self.agent_control_tx = None;
+
+        agent::spawn_compact_loop(
+            CompactRunInput {
+                llm: self.config.llm.clone(),
+                conversation,
+                pre_prompt_tokens: self.usage.last_usage.map(|usage| usage.prompt_tokens),
+            },
+            self.agent_tx.clone(),
+        );
+    }
+
+    fn submit_prompt(&mut self, prompt: String, clear_notice: bool) {
+        if clear_notice {
+            self.run_notice = None;
+        }
         self.reset_agent_channel();
         let conversation = self.transcript.model_history();
         self.transcript
@@ -630,6 +710,27 @@ impl App {
 
     fn update_agent(&mut self, event: AgentEvent) {
         match event {
+            AgentEvent::CompactStarted => {
+                self.status = AgentStatus::Compacting;
+                self.agent_activity = Some(if self.pending_prompt_after_compact.is_some() {
+                    "Auto-compacting conversation".to_owned()
+                } else {
+                    "Compacting conversation".to_owned()
+                });
+            }
+            AgentEvent::CompactFinished {
+                summary,
+                pre_prompt_tokens,
+            } => {
+                if let Some(prompt) = self.finish_compact(summary, pre_prompt_tokens) {
+                    self.submit_prompt(prompt, false);
+                }
+            }
+            AgentEvent::CompactFailed(error) => {
+                if let Some(prompt) = self.fail_compact(error) {
+                    self.submit_prompt(prompt, false);
+                }
+            }
             AgentEvent::Started => {
                 self.status = AgentStatus::Responding;
                 self.agent_activity = None;
@@ -733,6 +834,51 @@ impl App {
         }
     }
 
+    fn finish_compact(
+        &mut self,
+        summary: String,
+        pre_prompt_tokens: Option<u64>,
+    ) -> Option<String> {
+        let pending_prompt = self.pending_prompt_after_compact.take();
+        let trigger = if pending_prompt.is_some() {
+            CompactTrigger::Auto
+        } else {
+            CompactTrigger::Manual
+        };
+        self.transcript
+            .append_compact_boundary(trigger, summary, pre_prompt_tokens)
+            .ok();
+        self.messages = self.transcript.ui_messages();
+        self.status = AgentStatus::Idle;
+        self.turn_started_at = None;
+        self.agent_activity = None;
+        self.agent_control_tx = None;
+        self.approval = None;
+        if pending_prompt.is_some() {
+            self.auto_compact_failures = 0;
+            self.run_notice = Some("Auto-compacted conversation.".to_owned());
+        } else {
+            self.run_notice = Some("Compacted conversation.".to_owned());
+        }
+        pending_prompt
+    }
+
+    fn fail_compact(&mut self, error: String) -> Option<String> {
+        let pending_prompt = self.pending_prompt_after_compact.take();
+        self.status = AgentStatus::Idle;
+        self.turn_started_at = None;
+        self.agent_activity = None;
+        self.agent_control_tx = None;
+        self.approval = None;
+        if pending_prompt.is_some() {
+            self.auto_compact_failures = self.auto_compact_failures.saturating_add(1);
+            self.run_notice = Some("Auto-compact failed; continuing without compact.".to_owned());
+        } else {
+            self.run_notice = Some(format!("Compact failed: {error}"));
+        }
+        pending_prompt
+    }
+
     fn append_assistant_delta(&mut self, delta: &str) {
         if !matches!(self.messages.last(), Some(message) if message.role == Role::Assistant) {
             self.messages.push(Message::assistant(""));
@@ -784,15 +930,23 @@ impl App {
         if let Some(tx) = &self.agent_control_tx {
             tx.send(AgentControl::Cancel).ok();
         }
+        let was_compacting = self.status == AgentStatus::Compacting;
         self.reset_agent_channel();
-        self.transcript.abort_turn("cancelled".to_owned()).ok();
+        if !was_compacting {
+            self.transcript.abort_turn("cancelled".to_owned()).ok();
+        }
         self.status = AgentStatus::Idle;
         self.turn_started_at = None;
         self.agent_activity = None;
         self.agent_control_tx = None;
         self.approval = None;
+        self.pending_prompt_after_compact = None;
         self.remove_empty_assistant_tail();
-        self.run_notice = Some("Stopped this turn.".to_owned());
+        self.run_notice = Some(if was_compacting {
+            "Stopped compact.".to_owned()
+        } else {
+            "Stopped this turn.".to_owned()
+        });
     }
 
     fn reset_agent_channel(&mut self) {
@@ -863,7 +1017,185 @@ fn home_relative_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::config::{LlmConfig, LlmProviderConfig, ModelCatalog};
+
     use super::*;
+
+    fn app() -> App {
+        let (agent_tx, agent_events) = mpsc::channel();
+        App {
+            should_quit: false,
+            messages: Vec::new(),
+            input: InputState::default(),
+            status: AgentStatus::Idle,
+            scroll: 0,
+            usage: ConversationUsage::default(),
+            slash_command_selection: 0,
+            model_picker: None,
+            resume_picker: None,
+            agent_events,
+            config: Config {
+                llm: LlmConfig {
+                    provider: "test".to_owned(),
+                    base_url: "http://localhost".to_owned(),
+                    model: "test-model".to_owned(),
+                    providers: vec![LlmProviderConfig {
+                        name: "test".to_owned(),
+                        base_url: "http://localhost".to_owned(),
+                        models: vec!["test-model".to_owned()],
+                        model_context_windows: Default::default(),
+                        api_key_env: "TEST_API_KEY".to_owned(),
+                    }],
+                    temperature: 0.0,
+                    max_tokens: 100,
+                    context_window: Some(1000),
+                    api_key: "test-key".to_owned(),
+                    default_context_window: Some(1000),
+                },
+                model_catalog: ModelCatalog::default(),
+                system_prompt: "system".to_owned(),
+            },
+            current_dir: "/workspace".to_owned(),
+            agent_activity: None,
+            run_notice: None,
+            approval: None,
+            conversation_permissions: ConversationPermissions::default(),
+            turn_started_at: None,
+            transcript: TranscriptStore::test_empty(
+                std::env::temp_dir().join(format!("glint-app-test-{}.jsonl", uuid::Uuid::new_v4())),
+            ),
+            transcript_cwd: "/workspace".to_owned(),
+            agent_control_tx: None,
+            agent_tx,
+            pending_prompt_after_compact: None,
+            auto_compact_failures: 0,
+        }
+    }
+
+    #[test]
+    fn slash_commands_include_compact() {
+        let names = SLASH_COMMANDS
+            .iter()
+            .map(|command| command.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"/compact"));
+    }
+
+    #[test]
+    fn compact_command_on_empty_history_does_not_record_user_message() {
+        let mut app = app();
+        app.input.set("/compact");
+
+        let command = SLASH_COMMANDS
+            .iter()
+            .find(|command| command.name == "/compact")
+            .copied()
+            .unwrap();
+        app.run_slash_command(command);
+
+        assert_eq!(app.status, AgentStatus::Idle);
+        assert_eq!(app.messages.len(), 0);
+        assert_eq!(app.transcript.model_history().len(), 0);
+        assert_eq!(app.run_notice.as_deref(), Some("No messages to compact."));
+    }
+
+    #[test]
+    fn compact_finished_records_boundary_and_notice() {
+        let mut app = app();
+        app.transcript.append_user("old user".to_owned()).unwrap();
+        app.messages = app.transcript.ui_messages();
+        app.status = AgentStatus::Compacting;
+        app.turn_started_at = Some(Instant::now());
+
+        let pending_prompt = app.finish_compact("important summary".to_owned(), Some(20));
+
+        let history = app.transcript.model_history();
+        assert_eq!(pending_prompt, None);
+        assert_eq!(app.status, AgentStatus::Idle);
+        assert_eq!(app.run_notice.as_deref(), Some("Compacted conversation."));
+        assert!(
+            app.messages
+                .iter()
+                .any(|message| message.content == "Compacted conversation")
+        );
+        assert_eq!(history.len(), 1);
+        assert!(
+            history[0]
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("important summary"))
+        );
+    }
+
+    #[test]
+    fn auto_compact_finished_records_auto_boundary_and_returns_pending_prompt() {
+        let mut app = app();
+        app.transcript.append_user("old user".to_owned()).unwrap();
+        app.pending_prompt_after_compact = Some("new prompt".to_owned());
+        app.auto_compact_failures = 2;
+        app.status = AgentStatus::Compacting;
+
+        let pending_prompt = app.finish_compact("auto summary".to_owned(), Some(900));
+
+        assert_eq!(pending_prompt.as_deref(), Some("new prompt"));
+        assert_eq!(app.auto_compact_failures, 0);
+        assert_eq!(
+            app.run_notice.as_deref(),
+            Some("Auto-compacted conversation.")
+        );
+        assert!(
+            app.transcript
+                .model_history()
+                .first()
+                .and_then(|message| message.content.as_deref())
+                .is_some_and(|content| content.contains("auto summary"))
+        );
+    }
+
+    #[test]
+    fn auto_compact_failure_returns_pending_prompt_and_increments_failures() {
+        let mut app = app();
+        app.pending_prompt_after_compact = Some("new prompt".to_owned());
+        app.auto_compact_failures = 2;
+        app.status = AgentStatus::Compacting;
+
+        let pending_prompt = app.fail_compact("network error".to_owned());
+
+        assert_eq!(pending_prompt.as_deref(), Some("new prompt"));
+        assert_eq!(app.auto_compact_failures, 3);
+        assert_eq!(
+            app.run_notice.as_deref(),
+            Some("Auto-compact failed; continuing without compact.")
+        );
+        assert_eq!(app.status, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn should_auto_compact_uses_latest_prompt_usage_and_failure_limit() {
+        let mut app = app();
+        app.config.llm.context_window = Some(1_000_000);
+        app.config.llm.max_tokens = 8_196;
+        app.usage = ConversationUsage::default().record(TokenUsage {
+            prompt_tokens: 978_804,
+            completion_tokens: 10,
+            total_tokens: 978_814,
+            cached_prompt_tokens: None,
+        });
+
+        assert!(agent::should_auto_compact(
+            &app.config.llm,
+            app.usage.last_usage.map(|usage| usage.prompt_tokens),
+            app.auto_compact_failures
+        ));
+
+        app.auto_compact_failures = 3;
+        assert!(!agent::should_auto_compact(
+            &app.config.llm,
+            app.usage.last_usage.map(|usage| usage.prompt_tokens),
+            app.auto_compact_failures
+        ));
+    }
 
     #[test]
     fn records_latest_usage_and_accumulates_totals() {

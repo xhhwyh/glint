@@ -106,6 +106,7 @@ pub struct ModelResponse {
 pub struct ModelRequest {
     pub messages: Vec<ModelMessage>,
     pub tools: Vec<ToolSpec>,
+    pub max_tokens: Option<u32>,
 }
 
 pub trait ModelProvider {

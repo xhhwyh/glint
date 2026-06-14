@@ -20,7 +20,8 @@ use crate::{
     message::Message,
 };
 
-const SCHEMA: u16 = 2;
+const SCHEMA: u16 = 3;
+const COMPACT_UI_MESSAGE: &str = "Compacted conversation";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TranscriptEntry {
@@ -92,6 +93,12 @@ pub enum ResponseItem {
         #[serde(skip_serializing_if = "is_false")]
         is_error: bool,
     },
+    CompactBoundary {
+        trigger: CompactTrigger,
+        summary: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pre_prompt_tokens: Option<u64>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -106,6 +113,13 @@ pub enum ContentBlock {
 pub enum TranscriptRole {
     User,
     Assistant,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactTrigger {
+    Auto,
+    Manual,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -237,7 +251,12 @@ impl TranscriptStore {
     pub fn model_history(&self) -> Vec<ModelMessage> {
         let items = self.response_items();
         let mut history = Vec::new();
-        let mut index = 0;
+        let mut index = last_compact_boundary(&items)
+            .map(|(index, summary)| {
+                history.push(ModelMessage::user(compact_summary_message(summary)));
+                index + 1
+            })
+            .unwrap_or(0);
 
         while index < items.len() {
             match items[index] {
@@ -312,6 +331,13 @@ impl TranscriptStore {
                 ResponseItem::FunctionCall { .. } | ResponseItem::FunctionCallOutput { .. } => {
                     index += 1;
                 }
+                ResponseItem::CompactBoundary { .. } => {
+                    history.clear();
+                    if let ResponseItem::CompactBoundary { summary, .. } = items[index] {
+                        history.push(ModelMessage::user(compact_summary_message(summary)));
+                    }
+                    index += 1;
+                }
             }
         }
 
@@ -365,6 +391,9 @@ impl TranscriptStore {
                         message.content = output.clone();
                         message.tool_finished = true;
                     }
+                }
+                ResponseItem::CompactBoundary { .. } => {
+                    messages.push(Message::assistant(COMPACT_UI_MESSAGE));
                 }
             }
         }
@@ -465,6 +494,23 @@ impl TranscriptStore {
             self.append_usage(usage)?;
         }
         Ok(())
+    }
+
+    pub fn append_compact_boundary(
+        &mut self,
+        trigger: CompactTrigger,
+        summary: String,
+        pre_prompt_tokens: Option<u64>,
+    ) -> Result<()> {
+        self.flush_pending_usage()?;
+        self.append(
+            TranscriptEntryType::ResponseItem,
+            TranscriptPayload::ResponseItem(ResponseItem::CompactBoundary {
+                trigger,
+                summary,
+                pre_prompt_tokens,
+            }),
+        )
     }
 
     pub fn complete_turn(&mut self) -> Result<()> {
@@ -579,6 +625,11 @@ impl TranscriptStore {
             pending_usage: None,
             pending_usage_tool_calls: Vec::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_empty(path: PathBuf) -> Self {
+        Self::empty(path)
     }
 }
 
@@ -700,6 +751,24 @@ fn finish_reason_text(reason: FinishReason) -> String {
     }
 }
 
+fn last_compact_boundary<'a>(items: &[&'a ResponseItem]) -> Option<(usize, &'a str)> {
+    items
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, item)| match item {
+            ResponseItem::CompactBoundary { summary, .. } => Some((index, summary.as_str())),
+            _ => None,
+        })
+}
+
+fn compact_summary_message(summary: &str) -> String {
+    format!(
+        "This session is being continued from a previous conversation that was compacted. The summary below covers the earlier portion of the conversation.\n\n{}\n\nContinue from this context without asking the user to repeat prior details.",
+        summary.trim()
+    )
+}
+
 fn content_text(content: &[ContentBlock]) -> String {
     content
         .iter()
@@ -749,6 +818,24 @@ fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn store() -> TranscriptStore {
+        TranscriptStore::empty(
+            std::env::temp_dir().join(format!("glint-transcript-test-{}.jsonl", new_id())),
+        )
+    }
+
+    fn assistant(content: &str) -> AssistantTranscript {
+        AssistantTranscript {
+            content: content.to_owned(),
+            provider: "test".to_owned(),
+            model: "test-model".to_owned(),
+            tool_calls: Vec::new(),
+            usage: None,
+            finish_reason: FinishReason::Stop,
+            error: None,
+        }
+    }
 
     #[test]
     fn create_new_starts_empty_even_when_saved_sessions_exist() {
@@ -816,5 +903,131 @@ mod tests {
         assert!(messages[1].tool_finished);
 
         fs::remove_dir_all(project_dir).ok();
+    }
+
+    #[test]
+    fn model_history_is_unchanged_without_compact_boundary() {
+        let mut transcript = store();
+        transcript.append_user("first user".to_owned()).unwrap();
+        transcript
+            .append_assistant(assistant("first assistant"))
+            .unwrap();
+
+        let history = transcript.model_history();
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content.as_deref(), Some("first user"));
+        assert_eq!(history[1].content.as_deref(), Some("first assistant"));
+    }
+
+    #[test]
+    fn model_history_starts_from_last_compact_boundary() {
+        let mut transcript = store();
+        transcript.append_user("old user".to_owned()).unwrap();
+        transcript
+            .append_assistant(assistant("old assistant"))
+            .unwrap();
+        transcript
+            .append_compact_boundary(
+                CompactTrigger::Manual,
+                "important summary".to_owned(),
+                Some(8),
+            )
+            .unwrap();
+        transcript.append_user("new user".to_owned()).unwrap();
+
+        let history = transcript.model_history();
+
+        assert_eq!(history.len(), 2);
+        assert!(
+            history[0]
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("important summary"))
+        );
+        assert_eq!(history[1].content.as_deref(), Some("new user"));
+        assert!(
+            !history
+                .iter()
+                .any(|message| message.content.as_deref() == Some("old user"))
+        );
+    }
+
+    #[test]
+    fn model_history_uses_only_the_latest_compact_boundary() {
+        let mut transcript = store();
+        transcript.append_user("old user".to_owned()).unwrap();
+        transcript
+            .append_compact_boundary(CompactTrigger::Manual, "first summary".to_owned(), None)
+            .unwrap();
+        transcript.append_user("middle user".to_owned()).unwrap();
+        transcript
+            .append_compact_boundary(CompactTrigger::Manual, "second summary".to_owned(), None)
+            .unwrap();
+        transcript.append_user("latest user".to_owned()).unwrap();
+
+        let history = transcript.model_history();
+
+        assert_eq!(history.len(), 2);
+        assert!(
+            history[0]
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("second summary"))
+        );
+        assert!(
+            !history
+                .iter()
+                .any(|message| message.content.as_deref().is_some_and(|content| {
+                    content.contains("first summary") || content.contains("middle user")
+                }))
+        );
+    }
+
+    #[test]
+    fn ui_messages_show_compact_marker_without_summary() {
+        let mut transcript = store();
+        transcript.append_user("old user".to_owned()).unwrap();
+        transcript
+            .append_compact_boundary(
+                CompactTrigger::Manual,
+                "secret detailed summary".to_owned(),
+                None,
+            )
+            .unwrap();
+
+        let messages = transcript.ui_messages();
+
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content == COMPACT_UI_MESSAGE)
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.content.contains("secret detailed summary"))
+        );
+    }
+
+    #[test]
+    fn compact_trigger_auto_round_trips_as_snake_case() {
+        let item = ResponseItem::CompactBoundary {
+            trigger: CompactTrigger::Auto,
+            summary: "summary".to_owned(),
+            pre_prompt_tokens: Some(10),
+        };
+
+        let encoded = serde_json::to_string(&item).unwrap();
+        let decoded: ResponseItem = serde_json::from_str(&encoded).unwrap();
+
+        assert!(encoded.contains("\"trigger\":\"auto\""));
+        assert!(matches!(
+            decoded,
+            ResponseItem::CompactBoundary {
+                trigger: CompactTrigger::Auto,
+                ..
+            }
+        ));
     }
 }
