@@ -88,6 +88,7 @@ pub enum ResponseItem {
     FunctionCallOutput {
         call_id: String,
         output: String,
+        #[serde(default)]
         #[serde(skip_serializing_if = "is_false")]
         is_error: bool,
     },
@@ -164,27 +165,34 @@ struct EntryKind {
 }
 
 impl TranscriptStore {
-    pub fn load_or_create(cwd: &str, _provider: &str, _model: &str) -> Result<Self> {
+    pub fn create_new(cwd: &str) -> Result<Self> {
         let project_dir = transcript_project_dir(cwd)?;
+        Self::create_new_in_project_dir(project_dir)
+    }
+
+    fn create_new_in_project_dir(project_dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(&project_dir).context("failed to create transcript directory")?;
-        let path = latest_transcript_path(&project_dir)?.unwrap_or_else(|| {
-            let session_id = new_id();
-            project_dir.join(format!("{session_id}.jsonl"))
-        });
-
-        let mut store = Self::empty(path);
-
-        if store.path.exists() {
-            store.load_entries()?;
-        }
-
-        Ok(store)
+        let session_id = new_id();
+        Ok(Self::empty(project_dir.join(format!("{session_id}.jsonl"))))
     }
 
     pub fn load_path(path: PathBuf) -> Result<Self> {
         let mut store = Self::empty(path);
         store.load_entries()?;
         Ok(store)
+    }
+
+    pub fn tool_results_dir(&self) -> PathBuf {
+        let session_id = self
+            .path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("session");
+        self.path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(session_id)
+            .join("tool-results")
     }
 
     pub fn sessions(cwd: &str) -> Result<Vec<TranscriptSessionSummary>> {
@@ -683,28 +691,6 @@ fn sanitize_cwd(cwd: &str) -> String {
     }
 }
 
-fn latest_transcript_path(project_dir: &Path) -> Result<Option<PathBuf>> {
-    let mut latest = None;
-    for entry in fs::read_dir(project_dir).context("failed to read transcript directory")? {
-        let entry = entry.context("failed to read transcript entry")?;
-        let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let modified = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok();
-        if latest
-            .as_ref()
-            .is_none_or(|(_, latest_modified)| modified > *latest_modified)
-        {
-            latest = Some((path, modified));
-        }
-    }
-    Ok(latest.map(|(path, _)| path))
-}
-
 fn finish_reason_text(reason: FinishReason) -> String {
     match reason {
         FinishReason::Stop => "stop".to_owned(),
@@ -758,4 +744,77 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_new_starts_empty_even_when_saved_sessions_exist() {
+        let cwd = "/tmp/glint-create-new-test";
+        let project_dir = std::env::temp_dir().join(format!("glint-create-new-test-{}", new_id()));
+
+        let mut existing = TranscriptStore::create_new_in_project_dir(project_dir.clone())
+            .expect("create existing session");
+        existing
+            .start_turn(cwd.to_owned(), "provider".to_owned(), "model".to_owned())
+            .expect("start turn");
+        existing
+            .append_user("old prompt".to_owned())
+            .expect("append user");
+
+        let fresh = TranscriptStore::create_new_in_project_dir(project_dir.clone())
+            .expect("create fresh session");
+
+        assert!(fresh.ui_messages().is_empty());
+        assert!(fresh.model_history().is_empty());
+        assert_eq!(fresh.token_usages().count(), 0);
+
+        fs::remove_dir_all(project_dir).ok();
+    }
+
+    #[test]
+    fn load_path_accepts_successful_tool_outputs_without_is_error() {
+        let cwd = "/tmp/glint-load-path-tool-output-test";
+        let project_dir =
+            std::env::temp_dir().join(format!("glint-load-path-tool-output-test-{}", new_id()));
+
+        let mut store = TranscriptStore::create_new_in_project_dir(project_dir.clone())
+            .expect("create session");
+        store
+            .start_turn(cwd.to_owned(), "provider".to_owned(), "model".to_owned())
+            .expect("start turn");
+        store
+            .append_user("read file".to_owned())
+            .expect("append user");
+        store
+            .append_assistant(AssistantTranscript {
+                content: String::new(),
+                provider: "provider".to_owned(),
+                model: "model".to_owned(),
+                tool_calls: vec![ToolCall {
+                    id: "call-one".to_owned(),
+                    name: "Read".to_owned(),
+                    arguments: serde_json::json!({ "file_path": "Cargo.toml" }),
+                }],
+                usage: None,
+                finish_reason: FinishReason::ToolCalls,
+                error: None,
+            })
+            .expect("append assistant");
+        store
+            .append_tool("call-one".to_owned(), "tool output".to_owned(), false)
+            .expect("append successful tool output");
+
+        let loaded = TranscriptStore::load_path(store.path.clone()).expect("load transcript");
+        let messages = loaded.ui_messages();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "read file");
+        assert_eq!(messages[1].content, "tool output");
+        assert!(messages[1].tool_finished);
+
+        fs::remove_dir_all(project_dir).ok();
+    }
 }

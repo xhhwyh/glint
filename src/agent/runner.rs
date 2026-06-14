@@ -1,7 +1,12 @@
 use std::{
-    path::{Path, PathBuf},
-    sync::mpsc::{Receiver, Sender},
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
     thread,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -17,10 +22,12 @@ use super::{
     context::build_initial_messages,
     openai::OpenAiProvider,
     provider::{FinishReason, ModelMessage, ModelProvider, ModelRequest, ModelResponse, ToolCall},
+    tool_results::ToolResultBudget,
     tools::ToolRegistry,
 };
 
 const MAX_TOOL_ITERATIONS: usize = 8;
+const TOOL_BATCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone)]
 pub struct AgentRunInput {
@@ -30,6 +37,13 @@ pub struct AgentRunInput {
     pub conversation_permissions: ConversationPermissions,
     pub conversation: Vec<ModelMessage>,
     pub current_user_message: String,
+    pub tool_results_dir: PathBuf,
+}
+
+struct ToolExecutionState<'a> {
+    project_settings: &'a mut ProjectSettings,
+    conversation_permissions: &'a mut ConversationPermissions,
+    tool_result_budget: &'a ToolResultBudget,
 }
 
 pub fn spawn_agent_loop(
@@ -68,6 +82,7 @@ fn run_agent_loop(
         &input.conversation,
         &input.current_user_message,
     );
+    let tool_result_budget = ToolResultBudget::new(input.tool_results_dir);
 
     run_model_turns(
         &mut messages,
@@ -76,6 +91,7 @@ fn run_agent_loop(
         tx,
         control_rx,
         input.conversation_permissions,
+        &tool_result_budget,
     )
 }
 
@@ -86,6 +102,7 @@ fn run_model_turns(
     tx: &Sender<AgentEvent>,
     control_rx: &Receiver<AgentControl>,
     initial_permissions: ConversationPermissions,
+    tool_result_budget: &ToolResultBudget,
 ) -> Result<()> {
     let mut tool_iterations = 0;
     let mut project_settings = ProjectSettings::load();
@@ -112,6 +129,16 @@ fn run_model_turns(
             bail!("cancelled");
         }
 
+        let normalized_tool_calls = response
+            .tool_calls
+            .iter()
+            .map(|call| registry.normalize_for_context(call))
+            .collect();
+        let response = ModelResponse {
+            tool_calls: normalized_tool_calls,
+            ..response
+        };
+
         tx.send(AgentEvent::AssistantTurn {
             usage: response.usage,
             finish_reason: response.finish_reason.clone(),
@@ -125,14 +152,18 @@ fn run_model_turns(
                 bail!("maximum tool iterations exceeded");
             }
 
+            let mut tool_state = ToolExecutionState {
+                project_settings: &mut project_settings,
+                conversation_permissions: &mut conversation_permissions,
+                tool_result_budget,
+            };
             append_tool_turn(
                 messages,
                 response,
                 registry,
                 tx,
                 control_rx,
-                &mut project_settings,
-                &mut conversation_permissions,
+                &mut tool_state,
             )?;
             continue;
         }
@@ -147,8 +178,7 @@ fn append_tool_turn(
     registry: &ToolRegistry,
     tx: &Sender<AgentEvent>,
     control_rx: &Receiver<AgentControl>,
-    project_settings: &mut ProjectSettings,
-    conversation_permissions: &mut ConversationPermissions,
+    state: &mut ToolExecutionState<'_>,
 ) -> Result<()> {
     let assistant_text = response.assistant_text.filter(|text| !text.is_empty());
     messages.push(ModelMessage::assistant(
@@ -156,10 +186,73 @@ fn append_tool_turn(
         response.tool_calls.clone(),
     ));
 
-    for call in response.tool_calls {
-        if drain_control_messages(control_rx, tx, conversation_permissions) {
-            bail!("cancelled");
+    for batch in partition_tool_calls(registry, response.tool_calls, state) {
+        if batch.concurrent {
+            append_concurrent_tool_batch(messages, tx, control_rx, state, batch.calls)?;
+        } else {
+            for call in batch.calls {
+                append_serial_tool_call(messages, registry, tx, control_rx, state, call)?;
+            }
         }
+    }
+    Ok(())
+}
+
+fn append_serial_tool_call(
+    messages: &mut Vec<ModelMessage>,
+    registry: &ToolRegistry,
+    tx: &Sender<AgentEvent>,
+    control_rx: &Receiver<AgentControl>,
+    state: &mut ToolExecutionState<'_>,
+    call: ToolCall,
+) -> Result<()> {
+    if drain_control_messages(control_rx, tx, state.conversation_permissions) {
+        bail!("cancelled");
+    }
+    tx.send(AgentEvent::ToolStarted {
+        id: call.id.clone(),
+        name: call.name.clone(),
+        input_summary: summarize_tool_input(&call),
+        input_description: summarize_tool_description(&call),
+    })
+    .ok();
+
+    let result = execute_tool_with_approval(
+        registry,
+        call.clone(),
+        tx,
+        control_rx,
+        state.project_settings,
+        state.conversation_permissions,
+    )?;
+    let tool_name = call.name.clone();
+    let result = state.tool_result_budget.apply(&tool_name, result);
+
+    tx.send(AgentEvent::ToolFinished {
+        id: call.id,
+        name: tool_name,
+        output: result.content.clone(),
+        is_error: result.is_error,
+        output_summary: summarize_tool_output(&result.content),
+    })
+    .ok();
+
+    messages.push(ModelMessage::tool_result(&result));
+    Ok(())
+}
+
+fn append_concurrent_tool_batch(
+    messages: &mut Vec<ModelMessage>,
+    tx: &Sender<AgentEvent>,
+    control_rx: &Receiver<AgentControl>,
+    state: &mut ToolExecutionState<'_>,
+    calls: Vec<ToolCall>,
+) -> Result<()> {
+    let call_count = calls.len();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (result_tx, result_rx) = mpsc::channel();
+
+    for (index, call) in calls.into_iter().enumerate() {
         tx.send(AgentEvent::ToolStarted {
             id: call.id.clone(),
             name: call.name.clone(),
@@ -168,27 +261,124 @@ fn append_tool_turn(
         })
         .ok();
 
-        let result = execute_tool_with_approval(
-            registry,
-            call.clone(),
-            tx,
-            control_rx,
-            project_settings,
-            conversation_permissions,
-        )?;
+        let result_tx = result_tx.clone();
+        let cancelled = Arc::clone(&cancelled);
+        let tool_result_budget = state.tool_result_budget.clone();
+        thread::spawn(move || {
+            let registry = ToolRegistry::new();
+            let tool_name = call.name.clone();
+            let mut is_cancelled = || cancelled.load(Ordering::Relaxed);
+            let result = registry.execute_approved_with_cancel(&call, &mut is_cancelled);
+            let result = tool_result_budget.apply(&tool_name, result);
+            result_tx
+                .send(CompletedTool {
+                    index,
+                    call,
+                    result,
+                })
+                .ok();
+        });
+    }
+    drop(result_tx);
 
-        tx.send(AgentEvent::ToolFinished {
-            id: call.id.clone(),
-            name: call.name,
-            output: result.content.clone(),
-            is_error: result.is_error,
-            output_summary: summarize_tool_output(&result.content),
-        })
-        .ok();
+    let mut completed = (0..call_count).map(|_| None).collect::<Vec<_>>();
+    let mut remaining = call_count;
+    let mut saw_cancel = false;
 
-        messages.push(ModelMessage::tool_result(&result));
+    while remaining > 0 {
+        if drain_control_messages(control_rx, tx, state.conversation_permissions) {
+            cancelled.store(true, Ordering::Relaxed);
+            saw_cancel = true;
+        }
+
+        match result_rx.recv_timeout(TOOL_BATCH_POLL_INTERVAL) {
+            Ok(completed_tool) => {
+                remaining -= 1;
+                tx.send(AgentEvent::ToolFinished {
+                    id: completed_tool.call.id.clone(),
+                    name: completed_tool.call.name.clone(),
+                    output: completed_tool.result.content.clone(),
+                    is_error: completed_tool.result.is_error,
+                    output_summary: summarize_tool_output(&completed_tool.result.content),
+                })
+                .ok();
+                let index = completed_tool.index;
+                completed[index] = Some(completed_tool);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("tool worker channel closed before all tools completed");
+            }
+        }
+    }
+
+    if saw_cancel || drain_control_messages(control_rx, tx, state.conversation_permissions) {
+        cancelled.store(true, Ordering::Relaxed);
+        bail!("cancelled");
+    }
+
+    for completed_tool in completed.into_iter().flatten() {
+        messages.push(ModelMessage::tool_result(&completed_tool.result));
     }
     Ok(())
+}
+
+struct CompletedTool {
+    index: usize,
+    call: ToolCall,
+    result: super::provider::ToolResult,
+}
+
+struct ToolBatch {
+    concurrent: bool,
+    calls: Vec<ToolCall>,
+}
+
+fn partition_tool_calls(
+    registry: &ToolRegistry,
+    calls: Vec<ToolCall>,
+    state: &ToolExecutionState<'_>,
+) -> Vec<ToolBatch> {
+    let mut batches: Vec<ToolBatch> = Vec::new();
+
+    for call in calls {
+        let concurrent = can_run_concurrently(registry, &call, state);
+        if concurrent && batches.last().is_some_and(|batch| batch.concurrent) {
+            batches
+                .last_mut()
+                .expect("last batch exists")
+                .calls
+                .push(call);
+        } else {
+            batches.push(ToolBatch {
+                concurrent,
+                calls: vec![call],
+            });
+        }
+    }
+
+    batches
+}
+
+fn can_run_concurrently(
+    registry: &ToolRegistry,
+    call: &ToolCall,
+    state: &ToolExecutionState<'_>,
+) -> bool {
+    let bash_prefix_allowed = bash_prefix_allowed(state.project_settings, call);
+    registry.is_concurrency_safe(call)
+        && !registry.requires_approval(
+            call,
+            bash_prefix_allowed,
+            state.conversation_permissions.edit_always_allowed,
+        )
+}
+
+fn bash_prefix_allowed(project_settings: &ProjectSettings, call: &ToolCall) -> bool {
+    call.arguments
+        .get("command")
+        .and_then(|value| value.as_str())
+        .is_some_and(|command| project_settings.allows_bash(command))
 }
 
 fn execute_tool_with_approval(
@@ -202,11 +392,7 @@ fn execute_tool_with_approval(
     if drain_control_messages(control_rx, tx, conversation_permissions) {
         bail!("cancelled");
     }
-    let bash_prefix_allowed = call
-        .arguments
-        .get("command")
-        .and_then(|value| value.as_str())
-        .is_some_and(|command| project_settings.allows_bash(command));
+    let bash_prefix_allowed = bash_prefix_allowed(project_settings, &call);
     let requires_approval = registry.requires_approval(
         &call,
         bash_prefix_allowed,
@@ -375,97 +561,15 @@ fn finish_without_tools(response: ModelResponse) -> Result<()> {
 }
 
 fn summarize_tool_input(call: &ToolCall) -> String {
-    let summary = match call.name.as_str() {
-        "Read" => path_arg(call, "file_path"),
-        "Glob" => glob_summary(call),
-        "Grep" => string_arg(call, "pattern").map(str::to_owned),
-        "Bash" => string_arg(call, "command").map(str::to_owned),
-        "Edit" => path_arg(call, "file_path"),
-        _ => None,
-    };
-
-    let summary = summary.unwrap_or_else(|| call.arguments.to_string());
-    truncate_summary(&summary)
+    ToolRegistry::new().input_summary(call)
 }
 
 fn summarize_tool_description(call: &ToolCall) -> Option<String> {
-    match call.name.as_str() {
-        "Bash" => string_arg(call, "description").map(truncate_summary),
-        _ => None,
-    }
+    ToolRegistry::new().input_description(call)
 }
 
 fn summarize_tool_output(output: &str) -> String {
-    truncate_summary(output)
-}
-
-fn truncate_summary(output: &str) -> String {
-    const MAX_SUMMARY_CHARS: usize = 120;
-
-    if output.chars().count() <= MAX_SUMMARY_CHARS {
-        return output.to_owned();
-    }
-
-    format!(
-        "{}...",
-        output.chars().take(MAX_SUMMARY_CHARS).collect::<String>()
-    )
-}
-
-fn glob_summary(call: &ToolCall) -> Option<String> {
-    let pattern = string_arg(call, "pattern")?;
-    let Some(path) = string_arg(call, "path") else {
-        return Some(pattern.to_owned());
-    };
-
-    let display_path = display_path(path);
-    if display_path == "." {
-        Some(pattern.to_owned())
-    } else {
-        Some(format!("{display_path} ｜ {pattern}"))
-    }
-}
-
-fn path_arg(call: &ToolCall, name: &str) -> Option<String> {
-    string_arg(call, name).map(display_path)
-}
-
-fn string_arg<'a>(call: &'a ToolCall, name: &str) -> Option<&'a str> {
-    call.arguments.get(name).and_then(|value| value.as_str())
-}
-
-fn display_path(path: &str) -> String {
-    let path = Path::new(path);
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let cwd = cwd.canonicalize().unwrap_or(cwd);
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    };
-    let display_path = absolute.canonicalize().unwrap_or(absolute);
-
-    display_path
-        .strip_prefix(&cwd)
-        .map(display_relative_path)
-        .unwrap_or_else(|_| display_path_string(&display_path))
-}
-
-fn display_relative_path(path: &Path) -> String {
-    let display = display_path_string(path);
-    if display.is_empty() {
-        return ".".to_owned();
-    }
-
-    display
-        .strip_prefix("./")
-        .unwrap_or(&display)
-        .trim_end_matches('/')
-        .to_owned()
-}
-
-fn display_path_string(path: &Path) -> String {
-    path.display().to_string().replace('\\', "/")
+    ToolRegistry::new().output_summary(output)
 }
 
 #[cfg(test)]
@@ -479,6 +583,7 @@ mod tests {
     use crate::{
         agent::provider::{ModelRole, ToolResult},
         config::LlmProviderConfig,
+        settings::{ProjectPermissions, ProjectSettings},
     };
 
     struct FakeProvider {
@@ -546,6 +651,7 @@ mod tests {
             conversation_permissions: ConversationPermissions::default(),
             conversation: Vec::new(),
             current_user_message: "hello".to_owned(),
+            tool_results_dir: std::env::temp_dir(),
         }
     }
 
@@ -574,6 +680,18 @@ mod tests {
     fn control_rx() -> Receiver<AgentControl> {
         let (_tx, rx) = mpsc::channel();
         rx
+    }
+
+    fn tool_state<'a>(
+        project_settings: &'a mut ProjectSettings,
+        conversation_permissions: &'a mut ConversationPermissions,
+        tool_result_budget: &'a ToolResultBudget,
+    ) -> ToolExecutionState<'a> {
+        ToolExecutionState {
+            project_settings,
+            conversation_permissions,
+            tool_result_budget,
+        }
     }
 
     #[test]
@@ -614,6 +732,136 @@ mod tests {
                     .as_deref()
                     .is_some_and(|content| content.contains("not registered"))
         }));
+    }
+
+    #[test]
+    fn partitions_consecutive_read_only_tools_for_concurrent_execution() {
+        let registry = ToolRegistry::new();
+        let mut project_settings = ProjectSettings {
+            root: std::env::current_dir().unwrap(),
+            permissions: ProjectPermissions::default(),
+        };
+        let mut conversation_permissions = ConversationPermissions::default();
+        let budget = ToolResultBudget::new(std::env::temp_dir());
+        let state = tool_state(
+            &mut project_settings,
+            &mut conversation_permissions,
+            &budget,
+        );
+        let batches = partition_tool_calls(
+            &registry,
+            vec![
+                ToolCall {
+                    id: "read".to_owned(),
+                    name: "Read".to_owned(),
+                    arguments: json!({ "file_path": "Cargo.toml" }),
+                },
+                ToolCall {
+                    id: "grep".to_owned(),
+                    name: "Grep".to_owned(),
+                    arguments: json!({ "pattern": "glint", "path": "Cargo.toml" }),
+                },
+                ToolCall {
+                    id: "bash".to_owned(),
+                    name: "Bash".to_owned(),
+                    arguments: json!({ "command": "git status --short" }),
+                },
+                ToolCall {
+                    id: "glob".to_owned(),
+                    name: "Glob".to_owned(),
+                    arguments: json!({ "pattern": "src/*.rs" }),
+                },
+            ],
+            &state,
+        );
+
+        assert_eq!(batches.len(), 3);
+        assert!(batches[0].concurrent);
+        assert_eq!(batches[0].calls.len(), 2);
+        assert!(!batches[1].concurrent);
+        assert_eq!(batches[1].calls[0].name, "Bash");
+        assert!(batches[2].concurrent);
+        assert_eq!(batches[2].calls[0].name, "Glob");
+    }
+
+    #[test]
+    fn protected_read_tool_runs_serially() {
+        let registry = ToolRegistry::new();
+        let mut project_settings = ProjectSettings {
+            root: std::env::current_dir().unwrap(),
+            permissions: ProjectPermissions::default(),
+        };
+        let mut conversation_permissions = ConversationPermissions::default();
+        let budget = ToolResultBudget::new(std::env::temp_dir());
+        let state = tool_state(
+            &mut project_settings,
+            &mut conversation_permissions,
+            &budget,
+        );
+        let batches = partition_tool_calls(
+            &registry,
+            vec![ToolCall {
+                id: "read".to_owned(),
+                name: "Read".to_owned(),
+                arguments: json!({ "file_path": ".glint/settings.local.json" }),
+            }],
+            &state,
+        );
+
+        assert_eq!(batches.len(), 1);
+        assert!(!batches[0].concurrent);
+    }
+
+    #[test]
+    fn concurrent_tool_results_are_added_to_model_context_in_call_order() {
+        let registry = ToolRegistry::new();
+        let (tx, _rx) = mpsc::channel();
+        let control_rx = control_rx();
+        let mut project_settings = ProjectSettings {
+            root: std::env::current_dir().unwrap(),
+            permissions: ProjectPermissions::default(),
+        };
+        let mut conversation_permissions = ConversationPermissions::default();
+        let budget = ToolResultBudget::new(std::env::temp_dir());
+        let mut state = tool_state(
+            &mut project_settings,
+            &mut conversation_permissions,
+            &budget,
+        );
+        let mut messages = Vec::new();
+
+        append_tool_turn(
+            &mut messages,
+            ModelResponse {
+                assistant_text: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "read-cargo".to_owned(),
+                        name: "Read".to_owned(),
+                        arguments: json!({ "file_path": "Cargo.toml" }),
+                    },
+                    ToolCall {
+                        id: "read-main".to_owned(),
+                        name: "Read".to_owned(),
+                        arguments: json!({ "file_path": "src/main.rs" }),
+                    },
+                ],
+                finish_reason: FinishReason::ToolCalls,
+                usage: None,
+            },
+            &registry,
+            &tx,
+            &control_rx,
+            &mut state,
+        )
+        .unwrap();
+
+        let tool_ids = messages
+            .iter()
+            .filter(|message| message.role == ModelRole::Tool)
+            .map(|message| message.tool_call_id.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(tool_ids, [Some("read-cargo"), Some("read-main")]);
     }
 
     #[test]

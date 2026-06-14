@@ -136,11 +136,7 @@ impl App {
         let transcript_cwd = std::env::current_dir()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|_| current_dir.clone());
-        let transcript = TranscriptStore::load_or_create(
-            &transcript_cwd,
-            &config.llm.provider,
-            &config.llm.model,
-        )?;
+        let transcript = TranscriptStore::create_new(&transcript_cwd)?;
         let messages = transcript.ui_messages();
         let usage = usage_from_transcript(&transcript);
 
@@ -613,14 +609,19 @@ impl App {
         let (control_tx, control_rx) = mpsc::channel();
         self.agent_control_tx = Some(control_tx);
 
+        let runtime_current_dir = std::env::current_dir()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| self.current_dir.clone());
+
         agent::spawn_agent_loop(
             AgentRunInput {
                 llm: self.config.llm.clone(),
                 system_prompt: self.config.system_prompt.clone(),
-                runtime_context: RuntimeContext::current(self.current_dir.clone()),
+                runtime_context: RuntimeContext::current(runtime_current_dir),
                 conversation_permissions: self.conversation_permissions,
                 conversation,
                 current_user_message: prompt,
+                tool_results_dir: self.transcript.tool_results_dir(),
             },
             self.agent_tx.clone(),
             control_rx,

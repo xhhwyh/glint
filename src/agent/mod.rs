@@ -5,6 +5,7 @@ mod context;
 mod openai;
 pub(crate) mod provider;
 mod runner;
+mod tool_results;
 mod tools;
 
 pub use context::RuntimeContext;

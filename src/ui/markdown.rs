@@ -1,9 +1,9 @@
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub fn render_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
     Renderer::new(width.max(1) as usize).render(text)
@@ -19,7 +19,15 @@ struct Renderer {
     list_stack: Vec<ListState>,
     code_block: bool,
     quote_depth: usize,
-    table_row: Vec<String>,
+    table: Option<TableState>,
+}
+
+#[derive(Default)]
+struct TableState {
+    alignments: Vec<Alignment>,
+    header_rows: usize,
+    rows: Vec<Vec<String>>,
+    current_row: Vec<String>,
 }
 
 struct ListState {
@@ -38,7 +46,7 @@ impl Renderer {
             list_stack: Vec::new(),
             code_block: false,
             quote_depth: 0,
-            table_row: Vec::new(),
+            table: None,
         }
     }
 
@@ -86,8 +94,7 @@ impl Renderer {
                 self.push_style(heading_style(level));
                 self.push_text(match level {
                     HeadingLevel::H1 => "# ",
-                    HeadingLevel::H2 => "## ",
-                    HeadingLevel::H3 => "### ",
+                    HeadingLevel::H2 | HeadingLevel::H3 => "",
                     HeadingLevel::H4 => "#### ",
                     HeadingLevel::H5 => "##### ",
                     HeadingLevel::H6 => "###### ",
@@ -140,11 +147,24 @@ impl Renderer {
                     Style::default().fg(Color::Magenta),
                 );
             }
-            Tag::Table(_) | Tag::TableHead | Tag::TableRow => {
+            Tag::Table(alignments) => {
                 self.finish_line();
-                self.table_row.clear();
+                self.table = Some(TableState {
+                    alignments,
+                    ..TableState::default()
+                });
             }
-            Tag::TableCell => self.table_row.push(String::new()),
+            Tag::TableHead => {}
+            Tag::TableRow => {
+                if let Some(table) = &mut self.table {
+                    table.current_row.clear();
+                }
+            }
+            Tag::TableCell => {
+                if let Some(table) = &mut self.table {
+                    table.current_row.push(String::new());
+                }
+            }
             _ => {}
         }
     }
@@ -175,8 +195,14 @@ impl Renderer {
             }
             TagEnd::Image => {}
             TagEnd::TableCell => {}
-            TagEnd::TableHead | TagEnd::TableRow => self.flush_table_row(),
-            TagEnd::Table => self.finish_line(),
+            TagEnd::TableRow => self.flush_table_row(),
+            TagEnd::TableHead => {
+                self.flush_table_row();
+                if let Some(table) = &mut self.table {
+                    table.header_rows = table.rows.len();
+                }
+            }
+            TagEnd::Table => self.finish_table(),
             _ => {}
         }
     }
@@ -186,7 +212,9 @@ impl Renderer {
     }
 
     fn push_styled(&mut self, text: &str, style: Style) {
-        if let Some(cell) = self.table_row.last_mut() {
+        if let Some(table) = &mut self.table
+            && let Some(cell) = table.current_row.last_mut()
+        {
             cell.push_str(text);
             return;
         }
@@ -219,13 +247,38 @@ impl Renderer {
     }
 
     fn flush_table_row(&mut self) {
-        if self.table_row.is_empty() {
+        let Some(table) = &mut self.table else {
+            return;
+        };
+        if table.current_row.is_empty() {
             return;
         }
+        table.rows.push(
+            table
+                .current_row
+                .iter()
+                .map(|cell| cell.trim().to_owned())
+                .collect(),
+        );
+        table.current_row.clear();
+    }
+
+    fn finish_table(&mut self) {
+        self.flush_table_row();
+        let Some(table) = self.table.take() else {
+            return;
+        };
+        if table.rows.is_empty() {
+            self.finish_line();
+            return;
+        }
+
         self.finish_line();
-        self.push_text(&self.table_row.join(" │ "));
+        for line in format_table(&table) {
+            self.push_styled(&line, table_style());
+            self.finish_line();
+        }
         self.finish_line();
-        self.table_row.clear();
     }
 
     fn push_modifier(&mut self, modifier: Modifier) {
@@ -242,6 +295,74 @@ impl Renderer {
             self.style = style;
         }
     }
+}
+
+fn format_table(table: &TableState) -> Vec<String> {
+    let column_count = table.rows.iter().map(Vec::len).max().unwrap_or(0);
+    if column_count == 0 {
+        return Vec::new();
+    }
+
+    let widths = table_widths(&table.rows, column_count);
+    let mut lines = Vec::new();
+    lines.push(table_border('┌', '┬', '┐', &widths));
+    for (index, row) in table.rows.iter().enumerate() {
+        lines.push(format_table_row(row, &widths, &table.alignments));
+        if table.header_rows > 0 && index + 1 == table.header_rows {
+            lines.push(table_border('├', '┼', '┤', &widths));
+        }
+    }
+    lines.push(table_border('└', '┴', '┘', &widths));
+    lines
+}
+
+fn table_widths(rows: &[Vec<String>], column_count: usize) -> Vec<usize> {
+    let mut widths = vec![1; column_count];
+    for row in rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(cell.width());
+        }
+    }
+    widths
+}
+
+fn format_table_row(row: &[String], widths: &[usize], alignments: &[Alignment]) -> String {
+    let cells = widths
+        .iter()
+        .enumerate()
+        .map(|(index, width)| {
+            let cell = row.get(index).map(String::as_str).unwrap_or("");
+            format_table_cell(
+                cell,
+                *width,
+                alignments.get(index).copied().unwrap_or(Alignment::None),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" │ ");
+    format!("│ {cells} │")
+}
+
+fn format_table_cell(cell: &str, width: usize, alignment: Alignment) -> String {
+    let padding = width.saturating_sub(cell.width());
+    match alignment {
+        Alignment::Right => format!("{}{}", " ".repeat(padding), cell),
+        Alignment::Center => {
+            let left = padding / 2;
+            let right = padding - left;
+            format!("{}{}{}", " ".repeat(left), cell, " ".repeat(right))
+        }
+        Alignment::Left | Alignment::None => format!("{}{}", cell, " ".repeat(padding)),
+    }
+}
+
+fn table_border(left: char, join: char, right: char, widths: &[usize]) -> String {
+    let segments = widths
+        .iter()
+        .map(|width| "─".repeat(width + 2))
+        .collect::<Vec<_>>()
+        .join(&join.to_string());
+    format!("{left}{segments}{right}")
 }
 
 fn heading_style(level: HeadingLevel) -> Style {
@@ -264,4 +385,49 @@ fn link_style() -> Style {
     Style::default()
         .fg(Color::Blue)
         .add_modifier(Modifier::UNDERLINED)
+}
+
+fn table_style() -> Style {
+    Style::default().fg(Color::Gray)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
+    fn rendered_text(markdown: &str) -> Vec<String> {
+        render_markdown(markdown, 80)
+            .iter()
+            .map(line_text)
+            .collect()
+    }
+
+    #[test]
+    fn h2_and_h3_headings_hide_markdown_prefixes() {
+        let lines = rendered_text("## Section\n\n### Detail");
+
+        assert!(lines.iter().any(|line| line == "Section"));
+        assert!(lines.iter().any(|line| line == "Detail"));
+        assert!(!lines.iter().any(|line| line.contains("## Section")));
+        assert!(!lines.iter().any(|line| line.contains("### Detail")));
+    }
+
+    #[test]
+    fn tables_render_with_column_structure() {
+        let lines = rendered_text("| Name | Count |\n| --- | ---: |\n| Alpha | 2 |\n| Beta | 13 |");
+
+        assert!(lines.iter().any(|line| line == "┌───────┬───────┐"));
+        assert!(lines.iter().any(|line| line == "│ Name  │ Count │"));
+        assert!(lines.iter().any(|line| line == "├───────┼───────┤"));
+        assert!(lines.iter().any(|line| line == "│ Alpha │     2 │"));
+        assert!(lines.iter().any(|line| line == "│ Beta  │    13 │"));
+        assert!(lines.iter().any(|line| line == "└───────┴───────┘"));
+    }
 }
