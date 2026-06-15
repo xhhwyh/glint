@@ -10,6 +10,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 
 const TERMINAL_ROWS: u16 = 12;
 const TERMINAL_COLS: u16 = 120;
+const TERMINAL_SCROLLBACK_LINES: usize = 10_000;
 const DONE_PREFIX: &str = "__GLINT_DONE_";
 const TIMEOUT_GRACE: Duration = Duration::from_millis(800);
 pub const TERMINAL_RUN_DEFAULT_TIMEOUT_MS: u64 = 120_000;
@@ -142,7 +143,7 @@ impl TerminalPane {
 
         Ok(Self {
             name: "agent".to_owned(),
-            parser: vt100::Parser::new(TERMINAL_ROWS, TERMINAL_COLS, 0),
+            parser: vt100::Parser::new(TERMINAL_ROWS, TERMINAL_COLS, TERMINAL_SCROLLBACK_LINES),
             writer,
             output_rx,
             active: None,
@@ -216,16 +217,24 @@ impl TerminalPane {
     }
 
     pub fn cursor_position(&self) -> Option<(u16, u16)> {
-        (!self.parser.screen().hide_cursor()).then(|| self.parser.screen().cursor_position())
+        let screen = self.parser.screen();
+        if screen.hide_cursor() {
+            return None;
+        }
+
+        let (_, cols) = screen.size();
+        let rows = screen.rows(0, cols).collect::<Vec<_>>();
+        Some(remap_cursor_for_hidden_lines(
+            &rows,
+            screen.cursor_position(),
+        ))
     }
 
     pub fn screen_lines(&self, height: u16, width: u16) -> Vec<String> {
         let screen = self.parser.screen();
-        let rows = screen.rows(0, screen.size().0);
-        let mut lines = rows
-            .into_iter()
-            .map(|row| row.trim_end().to_owned())
-            .collect::<Vec<_>>();
+        let (_, cols) = screen.size();
+        let rows = screen.rows(0, cols).collect::<Vec<_>>();
+        let mut lines = visible_terminal_lines(rows);
 
         let height = height as usize;
         let width = width as usize;
@@ -236,6 +245,16 @@ impl TerminalPane {
             .into_iter()
             .map(|line| truncate_chars(&line, width))
             .collect()
+    }
+
+    pub fn scroll_up(&mut self, lines: usize) {
+        let current = self.parser.screen().scrollback();
+        self.parser.set_scrollback(current.saturating_add(lines));
+    }
+
+    pub fn scroll_down(&mut self, lines: usize) {
+        let current = self.parser.screen().scrollback();
+        self.parser.set_scrollback(current.saturating_sub(lines));
     }
 
     pub fn tick(&mut self) {
@@ -371,11 +390,7 @@ pub fn strip_sentinel_lines(raw: &str, id: &str) -> String {
     let sentinel_token = format!("{DONE_PREFIX}{id}__");
     normalized_lines(raw)
         .into_iter()
-        .filter(|line| {
-            let trimmed = line.trim();
-            !(trimmed.starts_with(&sentinel)
-                || (trimmed.contains("printf") && trimmed.contains(&sentinel_token)))
-        })
+        .filter(|line| !is_internal_result_line(line, &sentinel, &sentinel_token))
         .collect::<Vec<_>>()
         .join("\n")
         .trim()
@@ -428,6 +443,44 @@ fn strip_ansi(line: &str) -> String {
     output
 }
 
+fn is_internal_terminal_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.contains(DONE_PREFIX) || is_internal_done_printf_line(trimmed)
+}
+
+fn visible_terminal_lines(rows: Vec<String>) -> Vec<String> {
+    rows.into_iter()
+        .map(|row| row.trim_end().to_owned())
+        .filter(|line| !is_internal_terminal_line(line))
+        .collect()
+}
+
+fn remap_cursor_for_hidden_lines(rows: &[String], cursor: (u16, u16)) -> (u16, u16) {
+    let hidden_before_cursor = rows
+        .iter()
+        .take(cursor.0 as usize)
+        .filter(|line| is_internal_terminal_line(line))
+        .count();
+
+    (
+        cursor.0.saturating_sub(hidden_before_cursor as u16),
+        cursor.1,
+    )
+}
+
+fn is_internal_result_line(line: &str, sentinel: &str, sentinel_token: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with(sentinel)
+        || is_internal_terminal_line(trimmed)
+        || (trimmed.contains("printf") && trimmed.contains(sentinel_token))
+}
+
+fn is_internal_done_printf_line(trimmed: &str) -> bool {
+    trimmed.contains("printf '\\n%s:%s\\n'")
+        || trimmed.contains("printf '\\n%s")
+        || trimmed.contains("printf '") && trimmed.contains("%s:%s") && trimmed.contains("\\n")
+}
+
 fn truncate_chars(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         return value.to_owned();
@@ -457,6 +510,36 @@ mod tests {
 
         assert_eq!(parsed.0, 0);
         assert_eq!(parsed.1, "");
+    }
+
+    #[test]
+    fn terminal_screen_lines_hide_internal_done_protocol() {
+        let lines = vec![
+            "echo glint-terminal-test".to_owned(),
+            "glint-terminal-test".to_owned(),
+            "printf '\\n%s:%s\\n' '__GLINT_DONE_abc__' \"$?\"".to_owned(),
+            "__GLINT_DONE_abc__:0".to_owned(),
+            "$ ".to_owned(),
+        ];
+        let visible = visible_terminal_lines(lines);
+
+        assert_eq!(
+            visible,
+            ["echo glint-terminal-test", "glint-terminal-test", "$"]
+        );
+    }
+
+    #[test]
+    fn terminal_cursor_remaps_after_hidden_protocol_lines() {
+        let lines = vec![
+            "echo glint-terminal-test".to_owned(),
+            "glint-terminal-test".to_owned(),
+            "printf '\\n%s:%s\\n' '__GLINT_DONE_abc__' \"$?\"".to_owned(),
+            "__GLINT_DONE_abc__:0".to_owned(),
+            "$ ".to_owned(),
+        ];
+
+        assert_eq!(remap_cursor_for_hidden_lines(&lines, (4, 2)), (2, 2));
     }
 
     #[test]

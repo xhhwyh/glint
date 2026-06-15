@@ -62,7 +62,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
 
     while !app.should_quit {
         let size = terminal.size()?;
-        app.resize_terminal(ui::terminal_height(size.height), size.width);
+        let terminal_height = ui::terminal_height(size.height);
+        app.resize_terminal(
+            terminal_height.saturating_sub(2),
+            size.width.saturating_sub(4),
+        );
+        app.set_terminal_top_row(size.height.saturating_sub(terminal_height));
         app.update_terminal();
         terminal.draw(|frame| ui::render(frame, &app))?;
 

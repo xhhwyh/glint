@@ -9,8 +9,8 @@ pub enum AppEvent {
 }
 
 pub enum MouseAction {
-    ScrollUp,
-    ScrollDown,
+    ScrollUp { row: u16 },
+    ScrollDown { row: u16 },
     None,
 }
 
@@ -128,8 +128,8 @@ fn control_char(char: char) -> Option<Vec<u8>> {
 impl From<MouseEvent> for MouseAction {
     fn from(event: MouseEvent) -> Self {
         match event.kind {
-            MouseEventKind::ScrollUp => Self::ScrollUp,
-            MouseEventKind::ScrollDown => Self::ScrollDown,
+            MouseEventKind::ScrollUp => Self::ScrollUp { row: event.row },
+            MouseEventKind::ScrollDown => Self::ScrollDown { row: event.row },
             _ => Self::None,
         }
     }

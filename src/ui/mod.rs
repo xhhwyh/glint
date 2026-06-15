@@ -137,9 +137,11 @@ fn render_terminal(frame: &mut Frame, app: &App, area: Rect) {
         && let Some(terminal) = &app.terminal
         && let Some((row, col)) = terminal.cursor_position()
     {
+        let body_height = area.height.saturating_sub(2);
+        let body_width = area.width.saturating_sub(4);
         frame.set_cursor_position(Position::new(
-            area.x + 2 + col.min(area.width.saturating_sub(4)),
-            area.y + 1 + row.min(area.height.saturating_sub(2)),
+            area.x + 2 + col.min(body_width.saturating_sub(1)),
+            area.y + 1 + row.min(body_height.saturating_sub(1)),
         ));
     }
 }

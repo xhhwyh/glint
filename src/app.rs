@@ -41,6 +41,7 @@ pub struct App {
     pub terminal: Option<TerminalPane>,
     pub terminal_init_error: Option<String>,
     pub terminal_focused: bool,
+    terminal_top_row: u16,
     turn_started_at: Option<Instant>,
     transcript: TranscriptStore,
     transcript_cwd: String,
@@ -148,6 +149,7 @@ impl App {
             terminal,
             terminal_init_error,
             terminal_focused: false,
+            terminal_top_row: 0,
             turn_started_at: None,
             transcript,
             transcript_cwd,
@@ -215,6 +217,10 @@ impl App {
         if let Some(terminal) = &mut self.terminal {
             terminal.resize(rows, cols);
         }
+    }
+
+    pub fn set_terminal_top_row(&mut self, row: u16) {
+        self.terminal_top_row = row;
     }
 
     fn update_key(&mut self, key: KeyInput) {
@@ -643,10 +649,24 @@ impl App {
 
     fn update_mouse(&mut self, mouse: MouseAction) {
         match mouse {
-            MouseAction::ScrollUp => self.scroll = self.scroll.saturating_add(3),
-            MouseAction::ScrollDown => self.scroll = self.scroll.saturating_sub(3),
+            MouseAction::ScrollUp { row } if self.mouse_over_terminal(row) => {
+                if let Some(terminal) = &mut self.terminal {
+                    terminal.scroll_up(3);
+                }
+            }
+            MouseAction::ScrollDown { row } if self.mouse_over_terminal(row) => {
+                if let Some(terminal) = &mut self.terminal {
+                    terminal.scroll_down(3);
+                }
+            }
+            MouseAction::ScrollUp { .. } => self.scroll = self.scroll.saturating_add(3),
+            MouseAction::ScrollDown { .. } => self.scroll = self.scroll.saturating_sub(3),
             MouseAction::None => {}
         }
+    }
+
+    fn mouse_over_terminal(&self, row: u16) -> bool {
+        self.terminal.is_some() && row >= self.terminal_top_row
     }
 
     fn run_compact(&mut self) {
@@ -1123,6 +1143,7 @@ mod tests {
             terminal: None,
             terminal_init_error: None,
             terminal_focused: false,
+            terminal_top_row: 0,
             turn_started_at: None,
             transcript: TranscriptStore::test_empty(
                 std::env::temp_dir().join(format!("glint-app-test-{}.jsonl", uuid::Uuid::new_v4())),
