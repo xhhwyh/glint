@@ -668,8 +668,8 @@ mod tests {
             id: "terminal".to_owned(),
             name: "TerminalRun".to_owned(),
             arguments: json!({
-                "command": "git status --short",
-                "description": "Check git status",
+                "command": "echo glint-terminal-test",
+                "description": "Print terminal smoke test",
                 "timeout_ms": 500
             }),
         };
@@ -686,13 +686,13 @@ mod tests {
         else {
             panic!("expected run request");
         };
-        assert_eq!(command, "git status --short");
-        assert_eq!(description, "Check git status");
+        assert_eq!(command, "echo glint-terminal-test");
+        assert_eq!(description, "Print terminal smoke test");
         assert_eq!(timeout, Duration::from_millis(500));
         response
             .send(TerminalRunResult {
                 command,
-                output: "clean".to_owned(),
+                output: "glint-terminal-test".to_owned(),
                 exit_code: Some(0),
                 timed_out: false,
                 error: None,
@@ -702,9 +702,27 @@ mod tests {
         let result = handle.join().expect("tool worker should finish");
 
         assert!(!result.is_error);
-        assert!(result.content.contains("command: git status --short"));
+        assert!(result.content.contains("command: echo glint-terminal-test"));
         assert!(result.content.contains("exit_code: 0"));
-        assert!(result.content.contains("output:\nclean"));
+        assert!(result.content.contains("output:\nglint-terminal-test"));
+    }
+
+    #[test]
+    fn terminal_run_still_refuses_echo_redirection() {
+        let registry = ToolRegistry::new();
+        let call = ToolCall {
+            id: "terminal".to_owned(),
+            name: "TerminalRun".to_owned(),
+            arguments: json!({
+                "command": "echo hi > file.txt",
+                "description": "Write file"
+            }),
+        };
+
+        let result = registry.execute_approved(&call);
+
+        assert!(result.is_error);
+        assert!(result.content.contains("Use Edit"));
     }
 
     #[test]

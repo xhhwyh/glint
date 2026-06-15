@@ -1,4 +1,5 @@
 use std::{
+    path::Path,
     sync::mpsc::{self, Sender},
     time::Duration,
 };
@@ -17,9 +18,15 @@ mod description;
 
 use super::{
     ToolBehavior,
-    bash::{bash_command_requires_approval, bash_requires_approval, dedicated_tool_replacement},
+    bash::{
+        bash_command_requires_approval, bash_requires_approval, contains_shell_control,
+        dedicated_tool_replacement,
+    },
     utils::{error, missing_arg, string_arg},
 };
+
+const DIRECT_OUTPUT_REPLACEMENT: &str =
+    "Output text directly to the user instead of running echo or printf.";
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -84,7 +91,7 @@ pub(super) fn terminal_run(
         );
     }
 
-    if let Some(replacement) = dedicated_tool_replacement(command) {
+    if let Some(replacement) = terminal_run_replacement(command) {
         return error(
             call,
             format!(
@@ -121,6 +128,35 @@ pub(super) fn terminal_run(
             }
         }
     }
+}
+
+fn terminal_run_replacement(command: &str) -> Option<&'static str> {
+    let replacement = dedicated_tool_replacement(command)?;
+    if replacement == DIRECT_OUTPUT_REPLACEMENT && is_plain_terminal_output_command(command) {
+        None
+    } else {
+        Some(replacement)
+    }
+}
+
+fn is_plain_terminal_output_command(command: &str) -> bool {
+    if contains_shell_control(command) {
+        return false;
+    }
+    let Some(words) = shlex::split(command) else {
+        return false;
+    };
+    words
+        .first()
+        .map(|word| program_name(word))
+        .is_some_and(|program| matches!(program, "echo" | "printf"))
+}
+
+fn program_name(word: &str) -> &str {
+    Path::new(word)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(word)
 }
 
 fn terminal_timeout(call: &ToolCall) -> Duration {
