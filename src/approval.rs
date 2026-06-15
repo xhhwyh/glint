@@ -61,7 +61,9 @@ impl ApprovalPrompt {
             ApprovalChoice::Always if self.request.tool_name == "Edit" => {
                 ApprovalDecision::AllowConversation
             }
-            ApprovalChoice::Always if self.request.tool_name == "Bash" => {
+            ApprovalChoice::Always
+                if self.request.tool_name == "Bash" || self.request.tool_name == "TerminalRun" =>
+            {
                 ApprovalDecision::AllowProjectPrefix
             }
             ApprovalChoice::Always => ApprovalDecision::AllowOnce,
@@ -74,7 +76,7 @@ impl ApprovalPrompt {
     pub fn always_label(&self) -> &'static str {
         if self.request.tool_name == "Edit" {
             "yes, always allow edits in this conversation"
-        } else if self.request.tool_name == "Bash" {
+        } else if self.request.tool_name == "Bash" || self.request.tool_name == "TerminalRun" {
             "yes, always allow in this project"
         } else {
             "yes"

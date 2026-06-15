@@ -1,8 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::provider::ModelMessage;
+use crate::agent::provider::ModelMessage;
 
-const TOOL_MODE_CONTEXT: &str = "available tools: Read, Glob, Grep, Bash, Edit. Use paths relative to current_directory for files and directories under current_directory; use absolute paths only for targets outside current_directory. Do not use ~ in tool arguments. Use Read for known file contents. If you do not know the target file path, use narrow Glob or Grep first, then Read the discovered file paths. Only batch Read with Glob or Grep when the Read paths are already known from the user request or prior context. Do not start project summaries with broad root Glob patterns like **/*; read orientation files and manifests first. Glob results are capped at 100 files. Glob searches time out after 20 seconds by default, 60 seconds on WSL, or the positive value in CLAUDE_CODE_GLOB_TIMEOUT_SECONDS when set. Large tool outputs may be previewed and persisted outside the model context. Use Bash only for shell-only commands such as git, build/test, package manager, environment, and process commands.";
+const TOOL_MODE_CONTEXT: &str = "available tools: Read, Glob, Grep, TerminalRun, Bash, Edit. Use paths relative to current_directory for files and directories under current_directory; use absolute paths only for targets outside current_directory. Do not use ~ in tool arguments. Use Read for known file contents. If you do not know the target file path, use narrow Glob or Grep first, then Read the discovered file paths. Only batch Read with Glob or Grep when the Read paths are already known from the user request or prior context. Do not start project summaries with broad root Glob patterns like **/*; read orientation files and manifests first. Glob results are capped at 100 files. Glob searches time out after 20 seconds by default, 60 seconds on WSL, or the positive value in GLINT_GLOB_TIMEOUT_SECONDS when set. Large tool outputs may be previewed and persisted outside the model context. Use TerminalRun for non-interactive shell-only commands such as git, build/test, package manager, environment, and process commands so the command and output are visible in the agent terminal. Use Bash only as a legacy compatibility path.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeContext {
@@ -85,9 +85,9 @@ mod tests {
     fn places_system_prompt_first_and_runtime_context_second() {
         let messages = build_initial_messages("system", &runtime_context(), &[], "hello");
 
-        assert_eq!(messages[0].role, super::super::provider::ModelRole::System);
+        assert_eq!(messages[0].role, ModelRole::System);
         assert_eq!(messages[0].content.as_deref(), Some("system"));
-        assert_eq!(messages[1].role, super::super::provider::ModelRole::User);
+        assert_eq!(messages[1].role, ModelRole::User);
         assert!(
             messages[1]
                 .content

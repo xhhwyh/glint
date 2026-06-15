@@ -12,17 +12,20 @@ use std::{
 use anyhow::{Context, Result, bail};
 
 use crate::{
+    agent::{
+        AgentEvent,
+        openai::OpenAiProvider,
+        provider::{
+            FinishReason, ModelMessage, ModelProvider, ModelRequest, ModelResponse, ToolCall,
+            ToolResult,
+        },
+    },
     approval::{AgentControl, ApprovalDecision, ApprovalRequest, ConversationPermissions},
     config::LlmConfig,
+    context::{RuntimeContext, build_initial_messages},
+    services::tool_results::ToolResultBudget,
     settings::ProjectSettings,
-};
-
-use super::{
-    AgentEvent, RuntimeContext,
-    context::build_initial_messages,
-    openai::OpenAiProvider,
-    provider::{FinishReason, ModelMessage, ModelProvider, ModelRequest, ModelResponse, ToolCall},
-    tool_results::ToolResultBudget,
+    terminal::TerminalRequest,
     tools::ToolRegistry,
 };
 
@@ -38,6 +41,7 @@ pub struct AgentRunInput {
     pub conversation: Vec<ModelMessage>,
     pub current_user_message: String,
     pub tool_results_dir: PathBuf,
+    pub terminal_requests: Sender<TerminalRequest>,
 }
 
 struct ToolExecutionState<'a> {
@@ -53,7 +57,7 @@ pub fn spawn_agent_loop(
 ) {
     thread::spawn(move || {
         let mut provider = OpenAiProvider::new(input.llm.clone());
-        let registry = ToolRegistry::new();
+        let registry = ToolRegistry::with_terminal_requests(input.terminal_requests.clone());
 
         match run_agent_loop(input, &mut provider, &registry, &tx, &control_rx) {
             Ok(()) => {
@@ -327,7 +331,7 @@ fn append_concurrent_tool_batch(
 struct CompletedTool {
     index: usize,
     call: ToolCall,
-    result: super::provider::ToolResult,
+    result: ToolResult,
 }
 
 struct ToolBatch {
@@ -389,7 +393,7 @@ fn execute_tool_with_approval(
     control_rx: &Receiver<AgentControl>,
     project_settings: &mut ProjectSettings,
     conversation_permissions: &mut ConversationPermissions,
-) -> Result<super::provider::ToolResult> {
+) -> Result<ToolResult> {
     if drain_control_messages(control_rx, tx, conversation_permissions) {
         bail!("cancelled");
     }
@@ -476,7 +480,7 @@ fn handle_approval_decision(
     control_rx: &Receiver<AgentControl>,
     project_settings: &mut ProjectSettings,
     conversation_permissions: &mut ConversationPermissions,
-) -> Result<super::provider::ToolResult> {
+) -> Result<ToolResult> {
     match decision {
         ApprovalDecision::AllowOnce => {
             execute_approved_cancellable(registry, call, tx, control_rx, conversation_permissions)
@@ -499,7 +503,7 @@ fn handle_approval_decision(
             .ok();
             execute_approved_cancellable(registry, call, tx, control_rx, conversation_permissions)
         }
-        ApprovalDecision::Deny { feedback } => Ok(super::provider::ToolResult {
+        ApprovalDecision::Deny { feedback } => Ok(ToolResult {
             call_id: call.id,
             content: if feedback.is_empty() {
                 "Denied by user.".to_owned()
@@ -517,7 +521,7 @@ fn execute_approved_cancellable(
     tx: &Sender<AgentEvent>,
     control_rx: &Receiver<AgentControl>,
     conversation_permissions: &mut ConversationPermissions,
-) -> Result<super::provider::ToolResult> {
+) -> Result<ToolResult> {
     let mut cancelled = false;
     let result = {
         let mut is_cancelled = || {
@@ -539,6 +543,9 @@ fn execute_approved_cancellable(
 fn approval_explanation(call: &ToolCall) -> String {
     match call.name.as_str() {
         "Bash" => "This Bash command can modify project state and needs approval.".to_owned(),
+        "TerminalRun" => {
+            "This terminal command can modify project state and needs approval.".to_owned()
+        }
         "Edit" => "This Edit will modify a file and always needs approval unless allowed for this conversation.".to_owned(),
         _ => format!("{} needs approval before it can run.", call.name),
     }
@@ -622,6 +629,7 @@ mod tests {
     }
 
     fn input() -> AgentRunInput {
+        let (terminal_requests, _terminal_rx) = mpsc::channel();
         AgentRunInput {
             llm: LlmConfig {
                 provider: "test".to_owned(),
@@ -647,12 +655,13 @@ mod tests {
                 shell: "/bin/zsh".to_owned(),
                 app_name: "glint".to_owned(),
                 app_version: "0.1.0".to_owned(),
-                tool_mode: "available tools: Read, Glob, Grep, Bash, Edit".to_owned(),
+                tool_mode: "available tools: Read, Glob, Grep, TerminalRun, Bash, Edit".to_owned(),
             },
             conversation_permissions: ConversationPermissions::default(),
             conversation: Vec::new(),
             current_user_message: "hello".to_owned(),
             tool_results_dir: std::env::temp_dir(),
+            terminal_requests,
         }
     }
 
@@ -928,8 +937,8 @@ mod tests {
         );
         assert_eq!(
             summarize_tool_input(&ToolCall {
-                id: "bash".to_owned(),
-                name: "Bash".to_owned(),
+                id: "terminal".to_owned(),
+                name: "TerminalRun".to_owned(),
                 arguments: json!({
                     "command": "cargo test --lib",
                     "description": "Run library tests"
@@ -948,11 +957,11 @@ mod tests {
     }
 
     #[test]
-    fn summarizes_bash_description_separately_from_command() {
+    fn summarizes_shell_description_separately_from_command() {
         assert_eq!(
             summarize_tool_description(&ToolCall {
-                id: "bash".to_owned(),
-                name: "Bash".to_owned(),
+                id: "terminal".to_owned(),
+                name: "TerminalRun".to_owned(),
                 arguments: json!({
                     "command": "cargo test --lib",
                     "description": "Run library tests"

@@ -1,6 +1,6 @@
 use std::{
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, Sender},
     time::{Duration, Instant},
 };
 
@@ -12,10 +12,12 @@ use crate::{
         provider::FinishReason,
     },
     approval::{AgentControl, ApprovalFocus, ApprovalPrompt, ConversationPermissions},
+    commands::{SlashCommand, SlashCommandKind, matching_slash_commands},
     config::Config,
-    event::{AppEvent, KeyAction, MouseAction},
+    event::{AppEvent, KeyAction, KeyInput, MouseAction},
     input::InputState,
     message::{Message, Role},
+    terminal::{TerminalPane, TerminalRequest, TerminalRunResult},
     transcript::{AssistantTranscript, CompactTrigger, TranscriptSessionSummary, TranscriptStore},
 };
 
@@ -36,46 +38,19 @@ pub struct App {
     pub run_notice: Option<String>,
     pub approval: Option<ApprovalPrompt>,
     pub conversation_permissions: ConversationPermissions,
+    pub terminal: Option<TerminalPane>,
+    pub terminal_init_error: Option<String>,
+    pub terminal_focused: bool,
     turn_started_at: Option<Instant>,
     transcript: TranscriptStore,
     transcript_cwd: String,
     agent_control_tx: Option<mpsc::Sender<AgentControl>>,
     agent_tx: mpsc::Sender<AgentEvent>,
+    terminal_request_tx: Sender<TerminalRequest>,
+    terminal_requests: Receiver<TerminalRequest>,
     pending_prompt_after_compact: Option<String>,
     auto_compact_failures: u8,
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SlashCommand {
-    pub name: &'static str,
-    pub description: &'static str,
-    kind: SlashCommandKind,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SlashCommandKind {
-    Compact,
-    Model,
-    Resume,
-}
-
-const SLASH_COMMANDS: [SlashCommand; 3] = [
-    SlashCommand {
-        name: "/compact",
-        description: "Summarize earlier conversation and continue compacted",
-        kind: SlashCommandKind::Compact,
-    },
-    SlashCommand {
-        name: "/model",
-        description: "Switch provider and model",
-        kind: SlashCommandKind::Model,
-    },
-    SlashCommand {
-        name: "/resume",
-        description: "Resume a saved session",
-        kind: SlashCommandKind::Resume,
-    },
-];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelPicker {
@@ -140,6 +115,7 @@ fn usage_from_transcript(transcript: &TranscriptStore) -> ConversationUsage {
 impl App {
     pub fn new(config: Config) -> Result<Self> {
         let (agent_tx, agent_events) = mpsc::channel();
+        let (terminal_request_tx, terminal_requests) = mpsc::channel();
         let current_dir = current_dir_label();
         let transcript_cwd = std::env::current_dir()
             .map(|path| path.display().to_string())
@@ -147,6 +123,10 @@ impl App {
         let transcript = TranscriptStore::create_new(&transcript_cwd)?;
         let messages = transcript.ui_messages();
         let usage = usage_from_transcript(&transcript);
+        let (terminal, terminal_init_error) = match TerminalPane::new_agent() {
+            Ok(terminal) => (Some(terminal), None),
+            Err(error) => (None, Some(format!("{error:#}"))),
+        };
 
         Ok(Self {
             should_quit: false,
@@ -165,11 +145,16 @@ impl App {
             run_notice: None,
             approval: None,
             conversation_permissions: ConversationPermissions::default(),
+            terminal,
+            terminal_init_error,
+            terminal_focused: false,
             turn_started_at: None,
             transcript,
             transcript_cwd,
             agent_control_tx: None,
             agent_tx,
+            terminal_request_tx,
+            terminal_requests,
             pending_prompt_after_compact: None,
             auto_compact_failures: 0,
         })
@@ -187,8 +172,65 @@ impl App {
         self.turn_started_at.map(|started_at| started_at.elapsed())
     }
 
-    fn update_key(&mut self, key: KeyAction) {
-        if key == KeyAction::Quit {
+    pub fn update_terminal(&mut self) {
+        if let Some(terminal) = &mut self.terminal {
+            terminal.tick();
+        }
+
+        while let Ok(request) = self.terminal_requests.try_recv() {
+            match request {
+                TerminalRequest::Run {
+                    command,
+                    description,
+                    timeout,
+                    response,
+                } => {
+                    if let Some(terminal) = &mut self.terminal {
+                        terminal.run_noninteractive(command, description, timeout, response);
+                    } else {
+                        response
+                            .send(TerminalRunResult::failed(
+                                command,
+                                self.terminal_init_error
+                                    .clone()
+                                    .unwrap_or_else(|| "agent terminal is unavailable".to_owned()),
+                            ))
+                            .ok();
+                    }
+                }
+                TerminalRequest::CancelActive => {
+                    if let Some(terminal) = &mut self.terminal {
+                        terminal.cancel_active();
+                    }
+                }
+            }
+        }
+
+        if let Some(terminal) = &mut self.terminal {
+            terminal.tick();
+        }
+    }
+
+    pub fn resize_terminal(&mut self, rows: u16, cols: u16) {
+        if let Some(terminal) = &mut self.terminal {
+            terminal.resize(rows, cols);
+        }
+    }
+
+    fn update_key(&mut self, key: KeyInput) {
+        let action = key.action;
+        if action == KeyAction::ForceQuit {
+            self.should_quit = true;
+            return;
+        }
+        if action == KeyAction::ToggleTerminalFocus {
+            self.terminal_focused = !self.terminal_focused;
+            return;
+        }
+        if self.terminal_focused && self.write_terminal_key(&key) {
+            return;
+        }
+        if action == KeyAction::Quit {
             if self.status == AgentStatus::Idle {
                 self.should_quit = true;
             } else {
@@ -196,31 +238,32 @@ impl App {
             }
             return;
         }
-        if key == KeyAction::CancelConversationPermission {
+        if action == KeyAction::CancelConversationPermission {
             self.clear_conversation_edit_permission();
             return;
         }
         if self.approval.is_some() {
-            self.update_approval_key(key);
+            self.update_approval_key(action);
             return;
         }
         if self.resume_picker.is_some() {
-            self.update_resume_picker_key(key);
+            self.update_resume_picker_key(action);
             return;
         }
         if self.model_picker.is_some() {
-            self.update_model_picker_key(key);
+            self.update_model_picker_key(action);
             return;
         }
         if self.slash_menu_visible()
-            && matches!(key, KeyAction::Submit | KeyAction::Up | KeyAction::Down)
+            && matches!(action, KeyAction::Submit | KeyAction::Up | KeyAction::Down)
         {
-            self.update_slash_menu_key(key);
+            self.update_slash_menu_key(action);
             return;
         }
 
-        match key {
+        match action {
             KeyAction::Quit => self.should_quit = true,
+            KeyAction::ForceQuit => self.should_quit = true,
             KeyAction::Submit if self.status == AgentStatus::Idle => self.submit(),
             KeyAction::Newline if self.status == AgentStatus::Idle => self.input.newline(),
             KeyAction::Char(char) if self.status == AgentStatus::Idle => self.input.push(char),
@@ -240,9 +283,25 @@ impl App {
             | KeyAction::Right
             | KeyAction::Tab
             | KeyAction::Escape
+            | KeyAction::ToggleTerminalFocus
             | KeyAction::CancelConversationPermission => {}
         }
         self.clamp_slash_command_selection();
+    }
+
+    fn write_terminal_key(&mut self, key: &KeyInput) -> bool {
+        let Some(terminal) = &mut self.terminal else {
+            return false;
+        };
+        if terminal.is_running() {
+            return true;
+        }
+
+        if let Some(input) = key.terminal_input.as_deref() {
+            terminal.write_input(input);
+            return true;
+        }
+        false
     }
 
     pub fn slash_query(&self) -> Option<&str> {
@@ -264,11 +323,7 @@ impl App {
         let Some(query) = self.slash_query() else {
             return Vec::new();
         };
-        SLASH_COMMANDS
-            .into_iter()
-            .filter(|command| command.name[1..].starts_with(query))
-            .take(5)
-            .collect()
+        matching_slash_commands(query)
     }
 
     pub fn slash_menu_visible(&self) -> bool {
@@ -702,6 +757,7 @@ impl App {
                 conversation,
                 current_user_message: prompt,
                 tool_results_dir: self.transcript.tool_results_dir(),
+                terminal_requests: self.terminal_request_tx.clone(),
             },
             self.agent_tx.clone(),
             control_rx,
@@ -1017,12 +1073,16 @@ fn home_relative_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{LlmConfig, LlmProviderConfig, ModelCatalog};
+    use crate::{
+        commands::SLASH_COMMANDS,
+        config::{LlmConfig, LlmProviderConfig, ModelCatalog},
+    };
 
     use super::*;
 
     fn app() -> App {
         let (agent_tx, agent_events) = mpsc::channel();
+        let (terminal_request_tx, terminal_requests) = mpsc::channel();
         App {
             should_quit: false,
             messages: Vec::new(),
@@ -1060,6 +1120,9 @@ mod tests {
             run_notice: None,
             approval: None,
             conversation_permissions: ConversationPermissions::default(),
+            terminal: None,
+            terminal_init_error: None,
+            terminal_focused: false,
             turn_started_at: None,
             transcript: TranscriptStore::test_empty(
                 std::env::temp_dir().join(format!("glint-app-test-{}.jsonl", uuid::Uuid::new_v4())),
@@ -1067,6 +1130,8 @@ mod tests {
             transcript_cwd: "/workspace".to_owned(),
             agent_control_tx: None,
             agent_tx,
+            terminal_request_tx,
+            terminal_requests,
             pending_prompt_after_compact: None,
             auto_compact_failures: 0,
         }

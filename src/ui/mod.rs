@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ratatui::{
     Frame,
-    layout::Position,
+    layout::{Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
@@ -13,6 +13,7 @@ use crate::{
     app::{App, ModelPickerStage, ResumePicker},
     approval::{ApprovalChoice, ApprovalFocus},
     message::Role,
+    terminal::TerminalStatus,
 };
 
 mod markdown;
@@ -32,25 +33,146 @@ pub fn render(frame: &mut Frame, app: &App) {
         return;
     }
 
-    let width = frame.area().width.max(1);
+    let terminal_height = terminal_height(frame.area().height);
+    if terminal_height == 0 {
+        render_document(frame, app, frame.area());
+        return;
+    }
+
+    let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(terminal_height)])
+        .split(frame.area());
+    render_document(frame, app, chunks[0]);
+    render_terminal(frame, app, chunks[1]);
+}
+
+fn render_document(frame: &mut Frame, app: &App, area: Rect) {
+    let width = area.width.max(1);
     let document = document(app, width);
-    let max_scroll = document
-        .lines
-        .len()
-        .saturating_sub(frame.area().height as usize) as u16;
+    let max_scroll = document.lines.len().saturating_sub(area.height as usize) as u16;
     let scroll = max_scroll.saturating_sub(app.scroll);
 
-    frame.render_widget(
-        Paragraph::new(document.lines).scroll((scroll, 0)),
-        frame.area(),
-    );
+    frame.render_widget(Paragraph::new(document.lines).scroll((scroll, 0)), area);
 
-    if document.cursor_y >= scroll && document.cursor_y < scroll + frame.area().height {
+    if !app.terminal_focused
+        && document.cursor_y >= scroll
+        && document.cursor_y < scroll + area.height
+    {
         frame.set_cursor_position(Position::new(
-            document.cursor_x.min(width.saturating_sub(1)),
-            document.cursor_y - scroll,
+            area.x + document.cursor_x.min(width.saturating_sub(1)),
+            area.y + document.cursor_y - scroll,
         ));
     }
+}
+
+pub fn terminal_height(total_height: u16) -> u16 {
+    if total_height < 18 {
+        return 0;
+    }
+    (total_height / 3)
+        .clamp(6, 14)
+        .min(total_height.saturating_sub(8))
+}
+
+fn render_terminal(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+
+    let width = area.width.max(1);
+    let status = terminal_status_label(app);
+    let title = vec![
+        Span::styled(
+            format!(
+                " TERMINAL {} ",
+                app.terminal
+                    .as_ref()
+                    .map(|terminal| terminal.name())
+                    .unwrap_or("agent")
+            ),
+            Style::default()
+                .fg(if app.terminal_focused {
+                    Color::Cyan
+                } else {
+                    Color::Rgb(96, 165, 250)
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(status, Style::default().fg(Color::DarkGray)),
+    ];
+
+    let mut lines = vec![box_top_spans(title, width)];
+    let body_height = area.height.saturating_sub(2) as usize;
+    let body_width = width.saturating_sub(4);
+    let mut screen_lines = app
+        .terminal
+        .as_ref()
+        .map(|terminal| terminal.screen_lines(body_height as u16, body_width))
+        .unwrap_or_else(|| {
+            vec![
+                app.terminal_init_error
+                    .as_deref()
+                    .unwrap_or("agent terminal is unavailable")
+                    .to_owned(),
+            ]
+        });
+
+    if screen_lines.len() > body_height {
+        screen_lines = screen_lines[screen_lines.len() - body_height..].to_vec();
+    }
+    while screen_lines.len() < body_height {
+        screen_lines.push(String::new());
+    }
+    lines.extend(
+        screen_lines
+            .into_iter()
+            .map(|line| terminal_body_line(&line, width)),
+    );
+    if area.height > 1 {
+        lines.push(box_bottom(width));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+
+    if app.terminal_focused
+        && let Some(terminal) = &app.terminal
+        && let Some((row, col)) = terminal.cursor_position()
+    {
+        frame.set_cursor_position(Position::new(
+            area.x + 2 + col.min(area.width.saturating_sub(4)),
+            area.y + 1 + row.min(area.height.saturating_sub(2)),
+        ));
+    }
+}
+
+fn terminal_status_label(app: &App) -> String {
+    let focus = if app.terminal_focused { " focused" } else { "" };
+    let status = match app.terminal.as_ref().map(|terminal| terminal.status()) {
+        Some(TerminalStatus::Idle) => "idle".to_owned(),
+        Some(TerminalStatus::Running { description }) => format!("running {description}"),
+        Some(TerminalStatus::TimedOut) => "timed out".to_owned(),
+        Some(TerminalStatus::Error(error)) => format!("error {error}"),
+        None => "unavailable".to_owned(),
+    };
+    format!("agent terminal: {status}{focus} ")
+}
+
+fn terminal_body_line(text: &str, width: u16) -> Line<'static> {
+    let width = width as usize;
+    if width < 4 {
+        return Line::from(Span::raw(text.to_owned()));
+    }
+
+    let text_width = text.width();
+    let padding = width.saturating_sub(text_width + 4);
+    Line::from(vec![
+        Span::styled("┃ ", Style::default().fg(Color::Blue)),
+        Span::styled(
+            text.to_owned(),
+            Style::default().fg(Color::Rgb(226, 232, 240)),
+        ),
+        Span::raw(" ".repeat(padding)),
+        Span::styled(" ┃", Style::default().fg(Color::Blue)),
+    ])
 }
 
 fn render_resume_picker(frame: &mut Frame, picker: &ResumePicker) {

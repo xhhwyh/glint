@@ -1,11 +1,17 @@
 mod agent;
 mod app;
 mod approval;
+mod commands;
 mod config;
+mod context;
 mod event;
 mod input;
 mod message;
+mod query;
+mod services;
 mod settings;
+mod terminal;
+mod tools;
 mod transcript;
 mod ui;
 
@@ -22,7 +28,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use event::{AppEvent, KeyAction, MouseAction};
+use event::{AppEvent, KeyInput, MouseAction};
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 fn main() -> Result<()> {
@@ -55,12 +61,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
     let mut app = App::new(config)?;
 
     while !app.should_quit {
+        let size = terminal.size()?;
+        app.resize_terminal(ui::terminal_height(size.height), size.width);
+        app.update_terminal();
         terminal.draw(|frame| ui::render(frame, &app))?;
 
         if term_event::poll(Duration::from_millis(40))? {
             match term_event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    app.update(AppEvent::Key(KeyAction::from(key)));
+                    app.update(AppEvent::Key(KeyInput::from(key)));
                 }
                 Event::Mouse(mouse) => app.update(AppEvent::Mouse(MouseAction::from(mouse))),
                 _ => {}
@@ -70,6 +79,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         while let Ok(event) = app.agent_events.try_recv() {
             app.update(AppEvent::Agent(event));
         }
+        app.update_terminal();
     }
 
     Ok(())

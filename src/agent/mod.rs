@@ -2,16 +2,12 @@ use crate::approval::ApprovalRequest;
 use serde::{Deserialize, Serialize};
 
 mod compact;
-mod context;
-mod openai;
+pub(crate) mod openai;
 pub(crate) mod provider;
-mod runner;
-mod tool_results;
-mod tools;
 
+pub use crate::context::RuntimeContext;
+pub use crate::query::{AgentRunInput, spawn_agent_loop};
 pub use compact::{CompactRunInput, should_auto_compact, spawn_compact_loop};
-pub use context::RuntimeContext;
-pub use runner::{AgentRunInput, spawn_agent_loop};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct TokenUsage {

@@ -19,7 +19,7 @@ cargo test test_name              # Run tests matching a pattern
 cargo test -- --nocapture         # Show test stdout
 ```
 
-There are no committed tests yet; `cargo test` should report zero tests unless test modules are added.
+The repository has unit tests for agent orchestration, tools, transcript loading, config, and UI formatting. Run `cargo test` before committing behavior changes.
 
 ## Worktrees
 
@@ -77,19 +77,27 @@ agent thread -> AgentEvent -> AppEvent::Agent -> App::update -> ui::render
 - `src/main.rs`: config load, terminal lifecycle, render loop, Crossterm polling, agent event draining.
 - `src/config.rs`: YAML config and model metadata load, base URL trim, API key env resolution.
 - `src/app.rs`: central state machine; route state changes through `App::update`.
+- `src/commands/`: slash-command registry and matching.
+- `src/context/`: runtime context and initial model-message construction.
 - `src/event.rs`: map Crossterm input to `KeyAction`/`MouseAction`.
 - `src/input.rs`: editable multiline buffer and cursor behavior.
 - `src/message.rs`: chat message model and roles.
-- `src/agent/`: `AgentStatus`, `AgentEvent`, `spawn_agent_loop`, OpenAI-compatible HTTP integration.
+- `src/agent/`: agent event/status types, compaction entry points, model provider types, and OpenAI-compatible HTTP integration.
+- `src/query/`: model-turn orchestration, tool-call batching, approval flow, and `spawn_agent_loop`.
+- `src/services/`: cross-cutting agent services such as tool-result budgeting.
+- `src/terminal.rs`: persistent agent PTY, visible non-interactive terminal command execution, sentinel parsing, and terminal output truncation.
+- `src/tools/`: Glint tool registry, `utils.rs` helpers, and per-tool directories with local descriptions.
+- `src/transcript.rs`: session persistence, resume summaries, model history, and UI-message reconstruction.
 - `src/ui/`: state-driven, side-effect-free rendering; includes layout, markdown, and idle star mark.
 
 ## Behavior And Limits
 
 - `Enter` submits, `Shift+Enter` inserts newline, `Ctrl+C` quits, arrows/page keys/mouse wheel scroll.
 - While the agent is not idle, text input is disabled and up/down scroll the transcript.
-- Assistant responses appear after the blocking HTTP request returns; network deltas do not stream yet.
-- Conversation history is displayed, but only the latest user prompt is sent to the LLM.
-- No async runtime, persistence, MCP/tools, cancellation, retries, or multi-session state yet.
+- Assistant responses stream into the transcript as provider deltas arrive.
+- Conversation history is persisted and model requests include prior model history plus the current user request.
+- Tool execution supports Read, Glob, Grep, TerminalRun, Bash, and Edit with approval, cancellation, read-only batching, visible agent-terminal command execution, and large-result budgeting.
+- No async runtime, MCP, retries, or multi-session tabs yet.
 
 ## Style
 

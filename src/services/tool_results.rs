@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::provider::ToolResult;
+use crate::agent::provider::ToolResult;
 
 const DEFAULT_MAX_TOOL_RESULT_CHARS: usize = 50_000;
 const PREVIEW_CHARS: usize = 2_000;
