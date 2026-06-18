@@ -17,7 +17,8 @@ use crate::{
     event::{AppEvent, KeyAction, KeyInput, MouseAction},
     input::InputState,
     message::{Message, Role},
-    terminal::{TerminalPane, TerminalRequest, TerminalRunResult},
+    terminal::{TerminalRequest, TerminalRunResult, TerminalTab},
+    tools::ShellToolMode,
     transcript::{AssistantTranscript, CompactTrigger, TranscriptSessionSummary, TranscriptStore},
 };
 
@@ -38,11 +39,14 @@ pub struct App {
     pub run_notice: Option<String>,
     pub approval: Option<ApprovalPrompt>,
     pub conversation_permissions: ConversationPermissions,
-    pub terminal: Option<TerminalPane>,
+    pub terminal_tabs: Vec<TerminalTab>,
+    pub active_terminal_tab: usize,
     pub terminal_init_error: Option<String>,
+    pub terminal_visible: bool,
     pub terminal_focused: bool,
     terminal_top_row: u16,
     turn_started_at: Option<Instant>,
+    last_turn_duration: Option<Duration>,
     transcript: TranscriptStore,
     transcript_cwd: String,
     agent_control_tx: Option<mpsc::Sender<AgentControl>>,
@@ -124,11 +128,6 @@ impl App {
         let transcript = TranscriptStore::create_new(&transcript_cwd)?;
         let messages = transcript.ui_messages();
         let usage = usage_from_transcript(&transcript);
-        let (terminal, terminal_init_error) = match TerminalPane::new_agent() {
-            Ok(terminal) => (Some(terminal), None),
-            Err(error) => (None, Some(format!("{error:#}"))),
-        };
-
         Ok(Self {
             should_quit: false,
             messages,
@@ -146,11 +145,14 @@ impl App {
             run_notice: None,
             approval: None,
             conversation_permissions: ConversationPermissions::default(),
-            terminal,
-            terminal_init_error,
+            terminal_tabs: Vec::new(),
+            active_terminal_tab: 0,
+            terminal_init_error: None,
+            terminal_visible: false,
             terminal_focused: false,
             terminal_top_row: 0,
             turn_started_at: None,
+            last_turn_duration: None,
             transcript,
             transcript_cwd,
             agent_control_tx: None,
@@ -174,9 +176,13 @@ impl App {
         self.turn_started_at.map(|started_at| started_at.elapsed())
     }
 
+    pub fn last_turn_duration(&self) -> Option<Duration> {
+        self.last_turn_duration
+    }
+
     pub fn update_terminal(&mut self) {
-        if let Some(terminal) = &mut self.terminal {
-            terminal.tick();
+        for tab in &mut self.terminal_tabs {
+            tab.tick();
         }
 
         while let Ok(request) = self.terminal_requests.try_recv() {
@@ -187,8 +193,8 @@ impl App {
                     timeout,
                     response,
                 } => {
-                    if let Some(terminal) = &mut self.terminal {
-                        terminal.run_noninteractive(command, description, timeout, response);
+                    if let Some(tab) = self.active_terminal_tab_mut() {
+                        tab.run_noninteractive(command, description, timeout, response);
                     } else {
                         response
                             .send(TerminalRunResult::failed(
@@ -201,26 +207,34 @@ impl App {
                     }
                 }
                 TerminalRequest::CancelActive => {
-                    if let Some(terminal) = &mut self.terminal {
-                        terminal.cancel_active();
+                    for tab in &mut self.terminal_tabs {
+                        tab.cancel_active();
                     }
                 }
             }
         }
 
-        if let Some(terminal) = &mut self.terminal {
-            terminal.tick();
+        for tab in &mut self.terminal_tabs {
+            tab.tick();
         }
     }
 
     pub fn resize_terminal(&mut self, rows: u16, cols: u16) {
-        if let Some(terminal) = &mut self.terminal {
-            terminal.resize(rows, cols);
+        for tab in &mut self.terminal_tabs {
+            tab.resize(rows, cols);
         }
     }
 
     pub fn set_terminal_top_row(&mut self, row: u16) {
         self.terminal_top_row = row;
+    }
+
+    pub fn active_terminal_tab(&self) -> Option<&TerminalTab> {
+        self.terminal_tabs.get(self.active_terminal_tab)
+    }
+
+    fn active_terminal_tab_mut(&mut self) -> Option<&mut TerminalTab> {
+        self.terminal_tabs.get_mut(self.active_terminal_tab)
     }
 
     fn update_key(&mut self, key: KeyInput) {
@@ -229,7 +243,19 @@ impl App {
             self.should_quit = true;
             return;
         }
-        if action == KeyAction::ToggleTerminalFocus {
+        if action == KeyAction::NewTerminalTab {
+            self.new_terminal_tab();
+            return;
+        }
+        if action == KeyAction::CloseTerminalTab {
+            self.close_terminal_tab();
+            return;
+        }
+        if let KeyAction::SelectTerminalTab(index) = action {
+            self.select_terminal_tab(index);
+            return;
+        }
+        if action == KeyAction::ToggleTerminalFocus && self.terminal_visible {
             self.terminal_focused = !self.terminal_focused;
             return;
         }
@@ -290,21 +316,24 @@ impl App {
             | KeyAction::Tab
             | KeyAction::Escape
             | KeyAction::ToggleTerminalFocus
+            | KeyAction::NewTerminalTab
+            | KeyAction::CloseTerminalTab
+            | KeyAction::SelectTerminalTab(_)
             | KeyAction::CancelConversationPermission => {}
         }
         self.clamp_slash_command_selection();
     }
 
     fn write_terminal_key(&mut self, key: &KeyInput) -> bool {
-        let Some(terminal) = &mut self.terminal else {
+        let Some(tab) = self.active_terminal_tab_mut() else {
             return false;
         };
-        if terminal.is_running() {
+        if tab.is_running() {
             return true;
         }
 
         if let Some(input) = key.terminal_input.as_deref() {
-            terminal.write_input(input);
+            tab.write_input(input);
             return true;
         }
         false
@@ -365,6 +394,7 @@ impl App {
             SlashCommandKind::Compact => self.run_compact(),
             SlashCommandKind::Model => self.open_model_picker(),
             SlashCommandKind::Resume => self.open_resume_picker(),
+            SlashCommandKind::Terminal => self.toggle_terminal(),
         }
     }
 
@@ -650,13 +680,13 @@ impl App {
     fn update_mouse(&mut self, mouse: MouseAction) {
         match mouse {
             MouseAction::ScrollUp { row } if self.mouse_over_terminal(row) => {
-                if let Some(terminal) = &mut self.terminal {
-                    terminal.scroll_up(3);
+                if let Some(tab) = self.active_terminal_tab_mut() {
+                    tab.scroll_up(3);
                 }
             }
             MouseAction::ScrollDown { row } if self.mouse_over_terminal(row) => {
-                if let Some(terminal) = &mut self.terminal {
-                    terminal.scroll_down(3);
+                if let Some(tab) = self.active_terminal_tab_mut() {
+                    tab.scroll_down(3);
                 }
             }
             MouseAction::ScrollUp { .. } => self.scroll = self.scroll.saturating_add(3),
@@ -666,7 +696,84 @@ impl App {
     }
 
     fn mouse_over_terminal(&self, row: u16) -> bool {
-        self.terminal.is_some() && row >= self.terminal_top_row
+        self.terminal_visible && !self.terminal_tabs.is_empty() && row >= self.terminal_top_row
+    }
+
+    fn toggle_terminal(&mut self) {
+        let _command = self.input.take_trimmed();
+        if self.terminal_visible {
+            if self.terminal_tabs.iter().any(TerminalTab::is_running) {
+                self.run_notice = Some("Terminal is running; cannot hide it.".to_owned());
+                return;
+            }
+            self.terminal_visible = false;
+            self.terminal_focused = false;
+            self.run_notice = Some("Terminal hidden. Bash is active.".to_owned());
+            return;
+        }
+
+        if self.terminal_tabs.is_empty() && !self.create_terminal_tab() {
+            return;
+        }
+
+        self.terminal_visible = true;
+        self.run_notice = Some("Terminal visible. TerminalRun is active.".to_owned());
+    }
+
+    fn new_terminal_tab(&mut self) {
+        if self.create_terminal_tab() {
+            self.terminal_visible = true;
+            self.run_notice = Some(format!(
+                "Terminal tab {} created.",
+                self.active_terminal_tab + 1
+            ));
+        }
+    }
+
+    fn close_terminal_tab(&mut self) {
+        if !self.terminal_visible || self.terminal_tabs.is_empty() {
+            return;
+        }
+
+        let index = self.active_terminal_tab.min(self.terminal_tabs.len() - 1);
+        let tab = self.terminal_tabs.remove(index);
+        tab.close();
+
+        if self.terminal_tabs.is_empty() {
+            self.active_terminal_tab = 0;
+            self.terminal_visible = false;
+            self.terminal_focused = false;
+            self.run_notice = Some("Terminal closed. Bash is active.".to_owned());
+            return;
+        }
+
+        self.active_terminal_tab = index.min(self.terminal_tabs.len() - 1);
+        self.run_notice = Some("Terminal tab closed.".to_owned());
+    }
+
+    fn create_terminal_tab(&mut self) -> bool {
+        match TerminalTab::new_agent() {
+            Ok(tab) => {
+                self.terminal_tabs.push(tab);
+                self.active_terminal_tab = self.terminal_tabs.len().saturating_sub(1);
+                self.terminal_init_error = None;
+                true
+            }
+            Err(error) => {
+                self.terminal_init_error = Some(format!("{error:#}"));
+                self.run_notice = Some("Failed to start terminal.".to_owned());
+                false
+            }
+        }
+    }
+
+    fn select_terminal_tab(&mut self, index: usize) {
+        if index >= self.terminal_tabs.len() {
+            return;
+        }
+        self.active_terminal_tab = index;
+        self.terminal_visible = true;
+        self.run_notice = Some(format!("Terminal tab {} selected.", index + 1));
     }
 
     fn run_compact(&mut self) {
@@ -681,7 +788,7 @@ impl App {
         }
 
         self.status = AgentStatus::Compacting;
-        self.turn_started_at = Some(Instant::now());
+        self.start_turn_timer();
         self.agent_activity = Some("Compacting conversation".to_owned());
         self.scroll = 0;
         self.agent_control_tx = None;
@@ -726,7 +833,7 @@ impl App {
         self.reset_agent_channel();
         self.pending_prompt_after_compact = Some(prompt);
         self.status = AgentStatus::Compacting;
-        self.turn_started_at = Some(Instant::now());
+        self.start_turn_timer();
         self.agent_activity = Some("Auto-compacting conversation".to_owned());
         self.scroll = 0;
         self.agent_control_tx = None;
@@ -757,7 +864,7 @@ impl App {
         self.record_user(prompt.clone());
         self.messages.push(Message::user(prompt.clone()));
         self.status = AgentStatus::Thinking;
-        self.turn_started_at = Some(Instant::now());
+        self.start_turn_timer();
         self.scroll = 0;
         self.agent_activity = None;
 
@@ -768,16 +875,19 @@ impl App {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|_| self.current_dir.clone());
 
+        let shell_tool_mode = self.shell_tool_mode();
+
         agent::spawn_agent_loop(
             AgentRunInput {
                 llm: self.config.llm.clone(),
                 system_prompt: self.config.system_prompt.clone(),
-                runtime_context: RuntimeContext::current(runtime_current_dir),
+                runtime_context: RuntimeContext::current(runtime_current_dir, shell_tool_mode),
                 conversation_permissions: self.conversation_permissions,
                 conversation,
                 current_user_message: prompt,
                 tool_results_dir: self.transcript.tool_results_dir(),
                 terminal_requests: self.terminal_request_tx.clone(),
+                shell_tool_mode,
             },
             self.agent_tx.clone(),
             control_rx,
@@ -886,7 +996,7 @@ impl App {
             AgentEvent::AssistantFinished => {
                 self.transcript.complete_turn().ok();
                 self.status = AgentStatus::Idle;
-                self.turn_started_at = None;
+                self.finish_turn_timer();
                 self.agent_activity = None;
                 self.agent_control_tx = None;
                 self.approval = None;
@@ -902,7 +1012,7 @@ impl App {
                 );
                 self.transcript.abort_turn(error).ok();
                 self.status = AgentStatus::Idle;
-                self.turn_started_at = None;
+                self.finish_turn_timer();
                 self.agent_activity = None;
                 self.agent_control_tx = None;
                 self.approval = None;
@@ -926,7 +1036,7 @@ impl App {
             .ok();
         self.messages = self.transcript.ui_messages();
         self.status = AgentStatus::Idle;
-        self.turn_started_at = None;
+        self.finish_turn_timer();
         self.agent_activity = None;
         self.agent_control_tx = None;
         self.approval = None;
@@ -942,7 +1052,7 @@ impl App {
     fn fail_compact(&mut self, error: String) -> Option<String> {
         let pending_prompt = self.pending_prompt_after_compact.take();
         self.status = AgentStatus::Idle;
-        self.turn_started_at = None;
+        self.finish_turn_timer();
         self.agent_activity = None;
         self.agent_control_tx = None;
         self.approval = None;
@@ -1012,7 +1122,7 @@ impl App {
             self.transcript.abort_turn("cancelled".to_owned()).ok();
         }
         self.status = AgentStatus::Idle;
-        self.turn_started_at = None;
+        self.finish_turn_timer();
         self.agent_activity = None;
         self.agent_control_tx = None;
         self.approval = None;
@@ -1029,6 +1139,24 @@ impl App {
         let (agent_tx, agent_events) = mpsc::channel();
         self.agent_tx = agent_tx;
         self.agent_events = agent_events;
+    }
+
+    fn start_turn_timer(&mut self) {
+        self.turn_started_at = Some(Instant::now());
+        self.last_turn_duration = None;
+    }
+
+    fn finish_turn_timer(&mut self) {
+        self.last_turn_duration = self.turn_started_at.map(|started_at| started_at.elapsed());
+        self.turn_started_at = None;
+    }
+
+    fn shell_tool_mode(&self) -> ShellToolMode {
+        if self.terminal_visible {
+            ShellToolMode::TerminalRun
+        } else {
+            ShellToolMode::Bash
+        }
     }
 
     fn remove_empty_assistant_tail(&mut self) {
@@ -1140,11 +1268,14 @@ mod tests {
             run_notice: None,
             approval: None,
             conversation_permissions: ConversationPermissions::default(),
-            terminal: None,
+            terminal_tabs: Vec::new(),
+            active_terminal_tab: 0,
             terminal_init_error: None,
+            terminal_visible: false,
             terminal_focused: false,
             terminal_top_row: 0,
             turn_started_at: None,
+            last_turn_duration: None,
             transcript: TranscriptStore::test_empty(
                 std::env::temp_dir().join(format!("glint-app-test-{}.jsonl", uuid::Uuid::new_v4())),
             ),
@@ -1166,6 +1297,15 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(names.contains(&"/compact"));
+        assert!(names.contains(&"/terminal"));
+    }
+
+    #[test]
+    fn app_starts_with_terminal_hidden_and_uncreated() {
+        let app = app();
+
+        assert!(!app.terminal_visible);
+        assert!(app.terminal_tabs.is_empty());
     }
 
     #[test]
@@ -1212,6 +1352,26 @@ mod tests {
                 .as_deref()
                 .is_some_and(|content| content.contains("important summary"))
         );
+    }
+
+    #[test]
+    fn assistant_finished_records_last_turn_duration() {
+        let mut app = app();
+        app.status = AgentStatus::Responding;
+        app.turn_started_at = Some(Instant::now() - Duration::from_secs(65));
+
+        app.update_agent(AgentEvent::AssistantFinished);
+
+        assert_eq!(app.status, AgentStatus::Idle);
+        assert!(app.processing_elapsed().is_none());
+        assert!(
+            app.last_turn_duration()
+                .is_some_and(|duration| duration >= Duration::from_secs(65))
+        );
+
+        app.start_turn_timer();
+
+        assert!(app.last_turn_duration().is_none());
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::{
     io::{Read, Write},
+    path::Path,
     sync::mpsc::{self, Receiver, Sender},
     thread,
     time::{Duration, Instant},
@@ -61,8 +62,156 @@ impl TerminalRunResult {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TerminalColor {
+    #[default]
+    Default,
+    Indexed(u8),
+    Rgb(u8, u8, u8),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TerminalCellStyle {
+    pub fg: TerminalColor,
+    pub bg: TerminalColor,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub inverse: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalStyledSpan {
+    pub text: String,
+    pub style: TerminalCellStyle,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TerminalStyledLine {
+    pub spans: Vec<TerminalStyledSpan>,
+}
+
+impl TerminalStyledLine {
+    pub fn plain(text: impl Into<String>) -> Self {
+        Self {
+            spans: vec![TerminalStyledSpan {
+                text: text.into(),
+                style: TerminalCellStyle::default(),
+            }],
+        }
+    }
+}
+
+pub struct TerminalTab {
+    title: String,
+    input_buffer: String,
+    pane: TerminalPane,
+}
+
+impl TerminalTab {
+    pub fn new_agent() -> Result<Self> {
+        Ok(Self {
+            title: default_terminal_title(),
+            input_buffer: String::new(),
+            pane: TerminalPane::new_agent()?,
+        })
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn status(&self) -> TerminalStatus {
+        self.pane.status()
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.pane.is_running()
+    }
+
+    pub fn tick(&mut self) {
+        self.pane.tick();
+    }
+
+    pub fn resize(&mut self, rows: u16, cols: u16) {
+        self.pane.resize(rows, cols);
+    }
+
+    pub fn cursor_position(&self) -> Option<(u16, u16)> {
+        self.pane.cursor_position()
+    }
+
+    pub fn styled_screen_lines(&self, height: u16, width: u16) -> Vec<TerminalStyledLine> {
+        self.pane.styled_screen_lines(height, width)
+    }
+
+    pub fn scroll_up(&mut self, lines: usize) {
+        self.pane.scroll_up(lines);
+    }
+
+    pub fn scroll_down(&mut self, lines: usize) {
+        self.pane.scroll_down(lines);
+    }
+
+    pub fn write_input(&mut self, input: &[u8]) {
+        self.record_user_input(input);
+        self.pane.write_input(input);
+    }
+
+    pub fn cancel_active(&mut self) {
+        self.pane.cancel_active();
+    }
+
+    pub fn close(mut self) {
+        self.pane.close("terminal tab closed");
+    }
+
+    pub fn run_noninteractive(
+        &mut self,
+        command: String,
+        description: String,
+        timeout: Duration,
+        response: Sender<TerminalRunResult>,
+    ) {
+        self.update_title_for_command(&command);
+        self.pane
+            .run_noninteractive(command, description, timeout, response);
+    }
+
+    fn record_user_input(&mut self, input: &[u8]) {
+        if input == b"\r" || input == b"\n" {
+            let command = std::mem::take(&mut self.input_buffer);
+            self.update_title_for_command(&command);
+            return;
+        }
+
+        if input == [0x7f] {
+            self.input_buffer.pop();
+            return;
+        }
+
+        if input == [0x03] {
+            self.input_buffer.clear();
+            return;
+        }
+
+        let Ok(text) = std::str::from_utf8(input) else {
+            return;
+        };
+        if text.contains('\x1b') || text.contains('\r') || text.contains('\n') {
+            return;
+        }
+        self.input_buffer.push_str(text);
+    }
+
+    fn update_title_for_command(&mut self, command: &str) {
+        if let Some(title) = terminal_title_for_command(command) {
+            self.title = title;
+        }
+    }
+}
+
 pub struct TerminalPane {
-    name: String,
     parser: vt100::Parser,
     writer: Box<dyn Write + Send>,
     output_rx: Receiver<Vec<u8>>,
@@ -142,7 +291,6 @@ impl TerminalPane {
         });
 
         Ok(Self {
-            name: "agent".to_owned(),
             parser: vt100::Parser::new(TERMINAL_ROWS, TERMINAL_COLS, TERMINAL_SCROLLBACK_LINES),
             writer,
             output_rx,
@@ -153,10 +301,6 @@ impl TerminalPane {
             child,
             _pty: pty.master,
         })
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
     }
 
     pub fn status(&self) -> TerminalStatus {
@@ -196,6 +340,27 @@ impl TerminalPane {
         self.last_status = TerminalStatus::TimedOut;
     }
 
+    pub fn close(&mut self, reason: impl Into<String>) {
+        self.tick();
+        let reason = reason.into();
+        if let Some(active) = self.active.take() {
+            active
+                .response
+                .send(TerminalRunResult {
+                    command: active.command,
+                    output: truncate_terminal_output(&strip_sentinel_lines(
+                        &active.raw_output,
+                        &active.id,
+                    )),
+                    exit_code: None,
+                    timed_out: false,
+                    error: Some(reason.clone()),
+                })
+                .ok();
+        }
+        self.last_status = TerminalStatus::Error(reason);
+    }
+
     pub fn resize(&mut self, rows: u16, cols: u16) {
         let rows = rows.max(1);
         let cols = cols.max(1);
@@ -230,21 +395,22 @@ impl TerminalPane {
         ))
     }
 
-    pub fn screen_lines(&self, height: u16, width: u16) -> Vec<String> {
+    pub fn styled_screen_lines(&self, height: u16, width: u16) -> Vec<TerminalStyledLine> {
         let screen = self.parser.screen();
         let (_, cols) = screen.size();
-        let rows = screen.rows(0, cols).collect::<Vec<_>>();
-        let mut lines = visible_terminal_lines(rows);
+        let row_text = screen.rows(0, cols).collect::<Vec<_>>();
+        let mut lines = row_text
+            .iter()
+            .enumerate()
+            .filter(|(_, text)| !is_internal_terminal_line(text))
+            .map(|(row, _)| styled_screen_row(screen, row as u16, width))
+            .collect::<Vec<_>>();
 
         let height = height as usize;
-        let width = width as usize;
         if lines.len() > height {
             lines = lines[lines.len() - height..].to_vec();
         }
         lines
-            .into_iter()
-            .map(|line| truncate_chars(&line, width))
-            .collect()
     }
 
     pub fn scroll_up(&mut self, lines: usize) {
@@ -368,6 +534,70 @@ impl Drop for TerminalPane {
     }
 }
 
+fn default_terminal_title() -> String {
+    std::env::var("SHELL")
+        .ok()
+        .and_then(|shell| {
+            Path::new(&shell)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "sh".to_owned())
+}
+
+pub fn terminal_title_for_command(command: &str) -> Option<String> {
+    let recognized = [
+        "ssh", "codex", "claude", "bash", "zsh", "fish", "sh", "nu", "pwsh",
+    ];
+    let mut skip_options = false;
+
+    for token in command.split_whitespace() {
+        let token = clean_command_token(token);
+        if token.is_empty() {
+            continue;
+        }
+        if matches!(token, "sudo" | "env" | "command" | "exec") {
+            skip_options = matches!(token, "sudo" | "env");
+            continue;
+        }
+        if skip_options && token.starts_with('-') {
+            continue;
+        }
+        skip_options = false;
+        if is_env_assignment(token) {
+            continue;
+        }
+
+        let command = Path::new(token)
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| token.into());
+        return recognized
+            .contains(&command.as_ref())
+            .then(|| command.into_owned());
+    }
+
+    None
+}
+
+fn clean_command_token(token: &str) -> &str {
+    token
+        .trim_start_matches(['(', '{'])
+        .trim_end_matches([';', '&', '|', ')', '}'])
+        .trim_matches(['\'', '"'])
+}
+
+fn is_env_assignment(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|char| char.is_ascii_alphanumeric() || char == '_')
+}
+
 pub fn terminal_run_input(command: &str, id: &str) -> String {
     format!("{command}\nprintf '\\n%s:%s\\n' '{DONE_PREFIX}{id}__' \"$?\"\n")
 }
@@ -448,13 +678,6 @@ fn is_internal_terminal_line(line: &str) -> bool {
     trimmed.contains(DONE_PREFIX) || is_internal_done_printf_line(trimmed)
 }
 
-fn visible_terminal_lines(rows: Vec<String>) -> Vec<String> {
-    rows.into_iter()
-        .map(|row| row.trim_end().to_owned())
-        .filter(|line| !is_internal_terminal_line(line))
-        .collect()
-}
-
 fn remap_cursor_for_hidden_lines(rows: &[String], cursor: (u16, u16)) -> (u16, u16) {
     let hidden_before_cursor = rows
         .iter()
@@ -468,6 +691,77 @@ fn remap_cursor_for_hidden_lines(rows: &[String], cursor: (u16, u16)) -> (u16, u
     )
 }
 
+fn styled_screen_row(screen: &vt100::Screen, row: u16, width: u16) -> TerminalStyledLine {
+    let mut spans = Vec::new();
+    let mut active: Option<TerminalStyledSpan> = None;
+
+    for col in 0..width {
+        let Some(cell) = screen.cell(row, col) else {
+            push_terminal_cell(
+                &mut active,
+                &mut spans,
+                " ".to_owned(),
+                TerminalCellStyle::default(),
+            );
+            continue;
+        };
+
+        if cell.is_wide_continuation() {
+            continue;
+        }
+
+        let text = if cell.has_contents() {
+            cell.contents()
+        } else {
+            " ".to_owned()
+        };
+        push_terminal_cell(&mut active, &mut spans, text, terminal_cell_style(cell));
+    }
+
+    if let Some(span) = active {
+        spans.push(span);
+    }
+    TerminalStyledLine { spans }
+}
+
+fn push_terminal_cell(
+    active: &mut Option<TerminalStyledSpan>,
+    spans: &mut Vec<TerminalStyledSpan>,
+    text: String,
+    style: TerminalCellStyle,
+) {
+    if let Some(span) = active.as_mut()
+        && span.style == style
+    {
+        span.text.push_str(&text);
+        return;
+    }
+
+    if let Some(span) = active.take() {
+        spans.push(span);
+    }
+    *active = Some(TerminalStyledSpan { text, style });
+}
+
+fn terminal_cell_style(cell: &vt100::Cell) -> TerminalCellStyle {
+    TerminalCellStyle {
+        fg: terminal_color(cell.fgcolor()),
+        bg: terminal_color(cell.bgcolor()),
+        bold: cell.bold(),
+        italic: cell.italic(),
+        underline: cell.underline(),
+        inverse: cell.inverse(),
+    }
+}
+
+fn terminal_color(color: vt100::Color) -> TerminalColor {
+    match color {
+        vt100::Color::Default => TerminalColor::Default,
+        vt100::Color::Idx(index) => TerminalColor::Indexed(index),
+        vt100::Color::Rgb(red, green, blue) => TerminalColor::Rgb(red, green, blue),
+    }
+}
+
 fn is_internal_result_line(line: &str, sentinel: &str, sentinel_token: &str) -> bool {
     let trimmed = line.trim();
     trimmed.starts_with(sentinel)
@@ -479,13 +773,6 @@ fn is_internal_done_printf_line(trimmed: &str) -> bool {
     trimmed.contains("printf '\\n%s:%s\\n'")
         || trimmed.contains("printf '\\n%s")
         || trimmed.contains("printf '") && trimmed.contains("%s:%s") && trimmed.contains("\\n")
-}
-
-fn truncate_chars(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_owned();
-    }
-    value.chars().take(max_chars).collect()
 }
 
 #[cfg(test)]
@@ -521,7 +808,11 @@ mod tests {
             "__GLINT_DONE_abc__:0".to_owned(),
             "$ ".to_owned(),
         ];
-        let visible = visible_terminal_lines(lines);
+        let visible = lines
+            .into_iter()
+            .map(|row| row.trim_end().to_owned())
+            .filter(|line| !is_internal_terminal_line(line))
+            .collect::<Vec<_>>();
 
         assert_eq!(
             visible,
@@ -540,6 +831,44 @@ mod tests {
         ];
 
         assert_eq!(remap_cursor_for_hidden_lines(&lines, (4, 2)), (2, 2));
+    }
+
+    #[test]
+    fn styled_terminal_rows_preserve_ansi_attrs() {
+        let mut parser = vt100::Parser::new(2, 32, 0);
+        parser.process(b"\x1b[31;1mRED\x1b[0m plain \x1b[38;2;1;2;3mRGB");
+
+        let line = styled_screen_row(parser.screen(), 0, 32);
+
+        assert!(line.spans.iter().any(|span| {
+            span.text.contains("RED")
+                && span.style.fg == TerminalColor::Indexed(1)
+                && span.style.bold
+        }));
+        assert!(line.spans.iter().any(|span| {
+            span.text.contains("RGB") && span.style.fg == TerminalColor::Rgb(1, 2, 3)
+        }));
+    }
+
+    #[test]
+    fn terminal_title_detects_shell_and_session_commands() {
+        assert_eq!(
+            terminal_title_for_command("ssh host").as_deref(),
+            Some("ssh")
+        );
+        assert_eq!(
+            terminal_title_for_command("codex").as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            terminal_title_for_command("sudo -E claude").as_deref(),
+            Some("claude")
+        );
+        assert_eq!(
+            terminal_title_for_command("FOO=bar /bin/zsh").as_deref(),
+            Some("zsh")
+        );
+        assert_eq!(terminal_title_for_command("echo hello"), None);
     }
 
     #[test]

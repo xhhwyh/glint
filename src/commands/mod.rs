@@ -10,9 +10,10 @@ pub enum SlashCommandKind {
     Compact,
     Model,
     Resume,
+    Terminal,
 }
 
-pub const SLASH_COMMANDS: [SlashCommand; 3] = [
+pub const SLASH_COMMANDS: [SlashCommand; 4] = [
     SlashCommand {
         name: "/compact",
         description: "Summarize earlier conversation and continue compacted",
@@ -27,6 +28,11 @@ pub const SLASH_COMMANDS: [SlashCommand; 3] = [
         name: "/resume",
         description: "Resume a saved session",
         kind: SlashCommandKind::Resume,
+    },
+    SlashCommand {
+        name: "/terminal",
+        description: "Toggle the visible terminal and terminal-backed shell tool",
+        kind: SlashCommandKind::Terminal,
     },
 ];
 

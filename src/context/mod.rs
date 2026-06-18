@@ -1,8 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::agent::provider::ModelMessage;
+use crate::{agent::provider::ModelMessage, tools::ShellToolMode};
 
-const TOOL_MODE_CONTEXT: &str = "available tools: Read, Glob, Grep, TerminalRun, Bash, Edit. Use paths relative to current_directory for files and directories under current_directory; use absolute paths only for targets outside current_directory. Do not use ~ in tool arguments. Use Read for known file contents. If you do not know the target file path, use narrow Glob or Grep first, then Read the discovered file paths. Only batch Read with Glob or Grep when the Read paths are already known from the user request or prior context. Do not start project summaries with broad root Glob patterns like **/*; read orientation files and manifests first. Glob results are capped at 100 files. Glob searches time out after 20 seconds by default, 60 seconds on WSL, or the positive value in GLINT_GLOB_TIMEOUT_SECONDS when set. Large tool outputs may be previewed and persisted outside the model context. Use TerminalRun for non-interactive shell-only commands such as git, build/test, package manager, environment, and process commands so the command and output are visible in the agent terminal. Use Bash only as a legacy compatibility path.";
+const COMMON_TOOL_CONTEXT: &str = "Use paths relative to current_directory for files and directories under current_directory; use absolute paths only for targets outside current_directory. Do not use ~ in tool arguments. Use Read for known file contents. If you do not know the target file path, use narrow Glob or Grep first, then Read the discovered file paths. Only batch Read with Glob or Grep when the Read paths are already known from the user request or prior context. Do not start project summaries with broad root Glob patterns like **/*; read orientation files and manifests first. Glob results are capped at 100 files. Glob searches time out after 20 seconds by default, 60 seconds on WSL, or the positive value in GLINT_GLOB_TIMEOUT_SECONDS when set. Large tool outputs may be previewed and persisted outside the model context.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeContext {
@@ -15,14 +15,14 @@ pub struct RuntimeContext {
 }
 
 impl RuntimeContext {
-    pub fn current(current_dir: impl Into<String>) -> Self {
+    pub fn current(current_dir: impl Into<String>, shell_tool_mode: ShellToolMode) -> Self {
         Self {
             current_time: current_time_label(),
             current_dir: current_dir.into(),
             shell: std::env::var("SHELL").unwrap_or_else(|_| "unknown".to_owned()),
             app_name: env!("CARGO_PKG_NAME").to_owned(),
             app_version: env!("CARGO_PKG_VERSION").to_owned(),
-            tool_mode: TOOL_MODE_CONTEXT.to_owned(),
+            tool_mode: tool_mode_context(shell_tool_mode),
         }
     }
 
@@ -36,6 +36,17 @@ impl RuntimeContext {
             self.app_version,
             self.tool_mode
         ))
+    }
+}
+
+fn tool_mode_context(shell_tool_mode: ShellToolMode) -> String {
+    match shell_tool_mode {
+        ShellToolMode::Bash => format!(
+            "available tools: Read, Glob, Grep, Bash, Edit. {COMMON_TOOL_CONTEXT} Use Bash for non-interactive shell-only commands such as git, build/test, package manager, environment, and process commands. TerminalRun is unavailable until the user enables the visible terminal with /terminal."
+        ),
+        ShellToolMode::TerminalRun => format!(
+            "available tools: Read, Glob, Grep, TerminalRun, Edit. {COMMON_TOOL_CONTEXT} Use TerminalRun for non-interactive shell-only commands such as git, build/test, package manager, environment, and process commands so the command and output are visible in the terminal. Bash is unavailable while terminal mode is enabled."
+        ),
     }
 }
 
@@ -77,7 +88,7 @@ mod tests {
             shell: "/bin/zsh".to_owned(),
             app_name: "glint".to_owned(),
             app_version: "0.1.0".to_owned(),
-            tool_mode: TOOL_MODE_CONTEXT.to_owned(),
+            tool_mode: tool_mode_context(ShellToolMode::Bash),
         }
     }
 
@@ -95,6 +106,24 @@ mod tests {
                 .is_some_and(|content| content.contains("<system-reminder>")
                     && content.contains("<runtime_context>"))
         );
+    }
+
+    #[test]
+    fn runtime_context_describes_active_shell_tool_mode() {
+        let bash = RuntimeContext::current("/workspace", ShellToolMode::Bash);
+        let terminal = RuntimeContext::current("/workspace", ShellToolMode::TerminalRun);
+
+        assert!(
+            bash.tool_mode
+                .contains("available tools: Read, Glob, Grep, Bash, Edit")
+        );
+        assert!(bash.tool_mode.contains("TerminalRun is unavailable"));
+        assert!(
+            terminal
+                .tool_mode
+                .contains("available tools: Read, Glob, Grep, TerminalRun, Edit")
+        );
+        assert!(terminal.tool_mode.contains("Bash is unavailable"));
     }
 
     #[test]

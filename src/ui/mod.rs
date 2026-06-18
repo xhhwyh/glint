@@ -13,13 +13,14 @@ use crate::{
     app::{App, ModelPickerStage, ResumePicker},
     approval::{ApprovalChoice, ApprovalFocus},
     message::Role,
-    terminal::TerminalStatus,
+    terminal::{TerminalCellStyle, TerminalColor, TerminalStatus, TerminalStyledLine},
 };
 
 mod markdown;
 mod star;
 
 const WELCOME_TEXT: &str = "Catch the glint. Shape the work.";
+const TERMINAL_TAB_COLUMN_WIDTH: u16 = 12;
 
 struct Document {
     lines: Vec<Line<'static>>,
@@ -33,7 +34,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         return;
     }
 
-    let terminal_height = terminal_height(frame.area().height);
+    let terminal_height = terminal_height_for_app(app, frame.area().height);
     if terminal_height == 0 {
         render_document(frame, app, frame.area());
         return;
@@ -51,7 +52,12 @@ fn render_document(frame: &mut Frame, app: &App, area: Rect) {
     let max_scroll = document.lines.len().saturating_sub(area.height as usize) as u16;
     let scroll = max_scroll.saturating_sub(app.scroll);
 
-    frame.render_widget(Paragraph::new(document.lines).scroll((scroll, 0)), area);
+    frame.render_widget(
+        Paragraph::new(document.lines)
+            .scroll((scroll, 0))
+            .style(Style::default().bg(BG_COLOR)),
+        area,
+    );
 
     if !app.terminal_focused
         && document.cursor_y >= scroll
@@ -73,108 +79,254 @@ pub fn terminal_height(total_height: u16) -> u16 {
         .min(total_height.saturating_sub(8))
 }
 
+pub fn terminal_height_for_app(app: &App, total_height: u16) -> u16 {
+    if app.terminal_visible {
+        terminal_height(total_height)
+    } else {
+        0
+    }
+}
+
+pub fn terminal_content_width(total_width: u16) -> u16 {
+    let tab_width = terminal_tab_column_width(total_width);
+    if tab_width == 0 {
+        return total_width.saturating_sub(4).max(1);
+    }
+    total_width.saturating_sub(tab_width + 4).max(1)
+}
+
 fn render_terminal(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 {
         return;
     }
 
     let width = area.width.max(1);
-    let status = terminal_status_label(app);
-    let title = vec![
-        Span::styled(
-            format!(
-                " TERMINAL {} ",
-                app.terminal
-                    .as_ref()
-                    .map(|terminal| terminal.name())
-                    .unwrap_or("agent")
-            ),
-            Style::default()
-                .fg(if app.terminal_focused {
-                    Color::Cyan
-                } else {
-                    Color::Rgb(96, 165, 250)
-                })
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(status, Style::default().fg(Color::DarkGray)),
-    ];
+    let title = vec![Span::styled(
+        " Terminal ",
+        Style::default()
+            .fg(if app.terminal_focused {
+                ACCENT_COLOR
+            } else {
+                BORDER_BRIGHT_COLOR
+            })
+            .add_modifier(Modifier::BOLD),
+    )];
 
     let mut lines = vec![box_top_spans(title, width)];
     let body_height = area.height.saturating_sub(2) as usize;
-    let body_width = width.saturating_sub(4);
+    let body_width = terminal_content_width(width);
+    let tab_start = terminal_tab_window_start(
+        app.active_terminal_tab,
+        app.terminal_tabs.len(),
+        body_height,
+    );
     let mut screen_lines = app
-        .terminal
-        .as_ref()
-        .map(|terminal| terminal.screen_lines(body_height as u16, body_width))
+        .active_terminal_tab()
+        .map(|tab| tab.styled_screen_lines(body_height as u16, body_width))
         .unwrap_or_else(|| {
-            vec![
+            vec![TerminalStyledLine::plain(
                 app.terminal_init_error
                     .as_deref()
                     .unwrap_or("agent terminal is unavailable")
                     .to_owned(),
-            ]
+            )]
         });
 
     if screen_lines.len() > body_height {
         screen_lines = screen_lines[screen_lines.len() - body_height..].to_vec();
     }
     while screen_lines.len() < body_height {
-        screen_lines.push(String::new());
+        screen_lines.push(TerminalStyledLine::default());
     }
     lines.extend(
         screen_lines
             .into_iter()
-            .map(|line| terminal_body_line(&line, width)),
+            .enumerate()
+            .map(|(row, line)| terminal_body_line(app, row, tab_start, &line, width)),
     );
     if area.height > 1 {
-        lines.push(box_bottom(width));
+        lines.push(terminal_footer(width));
     }
 
-    frame.render_widget(Paragraph::new(lines), area);
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(BG_COLOR)),
+        area,
+    );
 
     if app.terminal_focused
-        && let Some(terminal) = &app.terminal
-        && let Some((row, col)) = terminal.cursor_position()
+        && let Some(tab) = app.active_terminal_tab()
+        && let Some((row, col)) = tab.cursor_position()
     {
         let body_height = area.height.saturating_sub(2);
-        let body_width = area.width.saturating_sub(4);
+        let body_width = terminal_content_width(area.width);
         frame.set_cursor_position(Position::new(
-            area.x + 2 + col.min(body_width.saturating_sub(1)),
+            area.x + terminal_content_x_offset(area.width) + col.min(body_width.saturating_sub(1)),
             area.y + 1 + row.min(body_height.saturating_sub(1)),
         ));
     }
 }
 
 fn terminal_status_label(app: &App) -> String {
-    let focus = if app.terminal_focused { " focused" } else { "" };
-    let status = match app.terminal.as_ref().map(|terminal| terminal.status()) {
+    if !app.terminal_visible {
+        return " hidden ".to_owned();
+    }
+
+    let focus = if app.terminal_focused {
+        "focused"
+    } else {
+        "attached"
+    };
+    let status = match app.active_terminal_tab().map(|terminal| terminal.status()) {
         Some(TerminalStatus::Idle) => "idle".to_owned(),
         Some(TerminalStatus::Running { description }) => format!("running {description}"),
         Some(TerminalStatus::TimedOut) => "timed out".to_owned(),
         Some(TerminalStatus::Error(error)) => format!("error {error}"),
         None => "unavailable".to_owned(),
     };
-    format!("agent terminal: {status}{focus} ")
+    format!(" {status} / {focus} ")
 }
 
-fn terminal_body_line(text: &str, width: u16) -> Line<'static> {
+fn terminal_body_line(
+    app: &App,
+    row: usize,
+    tab_start: usize,
+    line: &TerminalStyledLine,
+    width: u16,
+) -> Line<'static> {
     let width = width as usize;
     if width < 4 {
-        return Line::from(Span::raw(text.to_owned()));
+        return Line::from(terminal_spans(line));
     }
 
-    let text_width = text.width();
-    let padding = width.saturating_sub(text_width + 4);
+    let tab_width = terminal_tab_column_width(width as u16) as usize;
+    let content_width = terminal_content_width(width as u16) as usize;
+    let text_width = terminal_line_width(line).min(content_width);
+    let padding = content_width.saturating_sub(text_width);
+    if tab_width == 0 {
+        let mut spans = vec![Span::styled("│ ", Style::default().fg(BORDER_COLOR))];
+        spans.extend(terminal_spans(line));
+        spans.push(Span::raw(" ".repeat(padding)));
+        spans.push(Span::styled(" │", Style::default().fg(BORDER_COLOR)));
+        return Line::from(spans);
+    }
+
+    let mut spans = vec![Span::styled("│", Style::default().fg(BORDER_COLOR))];
+    spans.extend(terminal_tab_spans(app, row, tab_start, tab_width));
+    spans.push(Span::styled("│ ", Style::default().fg(PANEL_DIM_COLOR)));
+    spans.extend(terminal_spans(line));
+    spans.push(Span::raw(" ".repeat(padding)));
+    spans.push(Span::styled("│", Style::default().fg(BORDER_COLOR)));
+    Line::from(spans)
+}
+
+fn terminal_tab_column_width(width: u16) -> u16 {
+    if width < 36 {
+        return 0;
+    }
+    TERMINAL_TAB_COLUMN_WIDTH.min(width.saturating_sub(20))
+}
+
+fn terminal_content_x_offset(width: u16) -> u16 {
+    let tab_width = terminal_tab_column_width(width);
+    if tab_width == 0 { 2 } else { tab_width + 3 }
+}
+
+fn terminal_tab_spans(app: &App, row: usize, tab_start: usize, width: usize) -> Vec<Span<'static>> {
+    let index = tab_start + row;
+    let Some(tab) = app.terminal_tabs.get(index) else {
+        return vec![Span::raw(" ".repeat(width))];
+    };
+
+    let selected = index == app.active_terminal_tab;
+    let marker = if selected { ">" } else { " " };
+    let label = truncate_end_to_width(&format!("{marker}{} {}", index + 1, tab.title()), width);
+    let style = if selected {
+        Style::default()
+            .fg(ACCENT_COLOR)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(MUTED_TEXT_COLOR)
+    };
+    vec![Span::styled(pad_to_width(&label, width), style)]
+}
+
+fn terminal_tab_window_start(active: usize, len: usize, height: usize) -> usize {
+    if len <= height {
+        return 0;
+    }
+    active.saturating_sub(height / 2).min(len - height)
+}
+
+fn terminal_footer(width: u16) -> Line<'static> {
+    let width = width as usize;
+    if width < 2 {
+        return Line::from(Span::styled(
+            "─".repeat(width),
+            Style::default().fg(BORDER_COLOR),
+        ));
+    }
+
+    let content_width = width - 2;
+    if content_width < 2 {
+        return box_bottom(width as u16);
+    }
+
+    let hint = " Ctrl+T focus | Alt+N new tab | Alt+1-9/0 switch tab | Alt+D close tab ";
+    let hint = truncate_end_to_width(hint, content_width.saturating_sub(1));
+    let right = content_width.saturating_sub(1 + hint.width());
+
     Line::from(vec![
-        Span::styled("┃ ", Style::default().fg(Color::Blue)),
-        Span::styled(
-            text.to_owned(),
-            Style::default().fg(Color::Rgb(226, 232, 240)),
-        ),
-        Span::raw(" ".repeat(padding)),
-        Span::styled(" ┃", Style::default().fg(Color::Blue)),
+        Span::styled("╰", Style::default().fg(BORDER_COLOR)),
+        Span::styled("─", Style::default().fg(BORDER_COLOR)),
+        Span::styled(hint, Style::default().fg(MUTED_TEXT_COLOR)),
+        Span::styled("─".repeat(right), Style::default().fg(BORDER_COLOR)),
+        Span::styled("╯", Style::default().fg(BORDER_COLOR)),
     ])
+}
+
+fn terminal_spans(line: &TerminalStyledLine) -> Vec<Span<'static>> {
+    line.spans
+        .iter()
+        .map(|span| Span::styled(span.text.clone(), terminal_cell_style(span.style)))
+        .collect()
+}
+
+fn terminal_line_width(line: &TerminalStyledLine) -> usize {
+    line.spans.iter().map(|span| span.text.width()).sum()
+}
+
+fn terminal_cell_style(cell: TerminalCellStyle) -> Style {
+    let mut style = Style::default().fg(SOFT_TEXT_COLOR);
+    if let Some(color) = terminal_color(cell.fg) {
+        style = style.fg(color);
+    }
+    if let Some(color) = terminal_color(cell.bg) {
+        style = style.bg(color);
+    }
+
+    let mut modifiers = Modifier::empty();
+    if cell.bold {
+        modifiers |= Modifier::BOLD;
+    }
+    if cell.italic {
+        modifiers |= Modifier::ITALIC;
+    }
+    if cell.underline {
+        modifiers |= Modifier::UNDERLINED;
+    }
+    if cell.inverse {
+        modifiers |= Modifier::REVERSED;
+    }
+
+    style.add_modifier(modifiers)
+}
+
+fn terminal_color(color: TerminalColor) -> Option<Color> {
+    match color {
+        TerminalColor::Default => None,
+        TerminalColor::Indexed(index) => Some(Color::Indexed(index)),
+        TerminalColor::Rgb(red, green, blue) => Some(Color::Rgb(red, green, blue)),
+    }
 }
 
 fn render_resume_picker(frame: &mut Frame, picker: &ResumePicker) {
@@ -186,7 +338,7 @@ fn render_resume_picker(frame: &mut Frame, picker: &ResumePicker) {
     lines.push(Line::from(Span::styled(
         "Resume a session",
         Style::default()
-            .fg(Color::Cyan)
+            .fg(ACCENT_COLOR)
             .add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(""));
@@ -196,7 +348,7 @@ fn render_resume_picker(frame: &mut Frame, picker: &ResumePicker) {
     if picker.sessions.is_empty() {
         lines.push(Line::from(Span::styled(
             "No saved sessions for this workspace",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(MUTED_TEXT_COLOR),
         )));
     } else if list_height > 0 {
         let start = resume_window_start(picker.selected, picker.sessions.len(), list_height);
@@ -213,10 +365,10 @@ fn render_resume_picker(frame: &mut Frame, picker: &ResumePicker) {
             let selected = index == picker.selected;
             let style = if selected {
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(ACCENT_COLOR)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(TEXT_COLOR)
             };
             let age = pad_to_width(
                 &age_label(now.saturating_sub(session.last_timestamp)),
@@ -224,7 +376,7 @@ fn render_resume_picker(frame: &mut Frame, picker: &ResumePicker) {
             );
             let title_limit = width.saturating_sub(age_width + 6).max(1);
             lines.push(Line::from(vec![
-                Span::styled(if selected { "› " } else { "  " }, style),
+                Span::styled(if selected { "❯ " } else { "  " }, style),
                 Span::styled(age, style),
                 Span::raw("  "),
                 Span::styled(truncate_end_to_width(&session.title, title_limit), style),
@@ -237,15 +389,15 @@ fn render_resume_picker(frame: &mut Frame, picker: &ResumePicker) {
     }
     lines.push(Line::from(Span::styled(
         "─".repeat(width),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(MUTED_TEXT_COLOR),
     )));
     lines.push(Line::from(vec![
-        Span::styled("Enter", Style::default().fg(Color::Cyan)),
-        Span::styled(" select  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("↑/↓ ←/→", Style::default().fg(Color::Cyan)),
-        Span::styled(" switch  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Esc", Style::default().fg(Color::Cyan)),
-        Span::styled(" exit", Style::default().fg(Color::DarkGray)),
+        Span::styled("Enter", Style::default().fg(ACCENT_COLOR)),
+        Span::styled(" select  ", Style::default().fg(MUTED_TEXT_COLOR)),
+        Span::styled("↑/↓ ←/→", Style::default().fg(ACCENT_COLOR)),
+        Span::styled(" switch  ", Style::default().fg(MUTED_TEXT_COLOR)),
+        Span::styled("Esc", Style::default().fg(ACCENT_COLOR)),
+        Span::styled(" exit", Style::default().fg(MUTED_TEXT_COLOR)),
     ]));
 
     frame.render_widget(Paragraph::new(lines), frame.area());
@@ -260,9 +412,12 @@ fn resume_window_start(selected: usize, len: usize, height: usize) -> usize {
 
 fn document(app: &App, width: u16) -> Document {
     let mut lines = idle_panel_lines(app, width);
+    let has_status_line = app.processing_elapsed().is_some()
+        || app.run_notice.is_some()
+        || app.last_turn_duration().is_some();
 
     lines.extend(transcript_lines(app, width));
-    if !app.messages.is_empty() {
+    if !app.messages.is_empty() && !has_status_line {
         lines.push(Line::from(""));
     }
 
@@ -283,12 +438,17 @@ fn document(app: &App, width: u16) -> Document {
 
     if let Some(elapsed) = app.processing_elapsed() {
         lines.push(processing_line(elapsed));
-    } else if let Some(notice) = app.run_notice.as_deref() {
-        lines.push(notice_line(notice));
+    } else {
+        if let Some(notice) = app.run_notice.as_deref() {
+            lines.push(notice_line(notice));
+        }
+        if let Some(duration) = app.last_turn_duration() {
+            lines.push(turn_duration_line(duration));
+        }
     }
 
     let input_y = lines.len() as u16;
-    lines.push(box_top("INPUT", width));
+    lines.push(box_top("COMPOSER", width));
     lines.extend(
         input_rows(&app.input.value, width)
             .into_iter()
@@ -317,99 +477,296 @@ fn document(app: &App, width: u16) -> Document {
     }
 }
 
-fn idle_panel_lines(_app: &App, width: u16) -> Vec<Line<'static>> {
-    const ICON_PADDING_X: usize = 4;
-    const WELCOME_PADDING_X: usize = 2;
-    const RIGHT_MIN_WIDTH: usize = 32;
-    const GUTTER_WIDTH: usize = 3;
-
+fn idle_panel_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let width = width as usize;
     if width < 4 {
         return vec![Line::from(Span::styled(
-            "━".repeat(width),
-            Style::default().fg(Color::Blue),
+            "─".repeat(width),
+            Style::default().fg(BORDER_COLOR),
         ))];
     }
 
-    let inner_width = width.saturating_sub(2);
-    let left_min_width =
-        (star::STAR_WIDTH + ICON_PADDING_X * 2).max(WELCOME_TEXT.width() + WELCOME_PADDING_X * 2);
-    let has_split = inner_width >= left_min_width + GUTTER_WIDTH + RIGHT_MIN_WIDTH + 2;
-    let left_width = if has_split {
-        left_min_width
-    } else {
-        inner_width
-    };
-    let right_width = inner_width.saturating_sub(left_width + GUTTER_WIDTH);
-    let left_rows = idle_left_rows();
-
     let mut lines = vec![dashboard_top(width as u16)];
-    for (row, left_spans) in left_rows.into_iter().enumerate() {
-        let mut row_spans = vec![Span::styled("┃", Style::default().fg(Color::Blue))];
+    let inner_width = width.saturating_sub(2);
 
-        if has_split && right_width > 0 {
-            let right_spans = idle_right_spans(row);
-            row_spans.extend(center_spans(left_spans, left_width));
-            row_spans.push(Span::styled(" ┃ ", Style::default().fg(Color::Blue)));
-            row_spans.extend(pad_spans(right_spans, right_width));
-        } else {
-            row_spans.extend(center_spans(left_spans, inner_width));
+    if inner_width >= 76 {
+        let gutter = 3;
+        let left_width = compact_signal_width(inner_width.saturating_sub(gutter + 28));
+        let right_width = inner_width.saturating_sub(gutter + left_width);
+        let left_rows = core_signal_panel(left_width);
+        let right_rows = workspace_panel(app, right_width);
+        let row_count = left_rows.len().max(right_rows.len());
+
+        for row in 0..row_count {
+            let mut spans = vec![Span::styled("│", Style::default().fg(BORDER_COLOR))];
+            spans.extend(pad_spans(
+                left_rows.get(row).cloned().unwrap_or_else(Vec::new),
+                left_width,
+            ));
+            spans.push(Span::raw(" ".repeat(gutter / 2)));
+            spans.push(Span::styled("│", Style::default().fg(PANEL_DIM_COLOR)));
+            spans.push(Span::raw(" ".repeat(gutter - gutter / 2 - 1)));
+            spans.extend(pad_spans(
+                right_rows.get(row).cloned().unwrap_or_else(Vec::new),
+                right_width,
+            ));
+            spans.push(Span::styled("│", Style::default().fg(BORDER_COLOR)));
+            lines.push(Line::from(spans));
         }
-
-        row_spans.push(Span::styled("┃", Style::default().fg(Color::Blue)));
-        lines.push(Line::from(row_spans));
+    } else {
+        for row in core_signal_panel(inner_width) {
+            let mut spans = vec![Span::styled("│", Style::default().fg(BORDER_COLOR))];
+            spans.extend(pad_spans(row, inner_width));
+            spans.push(Span::styled("│", Style::default().fg(BORDER_COLOR)));
+            lines.push(Line::from(spans));
+        }
+        for row in workspace_panel(app, inner_width) {
+            let mut spans = vec![Span::styled("│", Style::default().fg(BORDER_COLOR))];
+            spans.extend(pad_spans(row, inner_width));
+            spans.push(Span::styled("│", Style::default().fg(BORDER_COLOR)));
+            lines.push(Line::from(spans));
+        }
     }
+
     lines.push(box_bottom(width as u16));
     lines
 }
 
-fn idle_left_rows() -> Vec<Vec<Span<'static>>> {
-    let mut rows = star::glint_star_rows();
-    rows.push(vec![Span::styled(
-        WELCOME_TEXT,
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    )]);
+fn compact_signal_width(max_width: usize) -> usize {
+    let desired = star::STAR_WIDTH
+        .max(WELCOME_TEXT.width())
+        .saturating_add(10);
+    desired.min(max_width).max(star::STAR_WIDTH.min(max_width))
+}
+
+fn core_signal_panel(width: usize) -> Vec<Vec<Span<'static>>> {
+    let mut rows = Vec::new();
+    rows.push(vec![]);
+
+    for star_row in star::glint_star_rows() {
+        rows.push(center_spans(star_row, width));
+    }
+
+    rows.push(vec![]);
+    rows.push(center_spans(
+        vec![Span::styled(
+            WELCOME_TEXT,
+            Style::default().fg(TEXT_COLOR).add_modifier(Modifier::BOLD),
+        )],
+        width,
+    ));
+    rows.push(vec![]);
     rows
 }
 
-fn idle_right_spans(row: usize) -> Vec<Span<'static>> {
-    match row {
-        0 => vec![Span::styled(
-            " ❖ WORKSPACE",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )],
-        2 => vec![
-            Span::styled("   [ENTER]", Style::default().fg(Color::Cyan)),
-            Span::styled(" Send", Style::default().fg(Color::DarkGray)),
-        ],
-        3 => vec![
-            Span::styled("   [SHIFT+ENTER]", Style::default().fg(Color::Cyan)),
-            Span::styled(" Newline", Style::default().fg(Color::DarkGray)),
-        ],
-        4 => vec![
-            Span::styled("   [CTRL+C]", Style::default().fg(Color::Cyan)),
-            Span::styled(" Quit", Style::default().fg(Color::DarkGray)),
-        ],
-        5 => vec![
-            Span::styled("   [SCROLL]", Style::default().fg(Color::Cyan)),
-            Span::styled(" Scroll", Style::default().fg(Color::DarkGray)),
-        ],
-        8 => vec![Span::styled(
-            " ❖ CAPABILITIES",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )],
-        9 => vec![Span::styled(
-            "   Reading, Writing, Execution",
-            Style::default().fg(Color::DarkGray),
-        )],
-        _ => vec![],
+fn workspace_panel(app: &App, width: usize) -> Vec<Vec<Span<'static>>> {
+    if width < 56 {
+        let mut rows = workspace_hud_box(app, width);
+        rows.push(vec![]);
+        rows.extend(quick_actions_box(width));
+        return rows;
     }
+
+    let gutter = 2;
+    let workspace_width = (width - gutter) / 2;
+    let actions_width = width.saturating_sub(gutter + workspace_width);
+    let mut rows = side_by_side_boxes(
+        workspace_hud_box(app, workspace_width),
+        workspace_width,
+        quick_actions_box(actions_width),
+        actions_width,
+        gutter,
+    );
+    rows.push(vec![]);
+    rows.extend(project_info_box(app, width));
+    rows
+}
+
+fn workspace_hud_box(app: &App, width: usize) -> Vec<Vec<Span<'static>>> {
+    vec![
+        mini_box_top("WORKSPACE HUD", width),
+        metric_row("STATE", "● READY", width),
+        metric_row("MODEL", &app.config.llm.model, width),
+        metric_row("PROVIDER", &app.config.llm.provider, width),
+        metric_row("MODE", "agent", width),
+        mini_box_bottom(width),
+    ]
+}
+
+fn quick_actions_box(width: usize) -> Vec<Vec<Span<'static>>> {
+    vec![
+        mini_box_top("QUICK ACTIONS", width),
+        mini_box_body(
+            vec![
+                Span::styled(
+                    "↵",
+                    Style::default()
+                        .fg(ACCENT_COLOR)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" send", Style::default().fg(SOFT_TEXT_COLOR)),
+            ],
+            width,
+        ),
+        mini_box_body(
+            vec![
+                Span::styled(
+                    "⇧↵",
+                    Style::default()
+                        .fg(ACCENT_COLOR)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" newline", Style::default().fg(SOFT_TEXT_COLOR)),
+            ],
+            width,
+        ),
+        mini_box_body(
+            vec![
+                Span::styled(
+                    "^C",
+                    Style::default()
+                        .fg(ACCENT_COLOR)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" quit", Style::default().fg(SOFT_TEXT_COLOR)),
+            ],
+            width,
+        ),
+        mini_box_body(
+            vec![
+                Span::styled(
+                    "wheel",
+                    Style::default()
+                        .fg(ACCENT_COLOR)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" scroll", Style::default().fg(SOFT_TEXT_COLOR)),
+            ],
+            width,
+        ),
+        mini_box_bottom(width),
+    ]
+}
+
+fn project_info_box(app: &App, width: usize) -> Vec<Vec<Span<'static>>> {
+    let context_tokens = app
+        .usage
+        .last_usage
+        .map(|usage| usage.prompt_tokens)
+        .unwrap_or(0);
+    let context = context_usage_label(context_tokens, app.config.llm.context_window);
+    let tokens = app.usage.total_tokens.to_string();
+    let terminal = terminal_status_label(app).trim().to_owned();
+
+    vec![
+        mini_box_top("PROJECT", width),
+        metric_row("CWD", &app.current_dir, width),
+        metric_row("CONTEXT", &context, width),
+        metric_row("TOKENS", &tokens, width),
+        metric_row("TERMINAL", &terminal, width),
+        mini_box_bottom(width),
+    ]
+}
+
+fn side_by_side_boxes(
+    left_rows: Vec<Vec<Span<'static>>>,
+    left_width: usize,
+    right_rows: Vec<Vec<Span<'static>>>,
+    right_width: usize,
+    gutter: usize,
+) -> Vec<Vec<Span<'static>>> {
+    let row_count = left_rows.len().max(right_rows.len());
+    (0..row_count)
+        .map(|row| {
+            let mut spans = pad_spans(
+                left_rows.get(row).cloned().unwrap_or_else(Vec::new),
+                left_width,
+            );
+            spans.push(Span::raw(" ".repeat(gutter)));
+            spans.extend(pad_spans(
+                right_rows.get(row).cloned().unwrap_or_else(Vec::new),
+                right_width,
+            ));
+            spans
+        })
+        .collect()
+}
+
+fn mini_box_top(title: &str, width: usize) -> Vec<Span<'static>> {
+    if width < 4 {
+        return vec![Span::styled(
+            "─".repeat(width),
+            Style::default().fg(PANEL_DIM_COLOR),
+        )];
+    }
+
+    let title = format!(" {title} ");
+    let title_width = title.width();
+    if width < title_width + 4 {
+        return vec![Span::styled(
+            "─".repeat(width),
+            Style::default().fg(PANEL_DIM_COLOR),
+        )];
+    }
+
+    vec![
+        Span::styled("╭─", Style::default().fg(PANEL_DIM_COLOR)),
+        Span::styled(
+            title,
+            Style::default()
+                .fg(ACCENT_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "─".repeat(width - title_width - 3),
+            Style::default().fg(PANEL_DIM_COLOR),
+        ),
+        Span::styled("╮", Style::default().fg(PANEL_DIM_COLOR)),
+    ]
+}
+
+fn mini_box_body(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    if width < 4 {
+        return pad_spans(spans, width);
+    }
+    let mut row = vec![Span::styled("│ ", Style::default().fg(PANEL_DIM_COLOR))];
+    row.extend(pad_spans(spans, width.saturating_sub(4)));
+    row.push(Span::styled(" │", Style::default().fg(PANEL_DIM_COLOR)));
+    row
+}
+
+fn mini_box_bottom(width: usize) -> Vec<Span<'static>> {
+    if width < 2 {
+        return vec![Span::styled(
+            "─".repeat(width),
+            Style::default().fg(PANEL_DIM_COLOR),
+        )];
+    }
+    vec![
+        Span::styled("╰", Style::default().fg(PANEL_DIM_COLOR)),
+        Span::styled("─".repeat(width - 2), Style::default().fg(PANEL_DIM_COLOR)),
+        Span::styled("╯", Style::default().fg(PANEL_DIM_COLOR)),
+    ]
+}
+
+fn metric_row(label: &str, value: &str, width: usize) -> Vec<Span<'static>> {
+    let content_width = width.saturating_sub(4);
+    let label_width = label.width();
+    let value_limit = content_width.saturating_sub(label_width + 2).max(1);
+    let value = truncate_end_to_width(value, value_limit);
+    let spacer = content_width.saturating_sub(label_width + value.width());
+
+    mini_box_body(
+        vec![
+            Span::styled(label.to_owned(), Style::default().fg(MUTED_TEXT_COLOR)),
+            Span::raw(" ".repeat(spacer)),
+            Span::styled(
+                value,
+                Style::default().fg(TEXT_COLOR).add_modifier(Modifier::BOLD),
+            ),
+        ],
+        width,
+    )
 }
 
 fn pad_spans(mut spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
@@ -468,7 +825,15 @@ fn approval_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         return Vec::new();
     };
 
-    let mut lines = vec![box_top("APPROVAL", width)];
+    let mut lines = vec![box_top("SECURITY CHECK / APPROVAL REQUIRED", width)];
+    lines.push(box_body_styled("", width, Style::default()));
+    lines.push(box_body_styled(
+        "COMMAND",
+        width,
+        Style::default()
+            .fg(ACCENT_COLOR)
+            .add_modifier(Modifier::BOLD),
+    ));
     lines.extend(
         wrap_text(&approval.request.command, width.saturating_sub(6))
             .into_iter()
@@ -476,16 +841,22 @@ fn approval_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 box_body_styled(
                     &format!("$ {row}"),
                     width,
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(TEXT_COLOR).add_modifier(Modifier::BOLD),
                 )
             }),
     );
+    lines.push(box_body_styled("", width, Style::default()));
+    lines.push(box_body_styled(
+        "REASON",
+        width,
+        Style::default()
+            .fg(ACCENT_COLOR)
+            .add_modifier(Modifier::BOLD),
+    ));
     lines.extend(
         wrap_text(&approval.request.explanation, width.saturating_sub(6))
             .into_iter()
-            .map(|row| box_body_styled(&row, width, Style::default().fg(Color::DarkGray))),
+            .map(|row| box_body_styled(&row, width, Style::default().fg(MUTED_TEXT_COLOR))),
     );
     lines.push(box_body_styled("", width, Style::default()));
 
@@ -495,20 +866,20 @@ fn approval_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         ApprovalChoice::No,
     ] {
         let label = match choice {
-            ApprovalChoice::Yes => "yes",
+            ApprovalChoice::Yes => "allow once",
             ApprovalChoice::Always => approval.always_label(),
-            ApprovalChoice::No => "no",
+            ApprovalChoice::No => "deny",
         };
         let selected = approval.selected == choice;
         let style = if selected {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(ACCENT_COLOR)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(SOFT_TEXT_COLOR)
         };
         lines.push(box_body_styled(
-            &format!("{} {label}", if selected { "›" } else { " " }),
+            &format!("{} {label}", if selected { "❯" } else { " " }),
             width,
             style,
         ));
@@ -519,14 +890,15 @@ fn approval_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 format!("feedback: {}", approval.feedback.value)
             };
             let style = if approval.focus == ApprovalFocus::Feedback {
-                Style::default().fg(Color::White)
+                Style::default().fg(TEXT_COLOR)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(MUTED_TEXT_COLOR)
             };
             lines.push(box_body_styled(&format!("  {feedback}"), width, style));
         }
     }
 
+    lines.push(box_body_styled("", width, Style::default()));
     lines.push(box_bottom(width));
     lines
 }
@@ -549,10 +921,10 @@ fn box_body_styled(text: &str, width: u16, style: Style) -> Line<'static> {
     let text_width = text.width();
     let padding = width.saturating_sub(text_width + 4);
     Line::from(vec![
-        Span::styled("┃ ", Style::default().fg(Color::Blue)),
+        Span::styled("│ ", Style::default().fg(BORDER_COLOR)),
         Span::styled(text.to_owned(), style),
         Span::raw(" ".repeat(padding)),
-        Span::styled(" ┃", Style::default().fg(Color::Blue)),
+        Span::styled(" │", Style::default().fg(BORDER_COLOR)),
     ])
 }
 
@@ -589,14 +961,15 @@ fn processing_line(elapsed: std::time::Duration) -> Line<'static> {
     Line::from(vec![
         Span::raw("  "),
         Span::styled(
-            "Processing...",
+            "Processing",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(ACCENT_COLOR)
                 .add_modifier(Modifier::BOLD | Modifier::ITALIC | Modifier::RAPID_BLINK),
         ),
+        Span::raw(" "),
         Span::styled(
-            format!(" ({})", duration_label(elapsed.as_secs())),
-            Style::default().fg(Color::DarkGray),
+            duration_label(elapsed.as_secs()),
+            Style::default().fg(SOFT_TEXT_COLOR),
         ),
     ])
 }
@@ -607,8 +980,19 @@ fn notice_line(message: &str) -> Line<'static> {
         Span::styled(
             message.to_owned(),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(BORDER_BRIGHT_COLOR)
                 .add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn turn_duration_line(duration: std::time::Duration) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled("Worked ", Style::default().fg(MUTED_TEXT_COLOR)),
+        Span::styled(
+            duration_label(duration.as_secs()),
+            Style::default().fg(TEXT_COLOR).add_modifier(Modifier::BOLD),
         ),
     ])
 }
@@ -645,7 +1029,7 @@ fn line_is_empty(line: &Line<'static>) -> bool {
 fn user_rule(width: u16) -> Line<'static> {
     Line::from(Span::styled(
         "─".repeat(width as usize),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(PANEL_DIM_COLOR),
     ))
 }
 
@@ -664,7 +1048,7 @@ fn tool_message_lines(message: &crate::message::Message, width: u16) -> Vec<Line
         ),
         Span::styled(
             format!(" {input}"),
-            Style::default().fg(Color::Rgb(147, 197, 253)),
+            Style::default().fg(BORDER_BRIGHT_COLOR),
         ),
     ]));
 
@@ -672,7 +1056,7 @@ fn tool_message_lines(message: &crate::message::Message, width: u16) -> Vec<Line
         for row in wrap_text(description, width.saturating_sub(6)) {
             lines.push(Line::from(vec![
                 Span::raw("    "),
-                Span::styled(row, Style::default().fg(Color::DarkGray)),
+                Span::styled(row, Style::default().fg(MUTED_TEXT_COLOR)),
             ]));
         }
     }
@@ -699,7 +1083,7 @@ fn tool_message_lines(message: &crate::message::Message, width: u16) -> Vec<Line
             Span::styled(
                 row,
                 Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(MUTED_TEXT_COLOR)
                     .add_modifier(if !message.tool_finished {
                         Modifier::ITALIC
                     } else {
@@ -736,7 +1120,7 @@ fn input_rows(value: &str, width: u16) -> Vec<String> {
     wrap_text(value, input_content_width(width) as u16)
         .into_iter()
         .enumerate()
-        .map(|(index, row)| format!("{}{}", if index == 0 { "▶ " } else { "  " }, row))
+        .map(|(index, row)| format!("{}{}", if index == 0 { "❯ " } else { "  " }, row))
         .collect()
 }
 
@@ -794,7 +1178,7 @@ fn slash_command_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
             Span::raw("  "),
             Span::styled(
                 "No matching slash command",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(MUTED_TEXT_COLOR),
             ),
         ])];
     }
@@ -806,14 +1190,14 @@ fn slash_command_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
             let selected = index == app.slash_command_selection;
             let style = if selected {
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(ACCENT_COLOR)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(MUTED_TEXT_COLOR)
             };
             Line::from(vec![
                 Span::raw("  "),
-                Span::styled(if selected { "› " } else { "  " }, style),
+                Span::styled(if selected { "❯ " } else { "  " }, style),
                 Span::styled(command.name, style),
                 Span::styled("  ", style),
                 Span::styled(command.description, style),
@@ -843,10 +1227,10 @@ fn model_picker_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
         Line::from(Span::styled(
             title,
             Style::default()
-                .fg(Color::Cyan)
+                .fg(ACCENT_COLOR)
                 .add_modifier(Modifier::BOLD),
         )),
-        Line::from(Span::styled(help, Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(help, Style::default().fg(MUTED_TEXT_COLOR))),
     ];
 
     match picker.stage {
@@ -863,19 +1247,19 @@ fn model_picker_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
                 let selected = index == picker.selected_provider;
                 let style = if selected {
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(ACCENT_COLOR)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(MUTED_TEXT_COLOR)
                 };
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(if selected { "› " } else { "  " }, style),
+                    Span::styled(if selected { "❯ " } else { "  " }, style),
                     Span::styled(pad_to_width(&provider.name, name_width), style),
                     Span::styled("  ", style),
                     Span::styled(
                         provider_summary(app, provider),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(MUTED_TEXT_COLOR),
                     ),
                 ]));
             }
@@ -885,12 +1269,10 @@ fn model_picker_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
                 return lines;
             };
             lines.push(Line::from(vec![
-                Span::styled("Provider ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Provider ", Style::default().fg(MUTED_TEXT_COLOR)),
                 Span::styled(
                     provider.name.clone(),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(TEXT_COLOR).add_modifier(Modifier::BOLD),
                 ),
             ]));
 
@@ -906,25 +1288,22 @@ fn model_picker_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
                     provider.name == app.config.llm.provider && model == &app.config.llm.model;
                 let style = if selected {
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(ACCENT_COLOR)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(MUTED_TEXT_COLOR)
                 };
                 let current_marker = if current { " current" } else { "" };
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(if selected { "› " } else { "  " }, style),
+                    Span::styled(if selected { "❯ " } else { "  " }, style),
                     Span::styled(pad_to_width(model, name_width), style),
                     Span::styled("  ", style),
                     Span::styled(
                         model_summary(app, &provider.name, model),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(MUTED_TEXT_COLOR),
                     ),
-                    Span::styled(
-                        current_marker,
-                        Style::default().fg(Color::Rgb(147, 197, 253)),
-                    ),
+                    Span::styled(current_marker, Style::default().fg(BORDER_BRIGHT_COLOR)),
                 ]));
             }
         }
@@ -1097,11 +1476,9 @@ fn info_line(app: &App, width: u16) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             app.config.llm.model.clone(),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(TEXT_COLOR).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
+        Span::styled(" · ", Style::default().fg(MUTED_TEXT_COLOR)),
         Span::styled(
             app.config.llm.provider.clone(),
             Style::default()
@@ -1131,9 +1508,7 @@ fn context_line(app: &App, _width: u16) -> Line<'static> {
     ));
     spans.push(Span::styled(
         context_usage_label(context_tokens, app.config.llm.context_window),
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(TEXT_COLOR).add_modifier(Modifier::BOLD),
     ));
 
     if let Some(usage) = app.usage.last_usage {
@@ -1145,13 +1520,13 @@ fn context_line(app: &App, _width: u16) -> Line<'static> {
         spans.push(Span::styled(
             usage.prompt_tokens.to_string(),
             Style::default()
-                .fg(Color::Rgb(250, 204, 21))
+                .fg(BORDER_BRIGHT_COLOR)
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             cached_suffix(cache_percent),
-            Style::default().fg(Color::Rgb(74, 222, 128)),
+            Style::default().fg(ACCENT_COLOR),
         ));
         spans.push(Span::raw("   "));
         spans.push(Span::styled(
@@ -1160,9 +1535,7 @@ fn context_line(app: &App, _width: u16) -> Line<'static> {
         ));
         spans.push(Span::styled(
             usage.completion_tokens.to_string(),
-            Style::default()
-                .fg(Color::Rgb(216, 180, 254))
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(TEXT_COLOR).add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -1175,17 +1548,15 @@ fn permission_line(app: &App) -> Option<Line<'static>> {
             Span::styled(
                 "Permissions ",
                 Style::default()
-                    .fg(Color::Rgb(147, 197, 253))
+                    .fg(BORDER_BRIGHT_COLOR)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 "edit auto-approved for this conversation",
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(TEXT_COLOR).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled("[CTRL+K] cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled("[CTRL+K] cancel", Style::default().fg(MUTED_TEXT_COLOR)),
         ]))
     } else {
         None
@@ -1198,7 +1569,13 @@ fn cached_suffix(percent: Option<u8>) -> String {
         .unwrap_or_else(|| "(— cached)".to_owned())
 }
 
+const BG_COLOR: Color = Color::Rgb(2, 6, 23);
+const BORDER_COLOR: Color = Color::Rgb(30, 64, 175);
+const PANEL_DIM_COLOR: Color = Color::Rgb(30, 64, 175);
+const BORDER_BRIGHT_COLOR: Color = Color::Rgb(96, 165, 250);
 const ACCENT_COLOR: Color = Color::Rgb(34, 211, 238);
+const TEXT_COLOR: Color = Color::Rgb(248, 250, 252);
+const SOFT_TEXT_COLOR: Color = Color::Rgb(226, 232, 240);
 const MUTED_TEXT_COLOR: Color = Color::Rgb(148, 163, 184);
 const CONTEXT_BAR_WIDTH: usize = 24;
 
@@ -1253,11 +1630,9 @@ fn dashboard_top(width: u16) -> Line<'static> {
     let title = vec![
         Span::styled(
             " GLINT ",
-            Style::default()
-                .fg(Color::Rgb(96, 165, 250))
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(TEXT_COLOR).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("v0.1.0 ", Style::default().fg(Color::DarkGray)),
+        Span::styled("v0.1.0 ", Style::default().fg(BORDER_BRIGHT_COLOR)),
     ];
     box_top_spans(title, width)
 }
@@ -1267,7 +1642,7 @@ fn box_top(title: &str, width: u16) -> Line<'static> {
         vec![Span::styled(
             format!(" {} ", title.to_uppercase()),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(ACCENT_COLOR)
                 .add_modifier(Modifier::BOLD),
         )],
         width,
@@ -1280,35 +1655,38 @@ fn box_top_spans(title: Vec<Span<'static>>, width: u16) -> Line<'static> {
 
     if width < title_len + 4 {
         return Line::from(Span::styled(
-            "━".repeat(width),
-            Style::default().fg(Color::Blue),
+            "─".repeat(width),
+            Style::default().fg(BORDER_COLOR),
         ));
     }
 
     let right_len = width.saturating_sub(title_len + 3);
-    let mut spans = vec![Span::styled("┏━", Style::default().fg(Color::Blue))];
+    let mut spans = vec![Span::styled("╭─", Style::default().fg(BORDER_COLOR))];
     spans.extend(title);
     spans.push(Span::styled(
-        "━".repeat(right_len),
-        Style::default().fg(Color::Blue),
+        "─".repeat(right_len),
+        Style::default().fg(BORDER_COLOR),
     ));
-    spans.push(Span::styled("┓", Style::default().fg(Color::Blue)));
+    spans.push(Span::styled("╮", Style::default().fg(BORDER_COLOR)));
     Line::from(spans)
 }
 
 fn box_input_body(text: &str, width: u16) -> Line<'static> {
     let width = width as usize;
     if width < 4 {
-        return Line::from(Span::raw(text.to_owned()));
+        return Line::from(Span::styled(
+            text.to_owned(),
+            Style::default().fg(TEXT_COLOR),
+        ));
     }
 
     let text_width = text.width();
     let padding = width.saturating_sub(text_width + 4);
     Line::from(vec![
-        Span::styled("┃ ", Style::default().fg(Color::Blue)),
-        Span::styled(text.to_owned(), Style::default().fg(Color::White)),
+        Span::styled("│ ", Style::default().fg(ACCENT_COLOR)),
+        Span::styled(text.to_owned(), Style::default().fg(TEXT_COLOR)),
         Span::raw(" ".repeat(padding)),
-        Span::styled(" ┃", Style::default().fg(Color::Blue)),
+        Span::styled(" │", Style::default().fg(ACCENT_COLOR)),
     ])
 }
 
@@ -1316,14 +1694,14 @@ fn box_bottom(width: u16) -> Line<'static> {
     let width = width as usize;
     if width < 2 {
         return Line::from(Span::styled(
-            "━".repeat(width),
-            Style::default().fg(Color::Blue),
+            "─".repeat(width),
+            Style::default().fg(BORDER_COLOR),
         ));
     }
     Line::from(vec![
-        Span::styled("┗", Style::default().fg(Color::Blue)),
-        Span::styled("━".repeat(width - 2), Style::default().fg(Color::Blue)),
-        Span::styled("┛", Style::default().fg(Color::Blue)),
+        Span::styled("╰", Style::default().fg(BORDER_COLOR)),
+        Span::styled("─".repeat(width - 2), Style::default().fg(BORDER_COLOR)),
+        Span::styled("╯", Style::default().fg(BORDER_COLOR)),
     ])
 }
 
@@ -1363,5 +1741,17 @@ mod tests {
             tool_output_preview("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight"),
             "one\ntwo\nthree\n...+5 lines omitted"
         );
+    }
+
+    #[test]
+    fn terminal_content_width_reserves_tab_column_when_roomy() {
+        assert_eq!(terminal_content_width(120), 104);
+        assert_eq!(terminal_content_width(30), 26);
+    }
+
+    #[test]
+    fn terminal_tab_window_tracks_active_tab() {
+        assert_eq!(terminal_tab_window_start(0, 3, 6), 0);
+        assert_eq!(terminal_tab_window_start(6, 10, 4), 4);
     }
 }

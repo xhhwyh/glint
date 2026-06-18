@@ -24,23 +24,43 @@ use utils::{error, normalize_path_argument, requires_path_approval, truncate_sum
 #[derive(Clone)]
 pub struct ToolRegistry {
     terminal_requests: Option<Sender<TerminalRequest>>,
+    shell_tool_mode: ShellToolMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellToolMode {
+    Bash,
+    TerminalRun,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             terminal_requests: None,
+            shell_tool_mode: ShellToolMode::Bash,
         }
     }
 
+    #[cfg(test)]
     pub fn with_terminal_requests(terminal_requests: Sender<TerminalRequest>) -> Self {
         Self {
             terminal_requests: Some(terminal_requests),
+            shell_tool_mode: ShellToolMode::TerminalRun,
+        }
+    }
+
+    pub fn with_shell_tool(
+        shell_tool_mode: ShellToolMode,
+        terminal_requests: Option<Sender<TerminalRequest>>,
+    ) -> Self {
+        Self {
+            terminal_requests,
+            shell_tool_mode,
         }
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
-        TOOLS.iter().map(|tool| tool.spec()).collect()
+        self.tools().into_iter().map(|tool| tool.spec()).collect()
     }
 
     #[cfg(test)]
@@ -54,6 +74,9 @@ impl ToolRegistry {
         is_cancelled: &mut dyn FnMut() -> bool,
     ) -> ToolResult {
         if call.name == "TerminalRun" {
+            if self.shell_tool_mode != ShellToolMode::TerminalRun {
+                return error(call, "Tool 'TerminalRun' is not registered.".to_owned());
+            }
             return terminal_run::terminal_run(
                 call,
                 self.terminal_requests.as_ref(),
@@ -61,7 +84,7 @@ impl ToolRegistry {
                 false,
             );
         }
-        tool_for_name(&call.name)
+        self.tool_for_name(&call.name)
             .map(|tool| tool.execute(call, is_cancelled))
             .unwrap_or_else(|| error(call, format!("Tool '{}' is not registered.", call.name)))
     }
@@ -72,7 +95,7 @@ impl ToolRegistry {
         bash_prefix_allowed: bool,
         edit_allowed: bool,
     ) -> bool {
-        tool_for_name(&call.name)
+        self.tool_for_name(&call.name)
             .is_some_and(|tool| tool.requires_approval(call, bash_prefix_allowed, edit_allowed))
     }
 
@@ -87,6 +110,9 @@ impl ToolRegistry {
         is_cancelled: &mut dyn FnMut() -> bool,
     ) -> ToolResult {
         if call.name == "TerminalRun" {
+            if self.shell_tool_mode != ShellToolMode::TerminalRun {
+                return error(call, "Tool 'TerminalRun' is not registered.".to_owned());
+            }
             return terminal_run::terminal_run(
                 call,
                 self.terminal_requests.as_ref(),
@@ -94,24 +120,25 @@ impl ToolRegistry {
                 true,
             );
         }
-        tool_for_name(&call.name)
+        self.tool_for_name(&call.name)
             .map(|tool| tool.execute_approved(call, is_cancelled))
             .unwrap_or_else(|| self.execute_with_cancel(call, is_cancelled))
     }
 
     pub fn is_concurrency_safe(&self, call: &ToolCall) -> bool {
-        tool_for_name(&call.name).is_some_and(|tool| tool.is_concurrency_safe(call))
+        self.tool_for_name(&call.name)
+            .is_some_and(|tool| tool.is_concurrency_safe(call))
     }
 
     pub fn input_summary(&self, call: &ToolCall) -> String {
-        let summary = tool_for_name(&call.name)
+        let summary = tool_metadata_for_name(&call.name)
             .and_then(|tool| tool.input_summary(call))
             .unwrap_or_else(|| call.arguments.to_string());
         truncate_summary(&summary)
     }
 
     pub fn input_description(&self, call: &ToolCall) -> Option<String> {
-        tool_for_name(&call.name)
+        tool_metadata_for_name(&call.name)
             .and_then(|tool| tool.input_description(call))
             .map(|description| truncate_summary(&description))
     }
@@ -128,6 +155,18 @@ impl ToolRegistry {
             _ => {}
         }
         call
+    }
+
+    fn tools(&self) -> Vec<&'static dyn ToolBehavior> {
+        let shell_tool: &'static dyn ToolBehavior = match self.shell_tool_mode {
+            ShellToolMode::Bash => &BASH_TOOL,
+            ShellToolMode::TerminalRun => &TERMINAL_RUN_TOOL,
+        };
+        vec![&READ_TOOL, &GLOB_TOOL, &GREP_TOOL, shell_tool, &EDIT_TOOL]
+    }
+
+    fn tool_for_name(&self, name: &str) -> Option<&'static dyn ToolBehavior> {
+        self.tools().into_iter().find(|tool| tool.name() == name)
     }
 }
 
@@ -177,7 +216,8 @@ static GREP_TOOL: GrepTool = GrepTool;
 static BASH_TOOL: BashTool = BashTool;
 static EDIT_TOOL: EditTool = EditTool;
 static TERMINAL_RUN_TOOL: TerminalRunTool = TerminalRunTool;
-static TOOLS: [&dyn ToolBehavior; 6] = [
+
+static ALL_TOOLS: [&dyn ToolBehavior; 6] = [
     &READ_TOOL,
     &GLOB_TOOL,
     &GREP_TOOL,
@@ -186,8 +226,8 @@ static TOOLS: [&dyn ToolBehavior; 6] = [
     &EDIT_TOOL,
 ];
 
-fn tool_for_name(name: &str) -> Option<&'static dyn ToolBehavior> {
-    TOOLS.iter().copied().find(|tool| tool.name() == name)
+fn tool_metadata_for_name(name: &str) -> Option<&'static dyn ToolBehavior> {
+    ALL_TOOLS.iter().copied().find(|tool| tool.name() == name)
 }
 
 fn spec(name: &str, description: &str, required: &[&str]) -> ToolSpec {
@@ -297,24 +337,69 @@ mod tests {
             .map(|spec| spec.name)
             .collect::<Vec<_>>();
 
-        assert_eq!(
-            names,
-            ["Read", "Glob", "Grep", "TerminalRun", "Bash", "Edit"]
-        );
+        assert_eq!(names, ["Read", "Glob", "Grep", "Bash", "Edit"]);
+    }
+
+    #[test]
+    fn terminal_mode_swaps_bash_for_terminal_run() {
+        let (terminal_tx, _terminal_rx) = mpsc::channel();
+        let names = ToolRegistry::with_terminal_requests(terminal_tx)
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["Read", "Glob", "Grep", "TerminalRun", "Edit"]);
+    }
+
+    #[test]
+    fn shell_tools_are_rejected_outside_active_mode() {
+        let bash_mode = ToolRegistry::new();
+        let terminal_run = ToolCall {
+            id: "terminal".to_owned(),
+            name: "TerminalRun".to_owned(),
+            arguments: json!({
+                "command": "git status --short",
+                "description": "Check status"
+            }),
+        };
+
+        let result = bash_mode.execute_approved(&terminal_run);
+
+        assert!(result.is_error);
+        assert!(result.content.contains("not registered"));
+
+        let (terminal_tx, _terminal_rx) = mpsc::channel();
+        let terminal_mode = ToolRegistry::with_terminal_requests(terminal_tx);
+        let bash = ToolCall {
+            id: "bash".to_owned(),
+            name: "Bash".to_owned(),
+            arguments: json!({
+                "command": "git status --short",
+                "description": "Check status"
+            }),
+        };
+
+        let result = terminal_mode.execute_approved(&bash);
+
+        assert!(result.is_error);
+        assert!(result.content.contains("not registered"));
     }
 
     #[test]
     fn shell_schemas_include_user_facing_description() {
-        let specs = ToolRegistry::new().specs();
-        let bash = specs
+        let bash_specs = ToolRegistry::new().specs();
+        let bash = bash_specs
             .iter()
             .find(|spec| spec.name == "Bash")
             .expect("Bash spec should exist");
-        let terminal_run = specs
+        let (terminal_tx, _terminal_rx) = mpsc::channel();
+        let terminal_specs = ToolRegistry::with_terminal_requests(terminal_tx).specs();
+        let terminal_run = terminal_specs
             .iter()
             .find(|spec| spec.name == "TerminalRun")
             .expect("TerminalRun spec should exist");
-        let read = specs
+        let read = bash_specs
             .iter()
             .find(|spec| spec.name == "Read")
             .expect("Read spec should exist");
@@ -619,7 +704,8 @@ mod tests {
 
     #[test]
     fn terminal_run_reuses_bash_approval_rules() {
-        let registry = ToolRegistry::new();
+        let (terminal_tx, _terminal_rx) = mpsc::channel();
+        let registry = ToolRegistry::with_terminal_requests(terminal_tx);
         let read_only = ToolCall {
             id: "terminal".to_owned(),
             name: "TerminalRun".to_owned(),
@@ -709,7 +795,8 @@ mod tests {
 
     #[test]
     fn terminal_run_still_refuses_echo_redirection() {
-        let registry = ToolRegistry::new();
+        let (terminal_tx, _terminal_rx) = mpsc::channel();
+        let registry = ToolRegistry::with_terminal_requests(terminal_tx);
         let call = ToolCall {
             id: "terminal".to_owned(),
             name: "TerminalRun".to_owned(),

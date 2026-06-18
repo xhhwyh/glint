@@ -19,6 +19,9 @@ pub enum KeyAction {
     Quit,
     ForceQuit,
     ToggleTerminalFocus,
+    NewTerminalTab,
+    CloseTerminalTab,
+    SelectTerminalTab(usize),
     Submit,
     Newline,
     Char(char),
@@ -52,6 +55,17 @@ impl From<KeyEvent> for KeyInput {
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 KeyAction::ToggleTerminalFocus
             }
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::ALT) => {
+                KeyAction::NewTerminalTab
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => {
+                KeyAction::CloseTerminalTab
+            }
+            KeyCode::Char(char)
+                if key.modifiers.contains(KeyModifiers::ALT) && char.is_ascii_digit() =>
+            {
+                KeyAction::SelectTerminalTab(terminal_tab_index(char))
+            }
             KeyCode::Char(char) => KeyAction::Char(char),
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => KeyAction::Newline,
             KeyCode::Enter => KeyAction::Submit,
@@ -69,6 +83,14 @@ impl From<KeyEvent> for KeyInput {
             action,
             terminal_input: terminal_input_bytes(key),
         }
+    }
+}
+
+fn terminal_tab_index(char: char) -> usize {
+    if char == '0' {
+        9
+    } else {
+        char.to_digit(10).unwrap_or(1).saturating_sub(1) as usize
     }
 }
 
@@ -132,5 +154,35 @@ impl From<MouseEvent> for MouseAction {
             MouseEventKind::ScrollDown => Self::ScrollDown { row: event.row },
             _ => Self::None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent};
+
+    use super::*;
+
+    #[test]
+    fn alt_n_creates_terminal_tab() {
+        let input = KeyInput::from(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT));
+
+        assert_eq!(input.action, KeyAction::NewTerminalTab);
+    }
+
+    #[test]
+    fn alt_d_closes_terminal_tab() {
+        let input = KeyInput::from(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT));
+
+        assert_eq!(input.action, KeyAction::CloseTerminalTab);
+    }
+
+    #[test]
+    fn alt_number_selects_terminal_tab_index() {
+        let input = KeyInput::from(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT));
+        let tenth = KeyInput::from(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT));
+
+        assert_eq!(input.action, KeyAction::SelectTerminalTab(2));
+        assert_eq!(tenth.action, KeyAction::SelectTerminalTab(9));
     }
 }
