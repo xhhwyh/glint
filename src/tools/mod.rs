@@ -13,6 +13,7 @@ use std::sync::mpsc::Sender;
 use serde_json::{Value, json};
 
 use crate::agent::provider::{ToolCall, ToolResult, ToolSpec};
+use crate::services::lsp::LspManager;
 use crate::terminal::TerminalRequest;
 
 use bash::BashTool;
@@ -28,6 +29,7 @@ use utils::{error, normalize_path_argument, requires_path_approval, truncate_sum
 #[derive(Clone)]
 pub struct ToolRegistry {
     terminal_requests: Option<Sender<TerminalRequest>>,
+    lsp_manager: Option<LspManager>,
     shell_tool_mode: ShellToolMode,
     read_file_state: ReadFileState,
 }
@@ -42,6 +44,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             terminal_requests: None,
+            lsp_manager: None,
             shell_tool_mode: ShellToolMode::Bash,
             read_file_state: ReadFileState::new(),
         }
@@ -51,6 +54,7 @@ impl ToolRegistry {
     pub fn with_terminal_requests(terminal_requests: Sender<TerminalRequest>) -> Self {
         Self {
             terminal_requests: Some(terminal_requests),
+            lsp_manager: None,
             shell_tool_mode: ShellToolMode::TerminalRun,
             read_file_state: ReadFileState::new(),
         }
@@ -62,9 +66,15 @@ impl ToolRegistry {
     ) -> Self {
         Self {
             terminal_requests,
+            lsp_manager: None,
             shell_tool_mode,
             read_file_state: ReadFileState::new(),
         }
+    }
+
+    pub fn with_lsp_manager(mut self, lsp_manager: LspManager) -> Self {
+        self.lsp_manager = Some(lsp_manager);
+        self
     }
 
     pub fn with_read_file_state(mut self, read_file_state: ReadFileState) -> Self {
@@ -99,6 +109,9 @@ impl ToolRegistry {
         }
         if call.name == "Read" {
             return read::read(call, &self.read_file_state);
+        }
+        if call.name == "LSP" {
+            return lsp::lsp(call, self.lsp_manager.as_ref());
         }
         if call.name == "Edit" {
             return edit::edit(call);
@@ -142,8 +155,11 @@ impl ToolRegistry {
         if call.name == "Read" {
             return read::read(call, &self.read_file_state);
         }
+        if call.name == "LSP" {
+            return lsp::lsp(call, self.lsp_manager.as_ref());
+        }
         if call.name == "Edit" {
-            return edit::edit_approved(call, &self.read_file_state);
+            return edit::edit_approved(call, &self.read_file_state, self.lsp_manager.as_ref());
         }
         self.tool_for_name(&call.name)
             .map(|tool| tool.execute_approved(call, is_cancelled))
@@ -335,7 +351,7 @@ fn spec(name: &str, description: &str, required: &[&str]) -> ToolSpec {
             "operation".to_owned(),
             json!({
                 "type": "string",
-                "enum": ["definition", "references", "hover", "document_symbols", "workspace_symbols"],
+                "enum": ["goToDefinition", "findReferences", "hover", "documentSymbol", "workspaceSymbol"],
                 "description": "Semantic operation to perform."
             }),
         );
@@ -343,7 +359,7 @@ fn spec(name: &str, description: &str, required: &[&str]) -> ToolSpec {
             "file_path".to_owned(),
             json!({
                 "type": "string",
-                "description": "Rust file path for definition, references, hover, and document_symbols. Use current_directory-relative paths for files under current_directory."
+                "description": "File path for goToDefinition, findReferences, hover, and documentSymbol. Optional route hint for workspaceSymbol when multiple LSP servers are configured. Use current_directory-relative paths for files under current_directory."
             }),
         );
         properties.insert(
@@ -351,7 +367,7 @@ fn spec(name: &str, description: &str, required: &[&str]) -> ToolSpec {
             json!({
                 "type": "integer",
                 "minimum": 1,
-                "description": "1-based line number for definition, references, and hover."
+                "description": "1-based line number for goToDefinition, findReferences, and hover."
             }),
         );
         properties.insert(
@@ -359,14 +375,14 @@ fn spec(name: &str, description: &str, required: &[&str]) -> ToolSpec {
             json!({
                 "type": "integer",
                 "minimum": 1,
-                "description": "1-based character offset for definition, references, and hover."
+                "description": "1-based character offset for goToDefinition, findReferences, and hover."
             }),
         );
         properties.insert(
             "query".to_owned(),
             json!({
                 "type": "string",
-                "description": "Workspace symbol query for workspace_symbols."
+                "description": "Workspace symbol query for workspaceSymbol."
             }),
         );
     }
@@ -613,11 +629,11 @@ mod tests {
         assert_eq!(
             lsp.parameters["properties"]["operation"]["enum"],
             json!([
-                "definition",
-                "references",
+                "goToDefinition",
+                "findReferences",
                 "hover",
-                "document_symbols",
-                "workspace_symbols"
+                "documentSymbol",
+                "workspaceSymbol"
             ])
         );
         assert!(

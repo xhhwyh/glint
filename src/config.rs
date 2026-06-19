@@ -6,6 +6,7 @@ use serde::Deserialize;
 #[derive(Clone)]
 pub struct Config {
     pub llm: LlmConfig,
+    pub lsp: LspConfig,
     pub model_catalog: ModelCatalog,
     pub system_prompt: String,
 }
@@ -30,6 +31,24 @@ pub struct LlmProviderConfig {
     pub models: Vec<String>,
     pub model_context_windows: BTreeMap<String, u64>,
     pub api_key_env: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LspConfig {
+    pub servers: BTreeMap<String, LspServerConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct LspServerConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub extension_to_language: BTreeMap<String, String>,
+    #[serde(default = "default_lsp_startup_timeout_ms")]
+    pub startup_timeout_ms: u64,
+    #[serde(default = "default_lsp_max_restarts")]
+    pub max_restarts: u8,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -71,6 +90,14 @@ pub struct ModelCatalogEntry {
 #[derive(Deserialize)]
 struct FileConfig {
     llm: FileLlmConfig,
+    #[serde(default)]
+    lsp: Option<FileLspConfig>,
+}
+
+#[derive(Default, Deserialize)]
+struct FileLspConfig {
+    #[serde(default)]
+    servers: Option<BTreeMap<String, LspServerConfig>>,
 }
 
 #[derive(Deserialize)]
@@ -131,14 +158,54 @@ impl Config {
             .context("failed to read prompts/system.md")?;
 
         let model_catalog = config.llm.model_catalog();
+        let lsp = config.lsp_config();
         Ok(Self {
             llm: config
                 .llm
                 .into_runtime_config(|api_key_env| std::env::var(api_key_env).ok())?,
+            lsp,
             model_catalog,
             system_prompt,
         })
     }
+}
+
+impl Default for LspConfig {
+    fn default() -> Self {
+        let mut extension_to_language = BTreeMap::new();
+        extension_to_language.insert(".rs".to_owned(), "rust".to_owned());
+
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "rust".to_owned(),
+            LspServerConfig {
+                command: "rust-analyzer".to_owned(),
+                args: Vec::new(),
+                extension_to_language,
+                startup_timeout_ms: default_lsp_startup_timeout_ms(),
+                max_restarts: default_lsp_max_restarts(),
+            },
+        );
+        Self { servers }
+    }
+}
+
+impl FileConfig {
+    fn lsp_config(&self) -> LspConfig {
+        self.lsp
+            .as_ref()
+            .and_then(|lsp| lsp.servers.clone())
+            .map(|servers| LspConfig { servers })
+            .unwrap_or_default()
+    }
+}
+
+fn default_lsp_startup_timeout_ms() -> u64 {
+    20_000
+}
+
+fn default_lsp_max_restarts() -> u8 {
+    3
 }
 
 impl FileLlmConfig {
@@ -457,6 +524,73 @@ mod tests {
             .into_runtime_config(|_| Some("secret".to_owned()))
             .unwrap();
         assert_eq!(llm.context_window, Some(1_000_000));
+    }
+
+    #[test]
+    fn lsp_config_defaults_to_rust_server_when_omitted() {
+        let config: FileConfig = serde_yaml::from_str(
+            r#"
+            llm:
+              provider: deepseek
+              model: deepseek-chat
+              temperature: 0.7
+              max_tokens: 8196
+              providers:
+                deepseek:
+                  base_url: https://api.deepseek.com
+                  models:
+                    - deepseek-chat
+                  api_key_env: TEST_API_KEY
+            "#,
+        )
+        .unwrap();
+
+        let lsp = config.lsp_config();
+        let rust = &lsp.servers["rust"];
+
+        assert_eq!(rust.command, "rust-analyzer");
+        assert_eq!(rust.args, Vec::<String>::new());
+        assert_eq!(rust.extension_to_language[".rs"], "rust");
+        assert_eq!(rust.startup_timeout_ms, 20_000);
+        assert_eq!(rust.max_restarts, 3);
+    }
+
+    #[test]
+    fn configured_lsp_servers_replace_default() {
+        let config: FileConfig = serde_yaml::from_str(
+            r#"
+            llm:
+              provider: deepseek
+              model: deepseek-chat
+              temperature: 0.7
+              max_tokens: 8196
+              providers:
+                deepseek:
+                  base_url: https://api.deepseek.com
+                  models:
+                    - deepseek-chat
+                  api_key_env: TEST_API_KEY
+            lsp:
+              servers:
+                python:
+                  command: pyright-langserver
+                  args: ["--stdio"]
+                  extension_to_language:
+                    .py: python
+                  startup_timeout_ms: 10000
+                  max_restarts: 1
+            "#,
+        )
+        .unwrap();
+
+        let lsp = config.lsp_config();
+
+        assert!(!lsp.servers.contains_key("rust"));
+        assert_eq!(lsp.servers["python"].command, "pyright-langserver");
+        assert_eq!(lsp.servers["python"].args, ["--stdio"]);
+        assert_eq!(lsp.servers["python"].extension_to_language[".py"], "python");
+        assert_eq!(lsp.servers["python"].startup_timeout_ms, 10_000);
+        assert_eq!(lsp.servers["python"].max_restarts, 1);
     }
 
     #[test]

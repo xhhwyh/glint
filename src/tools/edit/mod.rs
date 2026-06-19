@@ -1,6 +1,9 @@
 use std::fs;
 
-use crate::agent::provider::{ToolCall, ToolResult};
+use crate::{
+    agent::provider::{ToolCall, ToolResult},
+    services::lsp::LspManager,
+};
 
 mod description;
 
@@ -36,7 +39,7 @@ impl ToolBehavior for EditTool {
         call: &ToolCall,
         _is_cancelled: &mut dyn FnMut() -> bool,
     ) -> ToolResult {
-        edit_approved(call, &ReadFileState::new())
+        edit_approved(call, &ReadFileState::new(), None)
     }
 
     fn requires_approval(
@@ -60,7 +63,11 @@ pub(super) fn edit(call: &ToolCall) -> ToolResult {
     )
 }
 
-pub(super) fn edit_approved(call: &ToolCall, read_file_state: &ReadFileState) -> ToolResult {
+pub(super) fn edit_approved(
+    call: &ToolCall,
+    read_file_state: &ReadFileState,
+    lsp_manager: Option<&LspManager>,
+) -> ToolResult {
     let Some(path) = string_arg(call, "file_path") else {
         return missing_arg(call, "file_path");
     };
@@ -94,10 +101,33 @@ pub(super) fn edit_approved(call: &ToolCall, read_file_state: &ReadFileState) ->
     match fs::write(&path, &updated) {
         Ok(()) => {
             read_file_state.record(path.clone(), updated, false);
-            ok(call, format!("Edited {}", path.display()))
+            let mut message = format!("Edited {}", path.display());
+            if let Some(lsp_message) = sync_lsp_after_edit(lsp_manager, &path) {
+                message.push('\n');
+                message.push_str(&lsp_message);
+            }
+            ok(call, message)
         }
         Err(err) => error(call, format!("failed to write {}: {err}", path.display())),
     }
+}
+
+fn sync_lsp_after_edit(lsp_manager: Option<&LspManager>, path: &std::path::Path) -> Option<String> {
+    let manager = lsp_manager?;
+    if !manager.has_server_for_path(path) {
+        return None;
+    }
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) => return Some(format!("LSP sync failed: {err}")),
+    };
+    if let Err(message) = manager.change_file(path, text) {
+        return Some(format!("LSP sync failed: {message}"));
+    }
+    if let Err(message) = manager.save_file(path) {
+        return Some(format!("LSP sync failed: {message}"));
+    }
+    None
 }
 
 fn validate_read_state(
@@ -140,4 +170,61 @@ fn validate_read_state(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, env, fs};
+
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::config::{LspConfig, LspServerConfig};
+
+    #[test]
+    fn edit_success_reports_lsp_sync_warning_without_failing_edit() {
+        let path = env::temp_dir().join(format!("glint-edit-lsp-{}.rs", Uuid::new_v4()));
+        fs::write(&path, "fn main() {}\n").expect("write fixture");
+        let original = fs::read_to_string(&path).expect("read fixture");
+        let read_state = ReadFileState::new();
+        read_state.record(path.clone(), original, false);
+        let manager = LspManager::new(
+            LspConfig {
+                servers: BTreeMap::from([(
+                    "rust".to_owned(),
+                    LspServerConfig {
+                        command: "/bin/false".to_owned(),
+                        args: Vec::new(),
+                        extension_to_language: BTreeMap::from([(
+                            ".rs".to_owned(),
+                            "rust".to_owned(),
+                        )]),
+                        startup_timeout_ms: 100,
+                        max_restarts: 0,
+                    },
+                )]),
+            },
+            env::temp_dir(),
+        );
+        let call = ToolCall {
+            id: "edit".to_owned(),
+            name: "Edit".to_owned(),
+            arguments: json!({
+                "file_path": path.to_string_lossy(),
+                "old_string": "fn main() {}\n",
+                "new_string": "fn main() { println!(\"hi\"); }\n"
+            }),
+        };
+
+        let result = edit_approved(&call, &read_state, Some(&manager));
+        let updated = fs::read_to_string(&path).expect("read updated");
+        fs::remove_file(&path).ok();
+        manager.shutdown();
+
+        assert!(!result.is_error);
+        assert!(result.content.contains("Edited"));
+        assert!(result.content.contains("LSP sync failed"));
+        assert!(updated.contains("println!"));
+    }
 }

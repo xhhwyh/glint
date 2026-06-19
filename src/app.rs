@@ -76,7 +76,7 @@ impl App {
         let transcript_cwd = std::env::current_dir()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|_| current_dir.clone());
-        let runtime = SessionRuntime::create_new(transcript_cwd)?;
+        let runtime = SessionRuntime::create_new(transcript_cwd, config.lsp.clone())?;
         let messages = runtime.ui_messages();
         let usage = runtime.usage();
         Ok(Self {
@@ -1140,6 +1140,7 @@ mod tests {
                     default_context_window: Some(1000),
                 },
                 model_catalog: ModelCatalog::default(),
+                lsp: crate::config::LspConfig::default(),
                 system_prompt: "system".to_owned(),
             },
             current_dir: "/workspace".to_owned(),

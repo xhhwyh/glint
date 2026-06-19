@@ -11,8 +11,9 @@ use crate::{
         provider::{FinishReason, ToolCall},
     },
     approval::{AgentControl, ApprovalDecision, ConversationPermissions},
-    config::LlmConfig,
+    config::{LlmConfig, LspConfig},
     message::Message,
+    services::lsp::LspManager,
     terminal::TerminalRequest,
     tools::{ReadFileState, ShellToolMode},
     transcript::{AssistantTranscript, CompactTrigger, TranscriptSessionSummary, TranscriptStore},
@@ -121,6 +122,7 @@ pub struct SessionRuntime {
     agent_control_tx: Option<mpsc::Sender<AgentControl>>,
     terminal_request_tx: Sender<TerminalRequest>,
     terminal_requests: Receiver<TerminalRequest>,
+    lsp_manager: LspManager,
     conversation_permissions: ConversationPermissions,
     read_file_state: ReadFileState,
     pending_prompt_after_compact: Option<String>,
@@ -128,14 +130,19 @@ pub struct SessionRuntime {
 }
 
 impl SessionRuntime {
-    pub fn create_new(cwd: String) -> Result<Self> {
+    pub fn create_new(cwd: String, lsp_config: LspConfig) -> Result<Self> {
         let transcript = TranscriptStore::create_new(&cwd)?;
-        Ok(Self::from_transcript(transcript, cwd))
+        Ok(Self::from_transcript(transcript, cwd, lsp_config))
     }
 
-    fn from_transcript(transcript: TranscriptStore, transcript_cwd: String) -> Self {
+    fn from_transcript(
+        transcript: TranscriptStore,
+        transcript_cwd: String,
+        lsp_config: LspConfig,
+    ) -> Self {
         let (agent_tx, agent_events) = mpsc::channel();
         let (terminal_request_tx, terminal_requests) = mpsc::channel();
+        let lsp_manager = LspManager::new(lsp_config, PathBuf::from(&transcript_cwd));
         Self {
             transcript,
             transcript_cwd,
@@ -144,6 +151,7 @@ impl SessionRuntime {
             agent_control_tx: None,
             terminal_request_tx,
             terminal_requests,
+            lsp_manager,
             conversation_permissions: ConversationPermissions::default(),
             read_file_state: ReadFileState::new(),
             pending_prompt_after_compact: None,
@@ -393,6 +401,7 @@ impl SessionRuntime {
                 terminal_requests: self.terminal_request_tx.clone(),
                 shell_tool_mode: config.shell_tool_mode,
                 read_file_state: self.read_file_state.clone(),
+                lsp_manager: self.lsp_manager.clone(),
             },
             self.agent_tx.clone(),
             control_rx,
@@ -447,7 +456,11 @@ impl SessionRuntime {
 
     #[cfg(test)]
     pub(crate) fn test_empty(path: PathBuf, transcript_cwd: String) -> Self {
-        Self::from_transcript(TranscriptStore::test_empty(path), transcript_cwd)
+        Self::from_transcript(
+            TranscriptStore::test_empty(path),
+            transcript_cwd,
+            LspConfig::default(),
+        )
     }
 
     #[cfg(test)]
@@ -463,6 +476,12 @@ impl SessionRuntime {
     #[cfg(test)]
     pub(crate) fn set_auto_compact_failures(&mut self, failures: u8) {
         self.auto_compact_failures = failures;
+    }
+}
+
+impl Drop for SessionRuntime {
+    fn drop(&mut self) {
+        self.lsp_manager.shutdown();
     }
 }
 

@@ -23,6 +23,7 @@ use crate::{
     approval::{AgentControl, ApprovalDecision, ApprovalRequest, ConversationPermissions},
     config::LlmConfig,
     context::{RuntimeContext, build_initial_messages},
+    services::lsp::LspManager,
     services::tool_results::ToolResultBudget,
     settings::ProjectSettings,
     terminal::TerminalRequest,
@@ -44,6 +45,7 @@ pub struct AgentRunInput {
     pub terminal_requests: Sender<TerminalRequest>,
     pub shell_tool_mode: ShellToolMode,
     pub read_file_state: ReadFileState,
+    pub lsp_manager: LspManager,
 }
 
 struct ToolExecutionState<'a> {
@@ -63,6 +65,7 @@ pub fn spawn_agent_loop(
             input.shell_tool_mode,
             Some(input.terminal_requests.clone()),
         )
+        .with_lsp_manager(input.lsp_manager.clone())
         .with_read_file_state(input.read_file_state.clone());
 
         match run_agent_loop(input, &mut provider, &registry, &tx, &control_rx) {
@@ -199,7 +202,7 @@ fn append_tool_turn(
 
     for batch in partition_tool_calls(registry, response.tool_calls, state) {
         if batch.concurrent {
-            append_concurrent_tool_batch(messages, tx, control_rx, state, batch.calls)?;
+            append_concurrent_tool_batch(messages, registry, tx, control_rx, state, batch.calls)?;
         } else {
             for call in batch.calls {
                 append_serial_tool_call(messages, registry, tx, control_rx, state, call)?;
@@ -254,6 +257,7 @@ fn append_serial_tool_call(
 
 fn append_concurrent_tool_batch(
     messages: &mut Vec<ModelMessage>,
+    registry: &ToolRegistry,
     tx: &Sender<AgentEvent>,
     control_rx: &Receiver<AgentControl>,
     state: &mut ToolExecutionState<'_>,
@@ -275,8 +279,8 @@ fn append_concurrent_tool_batch(
         let result_tx = result_tx.clone();
         let cancelled = Arc::clone(&cancelled);
         let tool_result_budget = state.tool_result_budget.clone();
+        let registry = registry.clone();
         thread::spawn(move || {
-            let registry = ToolRegistry::new();
             let tool_name = call.name.clone();
             let mut is_cancelled = || cancelled.load(Ordering::Relaxed);
             let result = registry.execute_approved_with_cancel(&call, &mut is_cancelled);
@@ -596,7 +600,7 @@ mod tests {
     use super::*;
     use crate::{
         agent::provider::{ModelRole, ToolResult},
-        config::LlmProviderConfig,
+        config::{LlmProviderConfig, LspConfig},
         settings::{ProjectPermissions, ProjectSettings},
     };
 
@@ -670,6 +674,7 @@ mod tests {
             terminal_requests,
             shell_tool_mode: ShellToolMode::Bash,
             read_file_state: ReadFileState::new(),
+            lsp_manager: LspManager::new(LspConfig::default(), PathBuf::from("/workspace")),
         }
     }
 
