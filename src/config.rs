@@ -44,6 +44,8 @@ pub struct ModelCatalog {
 pub struct ProviderCatalogEntry {
     #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub unit: String,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -86,6 +88,8 @@ struct FileProviderConfig {
     #[serde(default)]
     description: String,
     base_url: String,
+    #[serde(default)]
+    unit: String,
     models: Vec<FileModelConfig>,
     api_key_env: String,
 }
@@ -145,6 +149,7 @@ impl FileLlmConfig {
                 provider_name.clone(),
                 ProviderCatalogEntry {
                     description: provider.description.clone(),
+                    unit: provider.unit.clone(),
                 },
             );
 
@@ -393,6 +398,7 @@ mod tests {
                 deepseek:
                   description: DeepSeek official endpoint
                   base_url: https://api.deepseek.com/
+                  unit: RMB
                   models:
                     - name: deepseek-v4-flash
                       positioning: Fast chat
@@ -412,6 +418,7 @@ mod tests {
             catalog.providers["deepseek"].description,
             "DeepSeek official endpoint"
         );
+        assert_eq!(catalog.providers["deepseek"].unit, "RMB");
 
         let entry = &catalog.models["deepseek"]["deepseek-v4-flash"];
         assert_eq!(entry.positioning, "Fast chat");

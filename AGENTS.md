@@ -53,6 +53,7 @@ llm:
     default:
       description: Default OpenAI-compatible endpoint
       base_url: https://example.com/v1
+      unit: USD
       models:
         - name: model-name
           positioning: General-purpose chat
@@ -65,7 +66,7 @@ llm:
       api_key_env: LLM_API_KEY
 ```
 
-Provider entries own `description`, `base_url`, `models`, and `api_key_env`; global LLM settings own the selected `provider`, selected `model`, `temperature`, `max_tokens`, and optional `context_window`. A model entry can be a plain model name or an object with `name`, `positioning`, `input`, `output`, `cache_read`, `cache_write`, `context`, `max_tokens`, or `price` for `/model` picker display. Numeric model `context` values are also used as the status-bar context window, with global `context_window` as fallback. API keys must come from the environment variable named by `api_key_env`; never hardcode or leak secrets. The HTTP client trims trailing slashes from `base_url`, posts to `{base_url}/chat/completions`, and expects `choices[0].message.content`.
+Provider entries own `description`, `base_url`, optional token-cost `unit`, `models`, and `api_key_env`; global LLM settings own the selected `provider`, selected `model`, `temperature`, `max_tokens`, and optional `context_window`. A model entry can be a plain model name or an object with `name`, `positioning`, `input`, `output`, `cache_read`, `cache_write`, `context`, `max_tokens`, or `price` for `/model` picker display. Provider `unit` is converted to a price symbol, such as `￥` for RMB/CNY or `$` for USD, and appended to each input/output/cache price value when present. Numeric model `context` values are also used as the status-bar context window, with global `context_window` as fallback. API keys must come from the environment variable named by `api_key_env`; never hardcode or leak secrets. The HTTP client trims trailing slashes from `base_url`, posts to `{base_url}/chat/completions`, and expects `choices[0].message.content`.
 
 ## Architecture
 

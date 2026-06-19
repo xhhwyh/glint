@@ -8,6 +8,7 @@ llm:
     deepseek:
       description: DeepSeek official OpenAI-compatible endpoint
       base_url: https://api.deepseek.com
+      unit: RMB
       models:
         - name: deepseek-v4-flash
           positioning: Fast general-purpose DeepSeek-style chat
@@ -39,8 +40,20 @@ llm:
     zhipu:
       description: Zhipu GLM endpoint for general Chinese and bilingual work
       base_url: https://open.bigmodel.cn/api/paas/v4/
+      unit: RMB
       models:
-        - glm-5.1
+        - name: glm-5.2
+          input: 8.00
+          output: 28.00
+          cache_read: 2.00
+          context: 1000000
+          max_tokens: 128000
+        - name: glm-5.1
+          input: 8.00
+          output: 28.00
+          cache_read: 2.00
+          context: 200000
+          max_tokens: 128000
         - glm-5
         - glm-5-turbo
         - glm-4.7
@@ -50,18 +63,53 @@ llm:
     kimi:
       description: Moonshot Kimi endpoint with long-context options
       base_url: https://api.moonshot.ai/v1/
+      unit: USD
       models:
-        - kimi-k2.6
-        - kimi-k2.5
+        - name: kimi-k2.7-code
+          input: 0.95
+          output: 4.00
+          cache_read: 0.19
+          context: 262144
+        - name: kimi-k2.7-code-highspeed
+          input: 1.90
+          output: 8.00
+          cache_read: 0.38
+          context: 262144
+        - name: kimi-k2.6
+          input: 0.95
+          output: 4.00
+          cache_read: 0.16
+          context: 262144
+        - name: kimi-k2.5
+          input: 0.60
+          output: 3.00
+          cache_read: 0.10
+          context: 262144
       api_key_env: KIMI_API_KEY
 
     dashscope:
       description: Alibaba DashScope compatible-mode endpoint for Qwen models
       base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+      unit: RMB
       models:
-        - qwen3.7-max
-        - qwen3.7-plus
-        - qwen3.6-flash
+        - name: qwen3.7-max
+          input: 12.00
+          output: 36.00
+          cache_read: 2.40
+          context: 1000000
+          max_tokens: 64000
+        - name: qwen3.7-plus
+          input: 2.00
+          output: 8.00
+          cache_read: 0.4
+          context: 1000000
+          max_tokens: 64000
+        - name: qwen3.6-flash
+          input: 1.20
+          output: 7.20
+          cache_read: 0.12
+          context: 1000000
+          max_tokens: 64000
         - deepseek-v4-pro
         - deepseek-v4-flash
         - glm-5.1
@@ -73,6 +121,7 @@ llm:
     openrouter:
       description: OpenRouter gateway for multiple upstream model families
       base_url: https://openrouter.ai/api/v1
+      unit: USD
       models:
         - deepseek/deepseek-v4-flash
       api_key_env: OPENROUTER_API_KEY

@@ -1324,6 +1324,13 @@ fn provider_summary(app: &App, provider: &crate::config::LlmProviderConfig) -> S
 }
 
 fn model_summary(app: &App, provider: &str, model: &str) -> String {
+    let unit = app
+        .config
+        .model_catalog
+        .providers
+        .get(provider)
+        .map(|provider| provider.unit.as_str())
+        .unwrap_or_default();
     let Some(entry) = app
         .config
         .model_catalog
@@ -1349,16 +1356,16 @@ fn model_summary(app: &App, provider: &str, model: &str) -> String {
     } else {
         let mut price = Vec::new();
         if !entry.input.is_empty() {
-            price.push(format!("input {}", entry.input));
+            price.push(price_label("input", &entry.input, unit));
         }
         if !entry.output.is_empty() {
-            price.push(format!("output {}", entry.output));
+            price.push(price_label("output", &entry.output, unit));
         }
         if !entry.cache_read.is_empty() {
-            price.push(format!("cache read {}", entry.cache_read));
+            price.push(price_label("cache read", &entry.cache_read, unit));
         }
         if !entry.cache_write.is_empty() {
-            price.push(format!("cache write {}", entry.cache_write));
+            price.push(price_label("cache write", &entry.cache_write, unit));
         }
         if !price.is_empty() {
             parts.push(price.join(", "));
@@ -1370,6 +1377,17 @@ fn model_summary(app: &App, provider: &str, model: &str) -> String {
     } else {
         parts.join(" | ")
     }
+}
+
+fn price_label(label: &str, value: &str, unit: &str) -> String {
+    let normalized_unit = unit.to_ascii_uppercase();
+    let suffix = match normalized_unit.as_str() {
+        "RMB" | "CNY" => "￥",
+        "USD" => "$",
+        "" => "",
+        _ => unit,
+    };
+    format!("{label} {value}{suffix}")
 }
 
 fn pad_to_width(text: &str, width: usize) -> String {
@@ -1720,6 +1738,13 @@ mod tests {
         assert_eq!(context_usage_label(1, None), "—");
         assert_eq!(context_bar_percent(37_500, Some(100_000)), 37);
         assert_eq!(context_bar_percent(1, None), 0);
+    }
+
+    #[test]
+    fn price_labels_include_provider_unit_when_present() {
+        assert_eq!(price_label("input", "1.0", "RMB"), "input 1.0￥");
+        assert_eq!(price_label("output", "2.0", "USD"), "output 2.0$");
+        assert_eq!(price_label("input", "1.0", ""), "input 1.0");
     }
 
     #[test]
