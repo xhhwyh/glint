@@ -8,6 +8,7 @@ mod event;
 mod input;
 mod message;
 mod query;
+mod runtime;
 mod services;
 mod settings;
 mod terminal;
@@ -83,9 +84,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
             }
         }
 
-        while let Ok(event) = app.agent_events.try_recv() {
-            app.update(AppEvent::Agent(event));
-        }
+        app.update_agent_events();
         app.update_terminal();
     }
 

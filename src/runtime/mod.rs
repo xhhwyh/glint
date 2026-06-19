@@ -1,0 +1,479 @@
+use std::{
+    path::PathBuf,
+    sync::mpsc::{self, Receiver, Sender},
+};
+
+use anyhow::Result;
+
+use crate::{
+    agent::{
+        self, AgentEvent, AgentRunInput, CompactRunInput, RuntimeContext, TokenUsage,
+        provider::{FinishReason, ToolCall},
+    },
+    approval::{AgentControl, ApprovalDecision, ConversationPermissions},
+    config::LlmConfig,
+    message::Message,
+    terminal::TerminalRequest,
+    tools::{ReadFileState, ShellToolMode},
+    transcript::{AssistantTranscript, CompactTrigger, TranscriptSessionSummary, TranscriptStore},
+};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConversationUsage {
+    pub last_usage: Option<TokenUsage>,
+    pub total_prompt_tokens: u64,
+    pub total_completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+impl ConversationUsage {
+    pub fn record(self, usage: TokenUsage) -> Self {
+        Self {
+            last_usage: Some(usage),
+            total_prompt_tokens: self.total_prompt_tokens + usage.prompt_tokens,
+            total_completion_tokens: self.total_completion_tokens + usage.completion_tokens,
+            total_tokens: self.total_tokens + usage.total_tokens,
+        }
+    }
+
+    pub fn cache_percent(self) -> Option<u8> {
+        let usage = self.last_usage?;
+        let cached_prompt_tokens = usage.cached_prompt_tokens?;
+        if usage.prompt_tokens == 0 {
+            return None;
+        }
+
+        Some(percent(cached_prompt_tokens, usage.prompt_tokens))
+    }
+}
+
+#[derive(Clone)]
+pub struct StartPromptConfig {
+    pub llm: LlmConfig,
+    pub system_prompt: String,
+    pub runtime_current_dir: String,
+    pub shell_tool_mode: ShellToolMode,
+}
+
+pub enum RuntimeCommand {
+    StartManualCompact {
+        llm: LlmConfig,
+        pre_prompt_tokens: Option<u64>,
+    },
+    SubmitPrompt {
+        prompt: String,
+        config: StartPromptConfig,
+        pre_prompt_tokens: Option<u64>,
+    },
+    StartPrompt {
+        prompt: String,
+        config: StartPromptConfig,
+    },
+    ApprovalDecision {
+        id: u64,
+        decision: ApprovalDecision,
+    },
+    ClearConversationEditPermission,
+    CancelCurrentTurn {
+        compacting: bool,
+    },
+}
+
+pub enum RuntimeEvent {
+    NoMessagesToCompact,
+    CompactStarted { automatic: bool },
+    PromptStarted { prompt: String },
+    PermissionChanged,
+    Cancelled { was_compacting: bool },
+}
+
+pub struct LoadedTranscript {
+    pub messages: Vec<Message>,
+    pub usage: ConversationUsage,
+}
+
+pub struct CompactFinished {
+    pub messages: Vec<Message>,
+    pub pending_prompt: Option<String>,
+    pub automatic: bool,
+}
+
+pub struct CompactFailed {
+    pub pending_prompt: Option<String>,
+    pub automatic: bool,
+}
+
+pub struct AssistantRecord {
+    pub content: String,
+    pub provider: String,
+    pub model: String,
+    pub tool_calls: Vec<ToolCall>,
+    pub usage: Option<TokenUsage>,
+    pub finish_reason: FinishReason,
+    pub error: Option<String>,
+}
+
+pub struct SessionRuntime {
+    transcript: TranscriptStore,
+    transcript_cwd: String,
+    agent_tx: Sender<AgentEvent>,
+    agent_events: Receiver<AgentEvent>,
+    agent_control_tx: Option<mpsc::Sender<AgentControl>>,
+    terminal_request_tx: Sender<TerminalRequest>,
+    terminal_requests: Receiver<TerminalRequest>,
+    conversation_permissions: ConversationPermissions,
+    read_file_state: ReadFileState,
+    pending_prompt_after_compact: Option<String>,
+    auto_compact_failures: u8,
+}
+
+impl SessionRuntime {
+    pub fn create_new(cwd: String) -> Result<Self> {
+        let transcript = TranscriptStore::create_new(&cwd)?;
+        Ok(Self::from_transcript(transcript, cwd))
+    }
+
+    fn from_transcript(transcript: TranscriptStore, transcript_cwd: String) -> Self {
+        let (agent_tx, agent_events) = mpsc::channel();
+        let (terminal_request_tx, terminal_requests) = mpsc::channel();
+        Self {
+            transcript,
+            transcript_cwd,
+            agent_tx,
+            agent_events,
+            agent_control_tx: None,
+            terminal_request_tx,
+            terminal_requests,
+            conversation_permissions: ConversationPermissions::default(),
+            read_file_state: ReadFileState::new(),
+            pending_prompt_after_compact: None,
+            auto_compact_failures: 0,
+        }
+    }
+
+    pub fn ui_messages(&self) -> Vec<Message> {
+        self.transcript.ui_messages()
+    }
+
+    pub fn usage(&self) -> ConversationUsage {
+        usage_from_transcript(&self.transcript)
+    }
+
+    #[cfg(test)]
+    pub fn model_history(&self) -> Vec<crate::agent::provider::ModelMessage> {
+        self.transcript.model_history()
+    }
+
+    pub fn conversation_permissions(&self) -> ConversationPermissions {
+        self.conversation_permissions
+    }
+
+    pub fn has_pending_prompt_after_compact(&self) -> bool {
+        self.pending_prompt_after_compact.is_some()
+    }
+
+    #[cfg(test)]
+    pub fn auto_compact_failures(&self) -> u8 {
+        self.auto_compact_failures
+    }
+
+    pub fn sessions(&self) -> Result<Vec<TranscriptSessionSummary>> {
+        TranscriptStore::sessions(&self.transcript_cwd)
+    }
+
+    pub fn load_path(&mut self, path: PathBuf) -> Result<LoadedTranscript> {
+        let transcript = TranscriptStore::load_path(path)?;
+        let messages = transcript.ui_messages();
+        let usage = usage_from_transcript(&transcript);
+        self.transcript = transcript;
+        self.read_file_state.clear();
+        Ok(LoadedTranscript { messages, usage })
+    }
+
+    pub fn try_recv_agent_event(&self) -> Option<AgentEvent> {
+        self.agent_events.try_recv().ok()
+    }
+
+    pub fn try_recv_terminal_request(&self) -> Option<TerminalRequest> {
+        self.terminal_requests.try_recv().ok()
+    }
+
+    pub fn handle_command(&mut self, command: RuntimeCommand) -> RuntimeEvent {
+        match command {
+            RuntimeCommand::StartManualCompact {
+                llm,
+                pre_prompt_tokens,
+            } => self.start_manual_compact(llm, pre_prompt_tokens),
+            RuntimeCommand::SubmitPrompt {
+                prompt,
+                config,
+                pre_prompt_tokens,
+            } => self.submit_prompt_or_auto_compact(prompt, config, pre_prompt_tokens),
+            RuntimeCommand::StartPrompt { prompt, config } => self.start_prompt(prompt, config),
+            RuntimeCommand::ApprovalDecision { id, decision } => {
+                self.submit_approval_decision(id, decision)
+            }
+            RuntimeCommand::ClearConversationEditPermission => {
+                self.clear_conversation_edit_permission()
+            }
+            RuntimeCommand::CancelCurrentTurn { compacting } => {
+                self.cancel_current_turn(compacting)
+            }
+        }
+    }
+
+    pub fn record_local_exchange(
+        &mut self,
+        user: String,
+        assistant: String,
+        provider: String,
+        model: String,
+    ) {
+        self.append_user(user);
+        self.record_assistant(AssistantRecord {
+            content: assistant,
+            provider,
+            model,
+            tool_calls: Vec::new(),
+            usage: None,
+            finish_reason: FinishReason::Stop,
+            error: None,
+        });
+    }
+
+    pub fn record_assistant(&mut self, record: AssistantRecord) {
+        self.transcript
+            .append_assistant(AssistantTranscript {
+                content: record.content,
+                provider: record.provider,
+                model: record.model,
+                tool_calls: record.tool_calls,
+                usage: record.usage,
+                finish_reason: record.finish_reason,
+                error: record.error,
+            })
+            .ok();
+    }
+
+    pub fn record_tool(&mut self, call_id: String, content: String, is_error: bool) {
+        self.transcript.append_tool(call_id, content, is_error).ok();
+    }
+
+    pub fn complete_turn(&mut self) {
+        self.transcript.complete_turn().ok();
+        self.agent_control_tx = None;
+    }
+
+    pub fn abort_turn(&mut self, reason: String) {
+        self.transcript.abort_turn(reason).ok();
+        self.agent_control_tx = None;
+    }
+
+    pub fn finish_compact(
+        &mut self,
+        summary: String,
+        pre_prompt_tokens: Option<u64>,
+    ) -> CompactFinished {
+        let pending_prompt = self.pending_prompt_after_compact.take();
+        let automatic = pending_prompt.is_some();
+        let trigger = if automatic {
+            CompactTrigger::Auto
+        } else {
+            CompactTrigger::Manual
+        };
+        self.transcript
+            .append_compact_boundary(trigger, summary, pre_prompt_tokens)
+            .ok();
+        self.agent_control_tx = None;
+        if automatic {
+            self.auto_compact_failures = 0;
+        }
+        CompactFinished {
+            messages: self.transcript.ui_messages(),
+            pending_prompt,
+            automatic,
+        }
+    }
+
+    pub fn fail_compact(&mut self) -> CompactFailed {
+        let pending_prompt = self.pending_prompt_after_compact.take();
+        let automatic = pending_prompt.is_some();
+        self.agent_control_tx = None;
+        if automatic {
+            self.auto_compact_failures = self.auto_compact_failures.saturating_add(1);
+        }
+        CompactFailed {
+            pending_prompt,
+            automatic,
+        }
+    }
+
+    pub fn sync_conversation_permission(&mut self, edit_always_allowed: bool) {
+        self.conversation_permissions.edit_always_allowed = edit_always_allowed;
+    }
+
+    fn start_manual_compact(
+        &mut self,
+        llm: LlmConfig,
+        pre_prompt_tokens: Option<u64>,
+    ) -> RuntimeEvent {
+        self.pending_prompt_after_compact = None;
+        self.reset_agent_channel();
+        let conversation = self.transcript.model_history();
+        if conversation.is_empty() {
+            return RuntimeEvent::NoMessagesToCompact;
+        }
+
+        self.agent_control_tx = None;
+        agent::spawn_compact_loop(
+            CompactRunInput {
+                llm,
+                conversation,
+                pre_prompt_tokens,
+            },
+            self.agent_tx.clone(),
+        );
+        RuntimeEvent::CompactStarted { automatic: false }
+    }
+
+    fn submit_prompt_or_auto_compact(
+        &mut self,
+        prompt: String,
+        config: StartPromptConfig,
+        pre_prompt_tokens: Option<u64>,
+    ) -> RuntimeEvent {
+        if agent::should_auto_compact(&config.llm, pre_prompt_tokens, self.auto_compact_failures) {
+            let conversation = self.transcript.model_history();
+            if !conversation.is_empty() {
+                self.reset_agent_channel();
+                self.pending_prompt_after_compact = Some(prompt);
+                self.agent_control_tx = None;
+                agent::spawn_compact_loop(
+                    CompactRunInput {
+                        llm: config.llm,
+                        conversation,
+                        pre_prompt_tokens,
+                    },
+                    self.agent_tx.clone(),
+                );
+                return RuntimeEvent::CompactStarted { automatic: true };
+            }
+        }
+
+        self.start_prompt(prompt, config)
+    }
+
+    fn start_prompt(&mut self, prompt: String, config: StartPromptConfig) -> RuntimeEvent {
+        self.reset_agent_channel();
+        let conversation = self.transcript.model_history();
+        self.transcript
+            .start_turn(
+                self.transcript_cwd.clone(),
+                config.llm.provider.clone(),
+                config.llm.model.clone(),
+            )
+            .ok();
+        self.append_user(prompt.clone());
+
+        let (control_tx, control_rx) = mpsc::channel();
+        self.agent_control_tx = Some(control_tx);
+
+        agent::spawn_agent_loop(
+            AgentRunInput {
+                llm: config.llm.clone(),
+                system_prompt: config.system_prompt,
+                runtime_context: RuntimeContext::current(
+                    config.runtime_current_dir,
+                    config.shell_tool_mode,
+                ),
+                conversation_permissions: self.conversation_permissions,
+                conversation,
+                current_user_message: prompt.clone(),
+                tool_results_dir: self.transcript.tool_results_dir(),
+                terminal_requests: self.terminal_request_tx.clone(),
+                shell_tool_mode: config.shell_tool_mode,
+                read_file_state: self.read_file_state.clone(),
+            },
+            self.agent_tx.clone(),
+            control_rx,
+        );
+
+        RuntimeEvent::PromptStarted { prompt }
+    }
+
+    fn submit_approval_decision(&mut self, id: u64, decision: ApprovalDecision) -> RuntimeEvent {
+        if decision == ApprovalDecision::AllowConversation {
+            self.conversation_permissions.edit_always_allowed = true;
+        }
+        if let Some(tx) = &self.agent_control_tx {
+            tx.send(AgentControl::ApprovalDecision { id, decision })
+                .ok();
+        }
+        RuntimeEvent::PermissionChanged
+    }
+
+    fn clear_conversation_edit_permission(&mut self) -> RuntimeEvent {
+        self.conversation_permissions.edit_always_allowed = false;
+        if let Some(tx) = &self.agent_control_tx {
+            tx.send(AgentControl::ClearConversationEditPermission).ok();
+        }
+        RuntimeEvent::PermissionChanged
+    }
+
+    fn cancel_current_turn(&mut self, compacting: bool) -> RuntimeEvent {
+        if let Some(tx) = &self.agent_control_tx {
+            tx.send(AgentControl::Cancel).ok();
+        }
+        self.reset_agent_channel();
+        if !compacting {
+            self.transcript.abort_turn("cancelled".to_owned()).ok();
+        }
+        self.agent_control_tx = None;
+        self.pending_prompt_after_compact = None;
+        RuntimeEvent::Cancelled {
+            was_compacting: compacting,
+        }
+    }
+
+    fn append_user(&mut self, content: String) {
+        self.transcript.append_user(content).ok();
+    }
+
+    fn reset_agent_channel(&mut self) {
+        let (agent_tx, agent_events) = mpsc::channel();
+        self.agent_tx = agent_tx;
+        self.agent_events = agent_events;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_empty(path: PathBuf, transcript_cwd: String) -> Self {
+        Self::from_transcript(TranscriptStore::test_empty(path), transcript_cwd)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transcript_mut(&mut self) -> &mut TranscriptStore {
+        &mut self.transcript
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_pending_prompt_after_compact(&mut self, prompt: Option<String>) {
+        self.pending_prompt_after_compact = prompt;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_auto_compact_failures(&mut self, failures: u8) {
+        self.auto_compact_failures = failures;
+    }
+}
+
+fn usage_from_transcript(transcript: &TranscriptStore) -> ConversationUsage {
+    transcript
+        .token_usages()
+        .fold(ConversationUsage::default(), |usage, item| {
+            usage.record(item)
+        })
+}
+
+fn percent(value: u64, total: u64) -> u8 {
+    (value.saturating_mul(100) / total).min(100) as u8
+}

@@ -6,6 +6,7 @@ mod description;
 
 use super::{
     ToolBehavior,
+    read_state::ReadFileState,
     utils::{error, missing_arg, ok, path_arg, resolve_tool_path, slice_lines, string_arg},
 };
 
@@ -25,7 +26,7 @@ impl ToolBehavior for ReadTool {
     }
 
     fn execute(&self, call: &ToolCall, _is_cancelled: &mut dyn FnMut() -> bool) -> ToolResult {
-        read(call)
+        read(call, &ReadFileState::new())
     }
 
     fn is_concurrency_safe(&self, _call: &ToolCall) -> bool {
@@ -37,7 +38,7 @@ impl ToolBehavior for ReadTool {
     }
 }
 
-fn read(call: &ToolCall) -> ToolResult {
+pub(super) fn read(call: &ToolCall, read_file_state: &ReadFileState) -> ToolResult {
     let Some(path) = string_arg(call, "file_path") else {
         return missing_arg(call, "file_path");
     };
@@ -48,7 +49,14 @@ fn read(call: &ToolCall) -> ToolResult {
     };
 
     match fs::read_to_string(&path) {
-        Ok(content) => ok(call, slice_lines(content, call)),
+        Ok(content) => {
+            read_file_state.record(path.clone(), content.clone(), is_partial_read(call));
+            ok(call, slice_lines(content, call))
+        }
         Err(err) => error(call, format!("failed to read {}: {err}", path.display())),
     }
+}
+
+fn is_partial_read(call: &ToolCall) -> bool {
+    call.arguments.get("offset").is_some() || call.arguments.get("limit").is_some()
 }

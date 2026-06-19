@@ -26,7 +26,7 @@ use crate::{
     services::tool_results::ToolResultBudget,
     settings::ProjectSettings,
     terminal::TerminalRequest,
-    tools::{ShellToolMode, ToolRegistry},
+    tools::{ReadFileState, ShellToolMode, ToolRegistry},
 };
 
 const MAX_TOOL_ITERATIONS: usize = 8;
@@ -43,6 +43,7 @@ pub struct AgentRunInput {
     pub tool_results_dir: PathBuf,
     pub terminal_requests: Sender<TerminalRequest>,
     pub shell_tool_mode: ShellToolMode,
+    pub read_file_state: ReadFileState,
 }
 
 struct ToolExecutionState<'a> {
@@ -61,7 +62,8 @@ pub fn spawn_agent_loop(
         let registry = ToolRegistry::with_shell_tool(
             input.shell_tool_mode,
             Some(input.terminal_requests.clone()),
-        );
+        )
+        .with_read_file_state(input.read_file_state.clone());
 
         match run_agent_loop(input, &mut provider, &registry, &tx, &control_rx) {
             Ok(()) => {
@@ -659,7 +661,7 @@ mod tests {
                 shell: "/bin/zsh".to_owned(),
                 app_name: "glint".to_owned(),
                 app_version: "0.1.0".to_owned(),
-                tool_mode: "available tools: Read, Glob, Grep, Bash, Edit".to_owned(),
+                tool_mode: "available tools: Read, Glob, Grep, LSP, Bash, Edit".to_owned(),
             },
             conversation_permissions: ConversationPermissions::default(),
             conversation: Vec::new(),
@@ -667,6 +669,7 @@ mod tests {
             tool_results_dir: std::env::temp_dir(),
             terminal_requests,
             shell_tool_mode: ShellToolMode::Bash,
+            read_file_state: ReadFileState::new(),
         }
     }
 

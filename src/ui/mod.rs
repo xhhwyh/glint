@@ -1543,7 +1543,7 @@ fn context_line(app: &App, _width: u16) -> Line<'static> {
 }
 
 fn permission_line(app: &App) -> Option<Line<'static>> {
-    if app.conversation_permissions.edit_always_allowed {
+    if app.edit_always_allowed() {
         Some(Line::from(vec![
             Span::styled(
                 "Permissions ",

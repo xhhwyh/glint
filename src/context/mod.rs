@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{agent::provider::ModelMessage, tools::ShellToolMode};
 
-const COMMON_TOOL_CONTEXT: &str = "Use paths relative to current_directory for files and directories under current_directory; use absolute paths only for targets outside current_directory. Do not use ~ in tool arguments. Use Read for known file contents. If you do not know the target file path, use narrow Glob or Grep first, then Read the discovered file paths. Only batch Read with Glob or Grep when the Read paths are already known from the user request or prior context. Do not start project summaries with broad root Glob patterns like **/*; read orientation files and manifests first. Glob results are capped at 100 files. Glob searches time out after 20 seconds by default, 60 seconds on WSL, or the positive value in GLINT_GLOB_TIMEOUT_SECONDS when set. Large tool outputs may be previewed and persisted outside the model context.";
+const COMMON_TOOL_CONTEXT: &str = "Use paths relative to current_directory for files and directories under current_directory; use absolute paths only for targets outside current_directory. Do not use ~ in tool arguments. Use Read for known file contents. If you do not know the target file path, use narrow Glob or Grep first, then Read the discovered file paths. Use LSP for Rust symbol-aware questions such as definitions, references, hover documentation, document symbols, and workspace symbols. Only batch Read with Glob or Grep when the Read paths are already known from the user request or prior context. Do not start project summaries with broad root Glob patterns like **/*; read orientation files and manifests first. Glob results are capped at 100 files. Glob searches time out after 20 seconds by default, 60 seconds on WSL, or the positive value in GLINT_GLOB_TIMEOUT_SECONDS when set. Large tool outputs may be previewed and persisted outside the model context.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeContext {
@@ -42,10 +42,10 @@ impl RuntimeContext {
 fn tool_mode_context(shell_tool_mode: ShellToolMode) -> String {
     match shell_tool_mode {
         ShellToolMode::Bash => format!(
-            "available tools: Read, Glob, Grep, Bash, Edit. {COMMON_TOOL_CONTEXT} Use Bash for non-interactive shell-only commands such as git, build/test, package manager, environment, and process commands. TerminalRun is unavailable until the user enables the visible terminal with /terminal."
+            "available tools: Read, Glob, Grep, LSP, Bash, Edit. {COMMON_TOOL_CONTEXT} Use Bash for non-interactive shell-only commands such as git, build/test, package manager, environment, and process commands. TerminalRun is unavailable until the user enables the visible terminal with /terminal."
         ),
         ShellToolMode::TerminalRun => format!(
-            "available tools: Read, Glob, Grep, TerminalRun, Edit. {COMMON_TOOL_CONTEXT} Use TerminalRun for non-interactive shell-only commands such as git, build/test, package manager, environment, and process commands so the command and output are visible in the terminal. Bash is unavailable while terminal mode is enabled."
+            "available tools: Read, Glob, Grep, LSP, TerminalRun, Edit. {COMMON_TOOL_CONTEXT} Use TerminalRun for non-interactive shell-only commands such as git, build/test, package manager, environment, and process commands so the command and output are visible in the terminal. Bash is unavailable while terminal mode is enabled."
         ),
     }
 }
@@ -115,13 +115,13 @@ mod tests {
 
         assert!(
             bash.tool_mode
-                .contains("available tools: Read, Glob, Grep, Bash, Edit")
+                .contains("available tools: Read, Glob, Grep, LSP, Bash, Edit")
         );
         assert!(bash.tool_mode.contains("TerminalRun is unavailable"));
         assert!(
             terminal
                 .tool_mode
-                .contains("available tools: Read, Glob, Grep, TerminalRun, Edit")
+                .contains("available tools: Read, Glob, Grep, LSP, TerminalRun, Edit")
         );
         assert!(terminal.tool_mode.contains("Bash is unavailable"));
     }

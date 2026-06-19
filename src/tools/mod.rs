@@ -2,7 +2,9 @@ mod bash;
 mod edit;
 mod glob;
 mod grep;
+mod lsp;
 mod read;
+mod read_state;
 mod terminal_run;
 mod utils;
 
@@ -17,7 +19,9 @@ use bash::BashTool;
 use edit::EditTool;
 use glob::{GLOB_MAX_LIMIT, GlobTool};
 use grep::GrepTool;
+use lsp::LspTool;
 use read::ReadTool;
+pub use read_state::ReadFileState;
 use terminal_run::TerminalRunTool;
 use utils::{error, normalize_path_argument, requires_path_approval, truncate_summary};
 
@@ -25,6 +29,7 @@ use utils::{error, normalize_path_argument, requires_path_approval, truncate_sum
 pub struct ToolRegistry {
     terminal_requests: Option<Sender<TerminalRequest>>,
     shell_tool_mode: ShellToolMode,
+    read_file_state: ReadFileState,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +43,7 @@ impl ToolRegistry {
         Self {
             terminal_requests: None,
             shell_tool_mode: ShellToolMode::Bash,
+            read_file_state: ReadFileState::new(),
         }
     }
 
@@ -46,6 +52,7 @@ impl ToolRegistry {
         Self {
             terminal_requests: Some(terminal_requests),
             shell_tool_mode: ShellToolMode::TerminalRun,
+            read_file_state: ReadFileState::new(),
         }
     }
 
@@ -56,7 +63,13 @@ impl ToolRegistry {
         Self {
             terminal_requests,
             shell_tool_mode,
+            read_file_state: ReadFileState::new(),
         }
+    }
+
+    pub fn with_read_file_state(mut self, read_file_state: ReadFileState) -> Self {
+        self.read_file_state = read_file_state;
+        self
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
@@ -83,6 +96,12 @@ impl ToolRegistry {
                 is_cancelled,
                 false,
             );
+        }
+        if call.name == "Read" {
+            return read::read(call, &self.read_file_state);
+        }
+        if call.name == "Edit" {
+            return edit::edit(call);
         }
         self.tool_for_name(&call.name)
             .map(|tool| tool.execute(call, is_cancelled))
@@ -120,6 +139,12 @@ impl ToolRegistry {
                 true,
             );
         }
+        if call.name == "Read" {
+            return read::read(call, &self.read_file_state);
+        }
+        if call.name == "Edit" {
+            return edit::edit_approved(call, &self.read_file_state);
+        }
         self.tool_for_name(&call.name)
             .map(|tool| tool.execute_approved(call, is_cancelled))
             .unwrap_or_else(|| self.execute_with_cancel(call, is_cancelled))
@@ -152,6 +177,7 @@ impl ToolRegistry {
         match call.name.as_str() {
             "Read" | "Edit" => normalize_path_argument(&mut call.arguments, "file_path"),
             "Glob" | "Grep" => normalize_path_argument(&mut call.arguments, "path"),
+            "LSP" => normalize_path_argument(&mut call.arguments, "file_path"),
             _ => {}
         }
         call
@@ -162,7 +188,9 @@ impl ToolRegistry {
             ShellToolMode::Bash => &BASH_TOOL,
             ShellToolMode::TerminalRun => &TERMINAL_RUN_TOOL,
         };
-        vec![&READ_TOOL, &GLOB_TOOL, &GREP_TOOL, shell_tool, &EDIT_TOOL]
+        vec![
+            &READ_TOOL, &GLOB_TOOL, &GREP_TOOL, &LSP_TOOL, shell_tool, &EDIT_TOOL,
+        ]
     }
 
     fn tool_for_name(&self, name: &str) -> Option<&'static dyn ToolBehavior> {
@@ -213,14 +241,16 @@ pub(super) trait ToolBehavior: Sync {
 static READ_TOOL: ReadTool = ReadTool;
 static GLOB_TOOL: GlobTool = GlobTool;
 static GREP_TOOL: GrepTool = GrepTool;
+static LSP_TOOL: LspTool = LspTool;
 static BASH_TOOL: BashTool = BashTool;
 static EDIT_TOOL: EditTool = EditTool;
 static TERMINAL_RUN_TOOL: TerminalRunTool = TerminalRunTool;
 
-static ALL_TOOLS: [&dyn ToolBehavior; 6] = [
+static ALL_TOOLS: [&dyn ToolBehavior; 7] = [
     &READ_TOOL,
     &GLOB_TOOL,
     &GREP_TOOL,
+    &LSP_TOOL,
     &TERMINAL_RUN_TOOL,
     &BASH_TOOL,
     &EDIT_TOOL,
@@ -236,6 +266,10 @@ fn spec(name: &str, description: &str, required: &[&str]) -> ToolSpec {
         "pattern": { "type": "string" },
         "path": { "type": "string", "description": "Search path. Use a path relative to current_directory when the directory is under current_directory; use an absolute path only outside it. Do not use ~." },
         "glob": { "type": "string", "description": "Optional file glob filter." },
+        "operation": { "type": "string" },
+        "line": { "type": "integer", "minimum": 1 },
+        "character": { "type": "integer", "minimum": 1 },
+        "query": { "type": "string" },
         "command": { "type": "string", "description": "Shell-only command. Do not use for file reading, listing, searching, or edits." },
         "old_string": { "type": "string" },
         "new_string": { "type": "string" },
@@ -294,6 +328,48 @@ fn spec(name: &str, description: &str, required: &[&str]) -> ToolSpec {
             }),
         );
     }
+    if name == "LSP"
+        && let Value::Object(properties) = &mut properties
+    {
+        properties.insert(
+            "operation".to_owned(),
+            json!({
+                "type": "string",
+                "enum": ["definition", "references", "hover", "document_symbols", "workspace_symbols"],
+                "description": "Semantic operation to perform."
+            }),
+        );
+        properties.insert(
+            "file_path".to_owned(),
+            json!({
+                "type": "string",
+                "description": "Rust file path for definition, references, hover, and document_symbols. Use current_directory-relative paths for files under current_directory."
+            }),
+        );
+        properties.insert(
+            "line".to_owned(),
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "description": "1-based line number for definition, references, and hover."
+            }),
+        );
+        properties.insert(
+            "character".to_owned(),
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "description": "1-based character offset for definition, references, and hover."
+            }),
+        );
+        properties.insert(
+            "query".to_owned(),
+            json!({
+                "type": "string",
+                "description": "Workspace symbol query for workspace_symbols."
+            }),
+        );
+    }
 
     ToolSpec {
         name: name.to_owned(),
@@ -337,7 +413,7 @@ mod tests {
             .map(|spec| spec.name)
             .collect::<Vec<_>>();
 
-        assert_eq!(names, ["Read", "Glob", "Grep", "Bash", "Edit"]);
+        assert_eq!(names, ["Read", "Glob", "Grep", "LSP", "Bash", "Edit"]);
     }
 
     #[test]
@@ -349,7 +425,10 @@ mod tests {
             .map(|spec| spec.name)
             .collect::<Vec<_>>();
 
-        assert_eq!(names, ["Read", "Glob", "Grep", "TerminalRun", "Edit"]);
+        assert_eq!(
+            names,
+            ["Read", "Glob", "Grep", "LSP", "TerminalRun", "Edit"]
+        );
     }
 
     #[test]
@@ -519,6 +598,31 @@ mod tests {
                 .as_str()
                 .expect("pattern should have a description")
                 .contains("Narrow glob pattern")
+        );
+    }
+
+    #[test]
+    fn lsp_schema_describes_operations() {
+        let specs = ToolRegistry::new().specs();
+        let lsp = specs
+            .iter()
+            .find(|spec| spec.name == "LSP")
+            .expect("LSP spec should exist");
+
+        assert_eq!(lsp.parameters["required"], json!(["operation"]));
+        assert_eq!(
+            lsp.parameters["properties"]["operation"]["enum"],
+            json!([
+                "definition",
+                "references",
+                "hover",
+                "document_symbols",
+                "workspace_symbols"
+            ])
+        );
+        assert!(
+            lsp.description
+                .contains("language-server semantic information")
         );
     }
 
@@ -857,6 +961,108 @@ mod tests {
         };
 
         assert!(registry.requires_approval(&call, false, false));
+    }
+
+    #[test]
+    fn edit_requires_prior_full_read() {
+        let registry = ToolRegistry::new();
+        let path = env::temp_dir().join(format!(
+            "glint-edit-requires-read-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(&path, "old").expect("write temp file");
+        let edit = ToolCall {
+            id: "edit".to_owned(),
+            name: "Edit".to_owned(),
+            arguments: json!({
+                "file_path": path,
+                "old_string": "old",
+                "new_string": "new"
+            }),
+        };
+
+        let result = registry.execute_approved(&edit);
+
+        assert!(result.is_error);
+        assert!(result.content.contains("has not been read yet"));
+        let path = edit.arguments["file_path"].as_str().expect("path");
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn edit_succeeds_after_full_read_and_refreshes_state() {
+        let registry = ToolRegistry::new();
+        let path = env::temp_dir().join(format!(
+            "glint-edit-after-read-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(&path, "old").expect("write temp file");
+        let read = ToolCall {
+            id: "read".to_owned(),
+            name: "Read".to_owned(),
+            arguments: json!({ "file_path": path }),
+        };
+        let edit = ToolCall {
+            id: "edit".to_owned(),
+            name: "Edit".to_owned(),
+            arguments: json!({
+                "file_path": read.arguments["file_path"].clone(),
+                "old_string": "old",
+                "new_string": "new"
+            }),
+        };
+        let edit_again = ToolCall {
+            id: "edit-again".to_owned(),
+            name: "Edit".to_owned(),
+            arguments: json!({
+                "file_path": read.arguments["file_path"].clone(),
+                "old_string": "new",
+                "new_string": "final"
+            }),
+        };
+
+        assert!(!registry.execute(&read).is_error);
+        assert!(!registry.execute_approved(&edit).is_error);
+        assert!(!registry.execute_approved(&edit_again).is_error);
+
+        let path = read.arguments["file_path"].as_str().expect("path");
+        assert_eq!(fs::read_to_string(path).expect("read temp file"), "final");
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn edit_rejects_partial_read_state() {
+        let registry = ToolRegistry::new();
+        let path = env::temp_dir().join(format!(
+            "glint-edit-partial-read-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(&path, "old\nsecond").expect("write temp file");
+        let read = ToolCall {
+            id: "read".to_owned(),
+            name: "Read".to_owned(),
+            arguments: json!({
+                "file_path": path,
+                "limit": 1
+            }),
+        };
+        let edit = ToolCall {
+            id: "edit".to_owned(),
+            name: "Edit".to_owned(),
+            arguments: json!({
+                "file_path": read.arguments["file_path"].clone(),
+                "old_string": "old",
+                "new_string": "new"
+            }),
+        };
+
+        assert!(!registry.execute(&read).is_error);
+        let result = registry.execute_approved(&edit);
+
+        assert!(result.is_error);
+        assert!(result.content.contains("only partially read"));
+        let path = read.arguments["file_path"].as_str().expect("path");
+        fs::remove_file(path).ok();
     }
 
     #[test]

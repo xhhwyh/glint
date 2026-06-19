@@ -96,7 +96,7 @@ agent thread -> AgentEvent -> AppEvent::Agent -> App::update -> ui::render
 - While the agent is not idle, text input is disabled and up/down scroll the transcript.
 - Assistant responses stream into the transcript as provider deltas arrive.
 - Conversation history is persisted and model requests include prior model history plus the current user request.
-- Tool execution supports Read, Glob, Grep, TerminalRun, Bash, and Edit with approval, cancellation, read-only batching, visible agent-terminal command execution, and large-result budgeting.
+- Tool execution supports Read, Glob, Grep, LSP, TerminalRun, Bash, and Edit with approval, cancellation, read-only batching, visible agent-terminal command execution, and large-result budgeting.
 - No async runtime, MCP, retries, or multi-session tabs yet.
 
 ## Style
