@@ -16,7 +16,10 @@ use crate::{
     services::lsp::LspManager,
     terminal::TerminalRequest,
     tools::{ReadFileState, ShellToolMode},
-    transcript::{AssistantTranscript, CompactTrigger, TranscriptSessionSummary, TranscriptStore},
+    transcript::{
+        AssistantTranscript, CompactTrigger, TranscriptSessionSummary, TranscriptStore,
+        WorkspaceUsageStats,
+    },
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -25,6 +28,7 @@ pub struct ConversationUsage {
     pub total_prompt_tokens: u64,
     pub total_completion_tokens: u64,
     pub total_tokens: u64,
+    pub total_cached_prompt_tokens: u64,
 }
 
 impl ConversationUsage {
@@ -34,6 +38,8 @@ impl ConversationUsage {
             total_prompt_tokens: self.total_prompt_tokens + usage.prompt_tokens,
             total_completion_tokens: self.total_completion_tokens + usage.completion_tokens,
             total_tokens: self.total_tokens + usage.total_tokens,
+            total_cached_prompt_tokens: self.total_cached_prompt_tokens
+                + usage.cached_prompt_tokens.unwrap_or(0),
         }
     }
 
@@ -189,13 +195,36 @@ impl SessionRuntime {
         TranscriptStore::sessions(&self.transcript_cwd)
     }
 
+    pub fn workspace_usage_stats(&self) -> Result<WorkspaceUsageStats> {
+        TranscriptStore::workspace_usage_stats(&self.transcript_cwd)
+    }
+
     pub fn load_path(&mut self, path: PathBuf) -> Result<LoadedTranscript> {
         let transcript = TranscriptStore::load_path(path)?;
         let messages = transcript.ui_messages();
         let usage = usage_from_transcript(&transcript);
         self.transcript = transcript;
-        self.read_file_state.clear();
+        self.reset_session_state();
         Ok(LoadedTranscript { messages, usage })
+    }
+
+    pub fn create_new_session(&mut self) -> Result<LoadedTranscript> {
+        let transcript = self.transcript.create_new_sibling()?;
+        self.transcript = transcript;
+        self.reset_session_state();
+        Ok(LoadedTranscript {
+            messages: self.transcript.ui_messages(),
+            usage: usage_from_transcript(&self.transcript),
+        })
+    }
+
+    pub fn clear_context(&mut self) -> Result<LoadedTranscript> {
+        self.transcript.append_clear_boundary()?;
+        self.reset_session_state();
+        Ok(LoadedTranscript {
+            messages: self.transcript.ui_messages(),
+            usage: usage_from_transcript(&self.transcript),
+        })
     }
 
     pub fn try_recv_agent_event(&self) -> Option<AgentEvent> {
@@ -452,6 +481,15 @@ impl SessionRuntime {
         let (agent_tx, agent_events) = mpsc::channel();
         self.agent_tx = agent_tx;
         self.agent_events = agent_events;
+    }
+
+    fn reset_session_state(&mut self) {
+        self.reset_agent_channel();
+        self.agent_control_tx = None;
+        self.conversation_permissions = ConversationPermissions::default();
+        self.read_file_state.clear();
+        self.pending_prompt_after_compact = None;
+        self.auto_compact_failures = 0;
     }
 
     #[cfg(test)]

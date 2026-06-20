@@ -17,12 +17,12 @@ use crate::{
     input::InputState,
     message::{Message, Role},
     runtime::{
-        AssistantRecord, ConversationUsage, RuntimeCommand, RuntimeEvent, SessionRuntime,
-        StartPromptConfig,
+        AssistantRecord, ConversationUsage, LoadedTranscript, RuntimeCommand, RuntimeEvent,
+        SessionRuntime, StartPromptConfig,
     },
     terminal::{TerminalRequest, TerminalRunResult, TerminalTab},
     tools::ShellToolMode,
-    transcript::TranscriptSessionSummary,
+    transcript::{TranscriptSessionSummary, WorkspaceUsageStats},
 };
 
 pub struct App {
@@ -35,6 +35,7 @@ pub struct App {
     pub slash_command_selection: usize,
     pub model_picker: Option<ModelPicker>,
     pub resume_picker: Option<ResumePicker>,
+    pub status_view: Option<StatusView>,
     pub config: Config,
     pub current_dir: String,
     pub agent_activity: Option<String>,
@@ -70,6 +71,38 @@ pub struct ResumePicker {
     pub selected: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatusView {
+    pub tab: StatusTab,
+    pub stats: WorkspaceUsageStats,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusTab {
+    General,
+    Usage,
+    Stat,
+}
+
+impl StatusTab {
+    fn previous(self) -> Self {
+        match self {
+            Self::General => Self::Stat,
+            Self::Usage => Self::General,
+            Self::Stat => Self::Usage,
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::General => Self::Usage,
+            Self::Usage => Self::Stat,
+            Self::Stat => Self::General,
+        }
+    }
+}
+
 impl App {
     pub fn new(config: Config) -> Result<Self> {
         let current_dir = current_dir_label();
@@ -89,6 +122,7 @@ impl App {
             slash_command_selection: 0,
             model_picker: None,
             resume_picker: None,
+            status_view: None,
             config,
             current_dir,
             agent_activity: None,
@@ -234,6 +268,10 @@ impl App {
             self.update_resume_picker_key(action);
             return;
         }
+        if self.status_view.is_some() {
+            self.update_status_view_key(action);
+            return;
+        }
         if self.model_picker.is_some() {
             self.update_model_picker_key(action);
             return;
@@ -295,6 +333,7 @@ impl App {
         if self.status != AgentStatus::Idle
             || self.model_picker.is_some()
             || self.resume_picker.is_some()
+            || self.status_view.is_some()
         {
             return None;
         }
@@ -343,6 +382,9 @@ impl App {
 
     fn run_slash_command(&mut self, command: SlashCommand) {
         match command.kind {
+            SlashCommandKind::New => self.run_new_session(),
+            SlashCommandKind::Clear => self.run_clear_context(),
+            SlashCommandKind::Status => self.open_status_view(),
             SlashCommandKind::Compact => self.run_compact(),
             SlashCommandKind::Model => self.open_model_picker(),
             SlashCommandKind::Resume => self.open_resume_picker(),
@@ -566,6 +608,51 @@ impl App {
         picker.selected = move_index(picker.selected, direction, picker.sessions.len());
     }
 
+    fn open_status_view(&mut self) {
+        self.input.set("/status");
+        let (stats, error) = match self.runtime.workspace_usage_stats() {
+            Ok(stats) => (stats, None),
+            Err(error) => (WorkspaceUsageStats::default(), Some(format!("{error:#}"))),
+        };
+        self.status_view = Some(StatusView {
+            tab: StatusTab::General,
+            stats,
+            error,
+        });
+    }
+
+    fn update_status_view_key(&mut self, key: KeyAction) {
+        match key {
+            KeyAction::Escape => self.close_status_view(),
+            KeyAction::Left => self.move_status_view(-1),
+            KeyAction::Right | KeyAction::Tab => self.move_status_view(1),
+            _ => {}
+        }
+    }
+
+    fn close_status_view(&mut self) {
+        self.status_view = None;
+        self.input.set("");
+    }
+
+    fn move_status_view(&mut self, direction: isize) {
+        let Some(view) = self.status_view.as_mut() else {
+            return;
+        };
+        view.tab = if direction < 0 {
+            view.tab.previous()
+        } else {
+            view.tab.next()
+        };
+    }
+
+    fn apply_loaded_transcript(&mut self, loaded: LoadedTranscript) {
+        self.messages = loaded.messages;
+        self.usage = loaded.usage;
+        self.scroll = 0;
+        self.approval = None;
+    }
+
     fn clamp_slash_command_selection(&mut self) {
         let matches = self.slash_command_matches();
         if matches.is_empty() {
@@ -716,6 +803,32 @@ impl App {
         self.active_terminal_tab = index;
         self.terminal_visible = true;
         self.run_notice = Some(format!("Terminal tab {} selected.", index + 1));
+    }
+
+    fn run_new_session(&mut self) {
+        let _command = self.input.take_trimmed();
+        match self.runtime.create_new_session() {
+            Ok(loaded) => {
+                self.apply_loaded_transcript(loaded);
+                self.run_notice = Some("Started new session.".to_owned());
+            }
+            Err(error) => {
+                self.run_notice = Some(format!("Failed to start new session: {error:#}"));
+            }
+        }
+    }
+
+    fn run_clear_context(&mut self) {
+        let _command = self.input.take_trimmed();
+        match self.runtime.clear_context() {
+            Ok(loaded) => {
+                self.apply_loaded_transcript(loaded);
+                self.run_notice = Some("Cleared conversation context.".to_owned());
+            }
+            Err(error) => {
+                self.run_notice = Some(format!("Failed to clear context: {error:#}"));
+            }
+        }
     }
 
     fn run_compact(&mut self) {
@@ -1121,6 +1234,7 @@ mod tests {
             slash_command_selection: 0,
             model_picker: None,
             resume_picker: None,
+            status_view: None,
             config: Config {
                 llm: LlmConfig {
                     provider: "test".to_owned(),
@@ -1169,6 +1283,9 @@ mod tests {
             .map(|command| command.name)
             .collect::<Vec<_>>();
 
+        assert!(names.contains(&"/new"));
+        assert!(names.contains(&"/clear"));
+        assert!(names.contains(&"/status"));
         assert!(names.contains(&"/compact"));
         assert!(names.contains(&"/terminal"));
     }
@@ -1197,6 +1314,109 @@ mod tests {
         assert_eq!(app.messages.len(), 0);
         assert_eq!(app.runtime.model_history().len(), 0);
         assert_eq!(app.run_notice.as_deref(), Some("No messages to compact."));
+    }
+
+    #[test]
+    fn new_command_starts_empty_session() {
+        let mut app = app();
+        app.runtime
+            .transcript_mut()
+            .append_user("old user".to_owned())
+            .unwrap();
+        app.messages = app.runtime.ui_messages();
+        app.input.set("/new");
+
+        let command = SLASH_COMMANDS
+            .iter()
+            .find(|command| command.name == "/new")
+            .copied()
+            .unwrap();
+        app.run_slash_command(command);
+
+        assert!(app.messages.is_empty());
+        assert!(app.runtime.model_history().is_empty());
+        assert_eq!(app.usage, ConversationUsage::default());
+        assert_eq!(app.run_notice.as_deref(), Some("Started new session."));
+    }
+
+    #[test]
+    fn clear_command_clears_current_context() {
+        let mut app = app();
+        app.runtime
+            .transcript_mut()
+            .append_user("old user".to_owned())
+            .unwrap();
+        app.messages = app.runtime.ui_messages();
+        app.usage = ConversationUsage::default().record(TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 25,
+            total_tokens: 125,
+            cached_prompt_tokens: None,
+        });
+        app.input.set("/clear");
+
+        let command = SLASH_COMMANDS
+            .iter()
+            .find(|command| command.name == "/clear")
+            .copied()
+            .unwrap();
+        app.run_slash_command(command);
+
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].content, "Cleared conversation context");
+        assert!(app.runtime.model_history().is_empty());
+        assert_eq!(app.usage, ConversationUsage::default());
+        assert_eq!(
+            app.run_notice.as_deref(),
+            Some("Cleared conversation context.")
+        );
+    }
+
+    #[test]
+    fn status_command_opens_status_view() {
+        let mut app = app();
+        app.input.set("/status");
+
+        let command = SLASH_COMMANDS
+            .iter()
+            .find(|command| command.name == "/status")
+            .copied()
+            .unwrap();
+        app.run_slash_command(command);
+
+        assert!(app.status_view.is_some());
+        assert_eq!(
+            app.status_view.as_ref().map(|view| view.tab),
+            Some(StatusTab::General)
+        );
+        assert_eq!(app.input.value, "/status");
+    }
+
+    #[test]
+    fn status_view_switches_tabs_and_closes() {
+        let mut app = app();
+        app.status_view = Some(StatusView {
+            tab: StatusTab::General,
+            stats: WorkspaceUsageStats::default(),
+            error: None,
+        });
+        app.input.set("/status");
+
+        app.update_status_view_key(KeyAction::Right);
+        assert_eq!(
+            app.status_view.as_ref().map(|view| view.tab),
+            Some(StatusTab::Usage)
+        );
+
+        app.update_status_view_key(KeyAction::Left);
+        assert_eq!(
+            app.status_view.as_ref().map(|view| view.tab),
+            Some(StatusTab::General)
+        );
+
+        app.update_status_view_key(KeyAction::Escape);
+        assert!(app.status_view.is_none());
+        assert_eq!(app.input.value, "");
     }
 
     #[test]

@@ -7,13 +7,31 @@ pub struct SlashCommand {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlashCommandKind {
+    New,
+    Clear,
+    Status,
     Compact,
     Model,
     Resume,
     Terminal,
 }
 
-pub const SLASH_COMMANDS: [SlashCommand; 4] = [
+pub const SLASH_COMMANDS: [SlashCommand; 7] = [
+    SlashCommand {
+        name: "/new",
+        description: "Start a fresh session",
+        kind: SlashCommandKind::New,
+    },
+    SlashCommand {
+        name: "/clear",
+        description: "Clear this session's conversation context",
+        kind: SlashCommandKind::Clear,
+    },
+    SlashCommand {
+        name: "/status",
+        description: "Open runtime, usage, and workspace statistics",
+        kind: SlashCommandKind::Status,
+    },
     SlashCommand {
         name: "/compact",
         description: "Summarize earlier conversation and continue compacted",
@@ -40,6 +58,5 @@ pub fn matching_slash_commands(query: &str) -> Vec<SlashCommand> {
     SLASH_COMMANDS
         .into_iter()
         .filter(|command| command.name[1..].starts_with(query))
-        .take(5)
         .collect()
 }

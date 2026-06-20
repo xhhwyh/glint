@@ -1,6 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -22,6 +22,7 @@ use crate::{
 
 const SCHEMA: u16 = 3;
 const COMPACT_UI_MESSAGE: &str = "Compacted conversation";
+const CLEAR_UI_MESSAGE: &str = "Cleared conversation context";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TranscriptEntry {
@@ -99,6 +100,7 @@ pub enum ResponseItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         pre_prompt_tokens: Option<u64>,
     },
+    ClearBoundary,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -162,6 +164,30 @@ pub struct TranscriptSessionSummary {
     pub last_timestamp: u64,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkspaceUsageStats {
+    pub session_count: usize,
+    pub turn_count: usize,
+    pub total_prompt_tokens: u64,
+    pub total_completion_tokens: u64,
+    pub total_tokens: u64,
+    pub total_cached_prompt_tokens: u64,
+    pub daily_tokens: Vec<DailyTokenTotal>,
+    pub model_tokens: Vec<ModelTokenTotal>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DailyTokenTotal {
+    pub day: i64,
+    pub tokens: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelTokenTotal {
+    pub model: String,
+    pub tokens: u64,
+}
+
 pub struct AssistantTranscript {
     pub content: String,
     pub provider: String,
@@ -188,6 +214,15 @@ impl TranscriptStore {
         fs::create_dir_all(&project_dir).context("failed to create transcript directory")?;
         let session_id = new_id();
         Ok(Self::empty(project_dir.join(format!("{session_id}.jsonl"))))
+    }
+
+    pub fn create_new_sibling(&self) -> Result<Self> {
+        let project_dir = self
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        Self::create_new_in_project_dir(project_dir)
     }
 
     pub fn load_path(path: PathBuf) -> Result<Self> {
@@ -229,6 +264,11 @@ impl TranscriptStore {
         Ok(sessions)
     }
 
+    pub fn workspace_usage_stats(cwd: &str) -> Result<WorkspaceUsageStats> {
+        let project_dir = transcript_project_dir(cwd)?;
+        workspace_usage_stats_in_project_dir(&project_dir)
+    }
+
     pub fn start_turn(&mut self, cwd: String, provider: String, model: String) -> Result<()> {
         self.ensure_session_meta(&cwd, &provider, &model)?;
         let turn_id = new_id();
@@ -251,12 +291,14 @@ impl TranscriptStore {
     pub fn model_history(&self) -> Vec<ModelMessage> {
         let items = self.response_items();
         let mut history = Vec::new();
-        let mut index = last_compact_boundary(&items)
-            .map(|(index, summary)| {
+        let mut index = match last_context_boundary(&items) {
+            Some(ContextBoundary::Compact { index, summary }) => {
                 history.push(ModelMessage::user(compact_summary_message(summary)));
                 index + 1
-            })
-            .unwrap_or(0);
+            }
+            Some(ContextBoundary::Clear { index }) => index + 1,
+            None => 0,
+        };
 
         while index < items.len() {
             match items[index] {
@@ -338,6 +380,10 @@ impl TranscriptStore {
                     }
                     index += 1;
                 }
+                ResponseItem::ClearBoundary => {
+                    history.clear();
+                    index += 1;
+                }
             }
         }
 
@@ -395,6 +441,11 @@ impl TranscriptStore {
                 ResponseItem::CompactBoundary { .. } => {
                     messages.push(Message::assistant(COMPACT_UI_MESSAGE));
                 }
+                ResponseItem::ClearBoundary => {
+                    messages.clear();
+                    tool_indexes.clear();
+                    messages.push(Message::assistant(CLEAR_UI_MESSAGE));
+                }
             }
         }
 
@@ -402,9 +453,17 @@ impl TranscriptStore {
     }
 
     pub fn token_usages(&self) -> impl Iterator<Item = TokenUsage> + '_ {
+        let last_clear_index = self.entries.iter().rposition(|entry| {
+            matches!(
+                entry.payload,
+                TranscriptPayload::ResponseItem(ResponseItem::ClearBoundary)
+            )
+        });
         self.entries
             .iter()
-            .filter_map(|entry| match &entry.payload {
+            .enumerate()
+            .filter(move |(index, _)| last_clear_index.is_none_or(|clear| *index > clear))
+            .filter_map(|(_, entry)| match &entry.payload {
                 TranscriptPayload::EventMsg(EventMsg::TokenCount { usage, .. }) => Some(*usage),
                 _ => None,
             })
@@ -510,6 +569,14 @@ impl TranscriptStore {
                 summary,
                 pre_prompt_tokens,
             }),
+        )
+    }
+
+    pub fn append_clear_boundary(&mut self) -> Result<()> {
+        self.flush_pending_usage()?;
+        self.append(
+            TranscriptEntryType::ResponseItem,
+            TranscriptPayload::ResponseItem(ResponseItem::ClearBoundary),
         )
     }
 
@@ -672,6 +739,118 @@ fn session_summary(path: &Path) -> Result<Option<TranscriptSessionSummary>> {
     }))
 }
 
+fn workspace_usage_stats_in_project_dir(project_dir: &Path) -> Result<WorkspaceUsageStats> {
+    if !project_dir.exists() {
+        return Ok(WorkspaceUsageStats::default());
+    }
+
+    let mut stats = UsageStatsAccumulator::default();
+    for entry in fs::read_dir(project_dir).context("failed to read transcript directory")? {
+        let path = entry.context("failed to read transcript entry")?.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(store) = TranscriptStore::load_path(path) else {
+            continue;
+        };
+        if store.entries.is_empty() {
+            continue;
+        }
+        stats.session_count += 1;
+        stats.accumulate(&store);
+    }
+
+    Ok(stats.finish())
+}
+
+#[derive(Default)]
+struct UsageStatsAccumulator {
+    session_count: usize,
+    turn_count: usize,
+    total_prompt_tokens: u64,
+    total_completion_tokens: u64,
+    total_tokens: u64,
+    total_cached_prompt_tokens: u64,
+    daily_tokens: BTreeMap<i64, u64>,
+    model_tokens: BTreeMap<String, u64>,
+}
+
+impl UsageStatsAccumulator {
+    fn accumulate(&mut self, store: &TranscriptStore) {
+        let mut turn_models = HashMap::new();
+        let mut turn_ids = HashSet::new();
+
+        for entry in &store.entries {
+            if let TranscriptPayload::TurnContext(TurnContext {
+                turn_id,
+                provider,
+                model,
+                ..
+            }) = &entry.payload
+            {
+                turn_models.insert(turn_id.clone(), format!("{model} · {provider}"));
+                turn_ids.insert(turn_id.clone());
+            }
+        }
+        self.turn_count += turn_ids.len();
+
+        for entry in &store.entries {
+            let TranscriptPayload::EventMsg(EventMsg::TokenCount { turn_id, usage }) =
+                &entry.payload
+            else {
+                continue;
+            };
+            let model = turn_id
+                .as_ref()
+                .and_then(|id| turn_models.get(id))
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_owned());
+            let day = (entry.timestamp / 86_400) as i64;
+
+            self.total_prompt_tokens = self.total_prompt_tokens.saturating_add(usage.prompt_tokens);
+            self.total_completion_tokens = self
+                .total_completion_tokens
+                .saturating_add(usage.completion_tokens);
+            self.total_tokens = self.total_tokens.saturating_add(usage.total_tokens);
+            self.total_cached_prompt_tokens = self
+                .total_cached_prompt_tokens
+                .saturating_add(usage.cached_prompt_tokens.unwrap_or(0));
+            *self.daily_tokens.entry(day).or_default() += usage.total_tokens;
+            *self.model_tokens.entry(model).or_default() += usage.total_tokens;
+        }
+    }
+
+    fn finish(self) -> WorkspaceUsageStats {
+        let daily_tokens = self
+            .daily_tokens
+            .into_iter()
+            .map(|(day, tokens)| DailyTokenTotal { day, tokens })
+            .collect();
+        let mut model_tokens = self
+            .model_tokens
+            .into_iter()
+            .map(|(model, tokens)| ModelTokenTotal { model, tokens })
+            .collect::<Vec<_>>();
+        model_tokens.sort_by(|left, right| {
+            right
+                .tokens
+                .cmp(&left.tokens)
+                .then_with(|| left.model.cmp(&right.model))
+        });
+
+        WorkspaceUsageStats {
+            session_count: self.session_count,
+            turn_count: self.turn_count,
+            total_prompt_tokens: self.total_prompt_tokens,
+            total_completion_tokens: self.total_completion_tokens,
+            total_tokens: self.total_tokens,
+            total_cached_prompt_tokens: self.total_cached_prompt_tokens,
+            daily_tokens,
+            model_tokens,
+        }
+    }
+}
+
 fn entry_timestamp(value: &Value) -> u64 {
     value
         .get("timestamp")
@@ -751,13 +930,22 @@ fn finish_reason_text(reason: FinishReason) -> String {
     }
 }
 
-fn last_compact_boundary<'a>(items: &[&'a ResponseItem]) -> Option<(usize, &'a str)> {
+enum ContextBoundary<'a> {
+    Compact { index: usize, summary: &'a str },
+    Clear { index: usize },
+}
+
+fn last_context_boundary<'a>(items: &[&'a ResponseItem]) -> Option<ContextBoundary<'a>> {
     items
         .iter()
         .enumerate()
         .rev()
         .find_map(|(index, item)| match item {
-            ResponseItem::CompactBoundary { summary, .. } => Some((index, summary.as_str())),
+            ResponseItem::CompactBoundary { summary, .. } => Some(ContextBoundary::Compact {
+                index,
+                summary: summary.as_str(),
+            }),
+            ResponseItem::ClearBoundary => Some(ContextBoundary::Clear { index }),
             _ => None,
         })
 }
@@ -985,6 +1173,37 @@ mod tests {
     }
 
     #[test]
+    fn model_history_starts_after_clear_boundary() {
+        let mut transcript = store();
+        transcript.append_user("old user".to_owned()).unwrap();
+        transcript
+            .append_assistant(assistant("old assistant"))
+            .unwrap();
+        transcript.append_clear_boundary().unwrap();
+        transcript.append_user("new user".to_owned()).unwrap();
+
+        let history = transcript.model_history();
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content.as_deref(), Some("new user"));
+    }
+
+    #[test]
+    fn clear_boundary_after_compact_drops_compact_summary() {
+        let mut transcript = store();
+        transcript
+            .append_compact_boundary(CompactTrigger::Manual, "old summary".to_owned(), None)
+            .unwrap();
+        transcript.append_clear_boundary().unwrap();
+        transcript.append_user("new user".to_owned()).unwrap();
+
+        let history = transcript.model_history();
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content.as_deref(), Some("new user"));
+    }
+
+    #[test]
     fn ui_messages_show_compact_marker_without_summary() {
         let mut transcript = store();
         transcript.append_user("old user".to_owned()).unwrap();
@@ -1011,6 +1230,82 @@ mod tests {
     }
 
     #[test]
+    fn ui_messages_start_after_clear_boundary() {
+        let mut transcript = store();
+        transcript.append_user("old user".to_owned()).unwrap();
+        transcript.append_clear_boundary().unwrap();
+        transcript.append_user("new user".to_owned()).unwrap();
+
+        let messages = transcript.ui_messages();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, CLEAR_UI_MESSAGE);
+        assert_eq!(messages[1].content, "new user");
+    }
+
+    #[test]
+    fn token_usages_start_after_clear_boundary() {
+        let mut transcript = store();
+        transcript
+            .append_usage(TokenUsage {
+                prompt_tokens: 100,
+                completion_tokens: 25,
+                total_tokens: 125,
+                cached_prompt_tokens: None,
+            })
+            .unwrap();
+        transcript.append_clear_boundary().unwrap();
+        transcript
+            .append_usage(TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                cached_prompt_tokens: None,
+            })
+            .unwrap();
+
+        let usages = transcript.token_usages().collect::<Vec<_>>();
+
+        assert_eq!(usages.len(), 1);
+        assert_eq!(usages[0].total_tokens, 15);
+    }
+
+    #[test]
+    fn workspace_usage_stats_group_by_day_and_model() {
+        let cwd = "/tmp/glint-workspace-stats-test";
+        let project_dir = std::env::temp_dir().join(format!("glint-workspace-stats-{}", new_id()));
+        let mut transcript =
+            TranscriptStore::create_new_in_project_dir(project_dir.clone()).unwrap();
+        transcript
+            .start_turn(cwd.to_owned(), "provider".to_owned(), "model".to_owned())
+            .unwrap();
+        transcript
+            .append_usage(TokenUsage {
+                prompt_tokens: 100,
+                completion_tokens: 25,
+                total_tokens: 125,
+                cached_prompt_tokens: Some(40),
+            })
+            .unwrap();
+
+        let stats = workspace_usage_stats_in_project_dir(&project_dir).unwrap();
+
+        assert_eq!(stats.session_count, 1);
+        assert_eq!(stats.turn_count, 1);
+        assert_eq!(stats.total_prompt_tokens, 100);
+        assert_eq!(stats.total_completion_tokens, 25);
+        assert_eq!(stats.total_tokens, 125);
+        assert_eq!(stats.total_cached_prompt_tokens, 40);
+        assert_eq!(stats.daily_tokens.len(), 1);
+        assert_eq!(stats.daily_tokens[0].tokens, 125);
+        assert_eq!(stats.model_tokens.len(), 1);
+        assert_eq!(stats.model_tokens[0].model, "model · provider");
+        assert_eq!(stats.model_tokens[0].tokens, 125);
+
+        fs::remove_dir_all(project_dir).ok();
+    }
+
+    #[test]
     fn compact_trigger_auto_round_trips_as_snake_case() {
         let item = ResponseItem::CompactBoundary {
             trigger: CompactTrigger::Auto,
@@ -1029,5 +1324,16 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn clear_boundary_round_trips_as_snake_case() {
+        let item = ResponseItem::ClearBoundary;
+
+        let encoded = serde_json::to_string(&item).unwrap();
+        let decoded: ResponseItem = serde_json::from_str(&encoded).unwrap();
+
+        assert!(encoded.contains("\"type\":\"clear_boundary\""));
+        assert!(matches!(decoded, ResponseItem::ClearBoundary));
     }
 }
