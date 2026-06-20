@@ -8,6 +8,8 @@ use crate::app::App;
 
 use super::{layout::wrap_text, theme::*};
 
+const MAX_SLASH_COMMAND_ROWS: usize = 5;
+
 pub(super) fn input_rows(value: &str, width: u16) -> Vec<String> {
     wrap_text(value, input_content_width(width) as u16)
         .into_iter()
@@ -61,10 +63,18 @@ pub(super) fn slash_command_lines(app: &App, _width: u16) -> Vec<Line<'static>> 
         .max()
         .unwrap_or(0);
 
-    matches
+    let start = slash_command_window_start(
+        app.slash_command_selection,
+        matches.len(),
+        MAX_SLASH_COMMAND_ROWS,
+    );
+    let end = (start + MAX_SLASH_COMMAND_ROWS).min(matches.len());
+
+    matches[start..end]
         .iter()
         .enumerate()
-        .map(|(index, command)| {
+        .map(|(offset, command)| {
+            let index = start + offset;
             let selected = index == app.slash_command_selection;
             let style = if selected {
                 Style::default()
@@ -85,4 +95,28 @@ pub(super) fn slash_command_lines(app: &App, _width: u16) -> Vec<Line<'static>> 
             ])
         })
         .collect()
+}
+
+fn slash_command_window_start(selected: usize, len: usize, height: usize) -> usize {
+    if len <= height {
+        return 0;
+    }
+    selected
+        .min(len - 1)
+        .saturating_sub(height - 1)
+        .min(len - height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slash_command_window_shows_five_rows_and_tracks_selection() {
+        assert_eq!(slash_command_window_start(0, 7, 5), 0);
+        assert_eq!(slash_command_window_start(4, 7, 5), 0);
+        assert_eq!(slash_command_window_start(5, 7, 5), 1);
+        assert_eq!(slash_command_window_start(6, 7, 5), 2);
+        assert_eq!(slash_command_window_start(6, 5, 5), 0);
+    }
 }

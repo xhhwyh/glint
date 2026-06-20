@@ -9,6 +9,8 @@ pub struct SlashCommand {
 pub enum SlashCommandKind {
     New,
     Clear,
+    Archive,
+    Delete,
     Status,
     Compact,
     Model,
@@ -16,7 +18,7 @@ pub enum SlashCommandKind {
     Terminal,
 }
 
-pub const SLASH_COMMANDS: [SlashCommand; 7] = [
+pub const SLASH_COMMANDS: [SlashCommand; 9] = [
     SlashCommand {
         name: "/new",
         description: "Start a fresh session",
@@ -26,6 +28,16 @@ pub const SLASH_COMMANDS: [SlashCommand; 7] = [
         name: "/clear",
         description: "Clear this session's conversation context",
         kind: SlashCommandKind::Clear,
+    },
+    SlashCommand {
+        name: "/archive",
+        description: "Archive this session",
+        kind: SlashCommandKind::Archive,
+    },
+    SlashCommand {
+        name: "/delete",
+        description: "Permanently delete this session",
+        kind: SlashCommandKind::Delete,
     },
     SlashCommand {
         name: "/status",

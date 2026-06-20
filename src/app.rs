@@ -370,11 +370,14 @@ impl App {
                 }
             }
             KeyAction::Up if !matches.is_empty() => {
-                self.slash_command_selection = self.slash_command_selection.saturating_sub(1);
+                self.slash_command_selection = if self.slash_command_selection == 0 {
+                    matches.len() - 1
+                } else {
+                    self.slash_command_selection - 1
+                };
             }
             KeyAction::Down if !matches.is_empty() => {
-                self.slash_command_selection =
-                    (self.slash_command_selection + 1).min(matches.len() - 1);
+                self.slash_command_selection = (self.slash_command_selection + 1) % matches.len();
             }
             _ => {}
         }
@@ -384,6 +387,8 @@ impl App {
         match command.kind {
             SlashCommandKind::New => self.run_new_session(),
             SlashCommandKind::Clear => self.run_clear_context(),
+            SlashCommandKind::Archive => self.run_archive_session(),
+            SlashCommandKind::Delete => self.run_delete_session(),
             SlashCommandKind::Status => self.open_status_view(),
             SlashCommandKind::Compact => self.run_compact(),
             SlashCommandKind::Model => self.open_model_picker(),
@@ -827,6 +832,32 @@ impl App {
             }
             Err(error) => {
                 self.run_notice = Some(format!("Failed to clear context: {error:#}"));
+            }
+        }
+    }
+
+    fn run_archive_session(&mut self) {
+        let _command = self.input.take_trimmed();
+        match self.runtime.archive_current_session() {
+            Ok(loaded) => {
+                self.apply_loaded_transcript(loaded);
+                self.run_notice = Some("Archived conversation.".to_owned());
+            }
+            Err(error) => {
+                self.run_notice = Some(format!("Failed to archive conversation: {error:#}"));
+            }
+        }
+    }
+
+    fn run_delete_session(&mut self) {
+        let _command = self.input.take_trimmed();
+        match self.runtime.delete_current_session() {
+            Ok(loaded) => {
+                self.apply_loaded_transcript(loaded);
+                self.run_notice = Some("Deleted conversation.".to_owned());
+            }
+            Err(error) => {
+                self.run_notice = Some(format!("Failed to delete conversation: {error:#}"));
             }
         }
     }
@@ -1285,6 +1316,8 @@ mod tests {
 
         assert!(names.contains(&"/new"));
         assert!(names.contains(&"/clear"));
+        assert!(names.contains(&"/archive"));
+        assert!(names.contains(&"/delete"));
         assert!(names.contains(&"/status"));
         assert!(names.contains(&"/compact"));
         assert!(names.contains(&"/terminal"));
@@ -1373,6 +1406,35 @@ mod tests {
     }
 
     #[test]
+    fn delete_command_deletes_current_session_and_starts_empty_session() {
+        let mut app = app();
+        app.runtime
+            .transcript_mut()
+            .append_user("old user".to_owned())
+            .unwrap();
+        app.messages = app.runtime.ui_messages();
+        app.usage = ConversationUsage::default().record(TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 25,
+            total_tokens: 125,
+            cached_prompt_tokens: None,
+        });
+        app.input.set("/delete");
+
+        let command = SLASH_COMMANDS
+            .iter()
+            .find(|command| command.name == "/delete")
+            .copied()
+            .unwrap();
+        app.run_slash_command(command);
+
+        assert!(app.messages.is_empty());
+        assert!(app.runtime.model_history().is_empty());
+        assert_eq!(app.usage, ConversationUsage::default());
+        assert_eq!(app.run_notice.as_deref(), Some("Deleted conversation."));
+    }
+
+    #[test]
     fn status_command_opens_status_view() {
         let mut app = app();
         app.input.set("/status");
@@ -1417,6 +1479,18 @@ mod tests {
         app.update_status_view_key(KeyAction::Escape);
         assert!(app.status_view.is_none());
         assert_eq!(app.input.value, "");
+    }
+
+    #[test]
+    fn slash_menu_navigation_wraps_at_edges() {
+        let mut app = app();
+        app.input.set("/");
+
+        app.update_slash_menu_key(KeyAction::Up);
+        assert_eq!(app.slash_command_selection, SLASH_COMMANDS.len() - 1);
+
+        app.update_slash_menu_key(KeyAction::Down);
+        assert_eq!(app.slash_command_selection, 0);
     }
 
     #[test]

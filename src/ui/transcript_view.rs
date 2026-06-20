@@ -68,7 +68,7 @@ pub(super) fn notice_line(message: &str) -> Line<'static> {
 pub(super) fn turn_duration_line(duration: std::time::Duration) -> Line<'static> {
     Line::from(vec![
         Span::raw("  "),
-        Span::styled("Worked ", Style::default().fg(MUTED_TEXT_COLOR)),
+        Span::styled("Worked for ", Style::default().fg(MUTED_TEXT_COLOR)),
         Span::styled(
             duration_label(duration.as_secs()),
             Style::default().fg(TEXT_COLOR).add_modifier(Modifier::BOLD),

@@ -17,14 +17,6 @@ pub(super) fn model_picker_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
         ModelPickerStage::Provider => "Select Provider",
         ModelPickerStage::Model => "Select Model",
     };
-    let help = match picker.stage {
-        ModelPickerStage::Provider => {
-            "Choose a provider endpoint. Enter continues to model selection; Backspace cancels."
-        }
-        ModelPickerStage::Model => {
-            "Choose a model for the selected provider. Enter switches; Backspace returns."
-        }
-    };
     let mut lines = vec![
         Line::from(Span::styled(
             title,
@@ -32,7 +24,7 @@ pub(super) fn model_picker_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
                 .fg(ACCENT_COLOR)
                 .add_modifier(Modifier::BOLD),
         )),
-        Line::from(Span::styled(help, Style::default().fg(MUTED_TEXT_COLOR))),
+        model_picker_help_line(picker.stage),
     ];
 
     match picker.stage {
@@ -112,6 +104,34 @@ pub(super) fn model_picker_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+fn model_picker_help_line(stage: ModelPickerStage) -> Line<'static> {
+    match stage {
+        ModelPickerStage::Provider => Line::from(vec![
+            Span::styled(
+                "Choose a provider endpoint. ",
+                Style::default().fg(MUTED_TEXT_COLOR),
+            ),
+            Span::styled("Enter", Style::default().fg(KEY_HINT_COLOR)),
+            Span::styled(
+                " continues to model selection; ",
+                Style::default().fg(MUTED_TEXT_COLOR),
+            ),
+            Span::styled("Backspace", Style::default().fg(KEY_HINT_COLOR)),
+            Span::styled(" cancels.", Style::default().fg(MUTED_TEXT_COLOR)),
+        ]),
+        ModelPickerStage::Model => Line::from(vec![
+            Span::styled(
+                "Choose a model for the selected provider. ",
+                Style::default().fg(MUTED_TEXT_COLOR),
+            ),
+            Span::styled("Enter", Style::default().fg(KEY_HINT_COLOR)),
+            Span::styled(" switches; ", Style::default().fg(MUTED_TEXT_COLOR)),
+            Span::styled("Backspace", Style::default().fg(KEY_HINT_COLOR)),
+            Span::styled(" returns.", Style::default().fg(MUTED_TEXT_COLOR)),
+        ]),
+    }
 }
 
 fn provider_summary(app: &App, provider: &crate::config::LlmProviderConfig) -> String {

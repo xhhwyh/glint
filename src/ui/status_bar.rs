@@ -105,7 +105,8 @@ pub(super) fn permission_line(app: &App) -> Option<Line<'static>> {
                 Style::default().fg(TEXT_COLOR).add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled("[CTRL+K] cancel", Style::default().fg(MUTED_TEXT_COLOR)),
+            Span::styled("[CTRL+K]", Style::default().fg(KEY_HINT_COLOR)),
+            Span::styled(" cancel", Style::default().fg(MUTED_TEXT_COLOR)),
         ]))
     } else {
         None

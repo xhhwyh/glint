@@ -137,6 +137,7 @@ pub struct SessionRuntime {
 
 impl SessionRuntime {
     pub fn create_new(cwd: String, lsp_config: LspConfig) -> Result<Self> {
+        TranscriptStore::prune_archive_older_than_in_background(30);
         let transcript = TranscriptStore::create_new(&cwd)?;
         Ok(Self::from_transcript(transcript, cwd, lsp_config))
     }
@@ -212,19 +213,36 @@ impl SessionRuntime {
         let transcript = self.transcript.create_new_sibling()?;
         self.transcript = transcript;
         self.reset_session_state();
-        Ok(LoadedTranscript {
+        Ok(self.loaded_transcript())
+    }
+
+    pub fn archive_current_session(&mut self) -> Result<LoadedTranscript> {
+        let transcript = self.transcript.create_new_sibling()?;
+        self.transcript.archive_current()?;
+        self.transcript = transcript;
+        self.reset_session_state();
+        Ok(self.loaded_transcript())
+    }
+
+    pub fn delete_current_session(&mut self) -> Result<LoadedTranscript> {
+        let transcript = self.transcript.create_new_sibling()?;
+        self.transcript.delete_current()?;
+        self.transcript = transcript;
+        self.reset_session_state();
+        Ok(self.loaded_transcript())
+    }
+
+    fn loaded_transcript(&self) -> LoadedTranscript {
+        LoadedTranscript {
             messages: self.transcript.ui_messages(),
             usage: usage_from_transcript(&self.transcript),
-        })
+        }
     }
 
     pub fn clear_context(&mut self) -> Result<LoadedTranscript> {
         self.transcript.append_clear_boundary()?;
         self.reset_session_state();
-        Ok(LoadedTranscript {
-            messages: self.transcript.ui_messages(),
-            usage: usage_from_transcript(&self.transcript),
-        })
+        Ok(self.loaded_transcript())
     }
 
     pub fn try_recv_agent_event(&self) -> Option<AgentEvent> {

@@ -4,7 +4,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -23,6 +23,7 @@ use crate::{
 const SCHEMA: u16 = 3;
 const COMPACT_UI_MESSAGE: &str = "Compacted conversation";
 const CLEAR_UI_MESSAGE: &str = "Cleared conversation context";
+const SECONDS_PER_DAY: u64 = 86_400;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TranscriptEntry {
@@ -232,16 +233,38 @@ impl TranscriptStore {
     }
 
     pub fn tool_results_dir(&self) -> PathBuf {
-        let session_id = self
-            .path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("session");
-        self.path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(session_id)
-            .join("tool-results")
+        self.session_dir().join("tool-results")
+    }
+
+    pub fn archive_current(&self) -> Result<()> {
+        self.archive_current_in_dir(archive_dir()?)
+    }
+
+    pub fn delete_current(&self) -> Result<()> {
+        if self.path.exists() {
+            fs::remove_file(&self.path).context("failed to delete transcript")?;
+        }
+        let session_dir = self.session_dir();
+        if session_dir.exists() {
+            fs::remove_dir_all(&session_dir).context("failed to delete transcript artifacts")?;
+        }
+        Ok(())
+    }
+
+    pub fn prune_archive_older_than(days: u64) -> Result<()> {
+        let archive_dir = archive_dir()?;
+        let cutoff = SystemTime::now()
+            .checked_sub(Duration::from_secs(days.saturating_mul(SECONDS_PER_DAY)))
+            .unwrap_or(UNIX_EPOCH);
+        prune_archive_entries_before(&archive_dir, cutoff)
+    }
+
+    pub fn prune_archive_older_than_in_background(days: u64) {
+        let _ = std::thread::Builder::new()
+            .name("glint-archive-prune".to_owned())
+            .spawn(move || {
+                let _ = Self::prune_archive_older_than(days);
+            });
     }
 
     pub fn sessions(cwd: &str) -> Result<Vec<TranscriptSessionSummary>> {
@@ -684,6 +707,42 @@ impl TranscriptStore {
         Ok(())
     }
 
+    fn archive_current_in_dir(&self, archive_dir: PathBuf) -> Result<()> {
+        let session_dir = self.session_dir();
+        if !self.path.exists() && !session_dir.exists() {
+            return Ok(());
+        }
+
+        fs::create_dir_all(&archive_dir).context("failed to create archive directory")?;
+        let archive_stem = unique_archive_stem(&archive_dir, &self.session_stem());
+        let archive_path = archive_dir.join(format!("{archive_stem}.jsonl"));
+        let archive_session_dir = archive_dir.join(archive_stem);
+
+        if self.path.exists() {
+            fs::rename(&self.path, archive_path).context("failed to archive transcript")?;
+        }
+        if session_dir.exists() {
+            fs::rename(session_dir, archive_session_dir)
+                .context("failed to archive transcript artifacts")?;
+        }
+        Ok(())
+    }
+
+    fn session_dir(&self) -> PathBuf {
+        self.path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(self.session_stem())
+    }
+
+    fn session_stem(&self) -> String {
+        self.path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("session")
+            .to_owned()
+    }
+
     fn empty(path: PathBuf) -> Self {
         Self {
             path,
@@ -904,6 +963,51 @@ fn append_json(path: &PathBuf, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+fn unique_archive_stem(archive_dir: &Path, preferred: &str) -> String {
+    let mut suffix = 0;
+    loop {
+        let candidate = if suffix == 0 {
+            preferred.to_owned()
+        } else {
+            format!("{preferred}-{}-{suffix}", now())
+        };
+        let transcript_path = archive_dir.join(format!("{candidate}.jsonl"));
+        let session_dir = archive_dir.join(&candidate);
+        if !transcript_path.exists() && !session_dir.exists() {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+fn prune_archive_entries_before(archive_dir: &Path, cutoff: SystemTime) -> Result<()> {
+    if !archive_dir.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(archive_dir).context("failed to read archive directory")? {
+        let path = entry.context("failed to read archive entry")?.path();
+        let metadata = fs::metadata(&path).context("failed to read archive metadata")?;
+        let modified = metadata
+            .modified()
+            .context("failed to read archive modification time")?;
+        if modified >= cutoff {
+            continue;
+        }
+        if metadata.is_dir() {
+            fs::remove_dir_all(&path).context("failed to delete archived session directory")?;
+        } else {
+            fs::remove_file(&path).context("failed to delete archived session")?;
+        }
+    }
+    Ok(())
+}
+
+fn archive_dir() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".glint").join("archive"))
+}
+
 fn transcript_project_dir(cwd: &str) -> Result<PathBuf> {
     let home = std::env::var_os("HOME").context("HOME is not set")?;
     Ok(PathBuf::from(home)
@@ -1091,6 +1195,88 @@ mod tests {
         assert!(messages[1].tool_finished);
 
         fs::remove_dir_all(project_dir).ok();
+    }
+
+    #[test]
+    fn archive_current_moves_transcript_and_artifacts() {
+        let project_dir =
+            std::env::temp_dir().join(format!("glint-archive-session-test-{}", new_id()));
+        let archive_dir =
+            std::env::temp_dir().join(format!("glint-archive-target-test-{}", new_id()));
+        let mut transcript =
+            TranscriptStore::create_new_in_project_dir(project_dir.clone()).unwrap();
+        transcript.append_user("archive me".to_owned()).unwrap();
+        let original_path = transcript.path.clone();
+        let original_session_dir = transcript.session_dir();
+        let archived_stem = transcript.session_stem();
+        let artifact_path = original_session_dir
+            .join("tool-results")
+            .join("large-output.txt");
+        fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        fs::write(&artifact_path, "large output").unwrap();
+
+        transcript
+            .archive_current_in_dir(archive_dir.clone())
+            .unwrap();
+
+        assert!(!original_path.exists());
+        assert!(!original_session_dir.exists());
+        assert!(archive_dir.join(format!("{archived_stem}.jsonl")).exists());
+        assert!(
+            archive_dir
+                .join(archived_stem)
+                .join("tool-results")
+                .join("large-output.txt")
+                .exists()
+        );
+
+        fs::remove_dir_all(project_dir).ok();
+        fs::remove_dir_all(archive_dir).ok();
+    }
+
+    #[test]
+    fn delete_current_removes_transcript_and_artifacts() {
+        let project_dir =
+            std::env::temp_dir().join(format!("glint-delete-session-test-{}", new_id()));
+        let mut transcript =
+            TranscriptStore::create_new_in_project_dir(project_dir.clone()).unwrap();
+        transcript.append_user("delete me".to_owned()).unwrap();
+        let original_path = transcript.path.clone();
+        let original_session_dir = transcript.session_dir();
+        let artifact_path = original_session_dir
+            .join("tool-results")
+            .join("large-output.txt");
+        fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
+        fs::write(&artifact_path, "large output").unwrap();
+
+        transcript.delete_current().unwrap();
+
+        assert!(!original_path.exists());
+        assert!(!original_session_dir.exists());
+
+        fs::remove_dir_all(project_dir).ok();
+    }
+
+    #[test]
+    fn prune_archive_entries_before_removes_old_entries() {
+        let archive_dir =
+            std::env::temp_dir().join(format!("glint-prune-archive-test-{}", new_id()));
+        let archived_file = archive_dir.join("old-session.jsonl");
+        let archived_dir = archive_dir.join("old-session");
+        fs::create_dir_all(&archived_dir).unwrap();
+        fs::write(&archived_file, "{}\n").unwrap();
+        fs::write(archived_dir.join("artifact.txt"), "artifact").unwrap();
+
+        prune_archive_entries_before(&archive_dir, UNIX_EPOCH).unwrap();
+        assert!(archived_file.exists());
+        assert!(archived_dir.exists());
+
+        prune_archive_entries_before(&archive_dir, SystemTime::now() + Duration::from_secs(1))
+            .unwrap();
+        assert!(!archived_file.exists());
+        assert!(!archived_dir.exists());
+
+        fs::remove_dir_all(archive_dir).ok();
     }
 
     #[test]

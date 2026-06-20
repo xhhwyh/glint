@@ -140,7 +140,7 @@ fn quick_actions_box(width: usize) -> Vec<Vec<Span<'static>>> {
                 Span::styled(
                     "↵",
                     Style::default()
-                        .fg(ACCENT_COLOR)
+                        .fg(KEY_HINT_COLOR)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(" send", Style::default().fg(SOFT_TEXT_COLOR)),
@@ -152,7 +152,7 @@ fn quick_actions_box(width: usize) -> Vec<Vec<Span<'static>>> {
                 Span::styled(
                     "⇧↵",
                     Style::default()
-                        .fg(ACCENT_COLOR)
+                        .fg(KEY_HINT_COLOR)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(" newline", Style::default().fg(SOFT_TEXT_COLOR)),
@@ -164,7 +164,7 @@ fn quick_actions_box(width: usize) -> Vec<Vec<Span<'static>>> {
                 Span::styled(
                     "^C",
                     Style::default()
-                        .fg(ACCENT_COLOR)
+                        .fg(KEY_HINT_COLOR)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(" quit", Style::default().fg(SOFT_TEXT_COLOR)),
@@ -176,7 +176,7 @@ fn quick_actions_box(width: usize) -> Vec<Vec<Span<'static>>> {
                 Span::styled(
                     "wheel",
                     Style::default()
-                        .fg(ACCENT_COLOR)
+                        .fg(KEY_HINT_COLOR)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(" scroll", Style::default().fg(SOFT_TEXT_COLOR)),

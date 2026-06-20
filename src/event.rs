@@ -62,7 +62,7 @@ impl From<KeyEvent> for KeyInput {
                 KeyAction::CloseTerminalTab
             }
             KeyCode::Char(char)
-                if key.modifiers.contains(KeyModifiers::ALT) && char.is_ascii_digit() =>
+                if key.modifiers.contains(KeyModifiers::ALT) && matches!(char, '1'..='9') =>
             {
                 KeyAction::SelectTerminalTab(terminal_tab_index(char))
             }
@@ -87,11 +87,7 @@ impl From<KeyEvent> for KeyInput {
 }
 
 fn terminal_tab_index(char: char) -> usize {
-    if char == '0' {
-        9
-    } else {
-        char.to_digit(10).unwrap_or(1).saturating_sub(1) as usize
-    }
+    char.to_digit(10).unwrap_or(1).saturating_sub(1) as usize
 }
 
 fn terminal_input_bytes(key: KeyEvent) -> Option<Vec<u8>> {
@@ -180,9 +176,14 @@ mod tests {
     #[test]
     fn alt_number_selects_terminal_tab_index() {
         let input = KeyInput::from(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT));
-        let tenth = KeyInput::from(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT));
 
         assert_eq!(input.action, KeyAction::SelectTerminalTab(2));
-        assert_eq!(tenth.action, KeyAction::SelectTerminalTab(9));
+    }
+
+    #[test]
+    fn alt_zero_does_not_select_terminal_tab() {
+        let input = KeyInput::from(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT));
+
+        assert_eq!(input.action, KeyAction::Char('0'));
     }
 }

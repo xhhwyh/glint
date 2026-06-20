@@ -5,7 +5,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::Paragraph,
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     app::App,
@@ -220,17 +220,73 @@ pub(super) fn terminal_footer(width: u16) -> Line<'static> {
         return box_bottom(width as u16);
     }
 
-    let hint = " Ctrl+T focus | Alt+N new tab | Alt+1-9/0 switch tab | Alt+D close tab ";
-    let hint = truncate_end_to_width(hint, content_width.saturating_sub(1));
-    let right = content_width.saturating_sub(1 + hint.width());
+    let hint_spans = terminal_footer_hint_spans(content_width.saturating_sub(1));
+    let hint_width = spans_width(&hint_spans);
+    let right = content_width.saturating_sub(1 + hint_width);
 
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled("╰", Style::default().fg(BORDER_COLOR)),
         Span::styled("─", Style::default().fg(BORDER_COLOR)),
-        Span::styled(hint, Style::default().fg(MUTED_TEXT_COLOR)),
+    ];
+    spans.extend(hint_spans);
+    spans.extend([
         Span::styled("─".repeat(right), Style::default().fg(BORDER_COLOR)),
         Span::styled("╯", Style::default().fg(BORDER_COLOR)),
-    ])
+    ]);
+    Line::from(spans)
+}
+
+fn terminal_footer_hint_spans(max_width: usize) -> Vec<Span<'static>> {
+    let chunks = [
+        (" ", false),
+        ("Ctrl+T", true),
+        (" switch cursor | ", false),
+        ("Alt+N", true),
+        (" new tab | ", false),
+        ("Alt+1-9", true),
+        (" switch tab | ", false),
+        ("Alt+D", true),
+        (" close tab ", false),
+    ];
+
+    let mut spans = Vec::new();
+    let mut remaining = max_width;
+    for (text, is_key) in chunks {
+        if remaining == 0 {
+            break;
+        }
+
+        let text = truncate_text_to_width(text, remaining);
+        if text.is_empty() {
+            break;
+        }
+        remaining = remaining.saturating_sub(text.width());
+        let color = if is_key {
+            KEY_HINT_COLOR
+        } else {
+            MUTED_TEXT_COLOR
+        };
+        spans.push(Span::styled(text, Style::default().fg(color)));
+    }
+    spans
+}
+
+fn truncate_text_to_width(text: &str, max_width: usize) -> String {
+    let mut truncated = String::new();
+    let mut width = 0;
+    for character in text.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if width + character_width > max_width {
+            break;
+        }
+        truncated.push(character);
+        width += character_width;
+    }
+    truncated
+}
+
+fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|span| span.content.as_ref().width()).sum()
 }
 
 fn terminal_spans(line: &TerminalStyledLine) -> Vec<Span<'static>> {

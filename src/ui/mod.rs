@@ -71,8 +71,14 @@ fn render_document(frame: &mut Frame, app: &App, area: Rect) {
     );
     frame.set_cursor_position(Position::new(
         area.x + document.cursor_x.min(width.saturating_sub(1)),
-        area.y + document.cursor_y,
+        area.y + visible_cursor_y(document.cursor_y, scroll, area.height),
     ));
+}
+
+fn visible_cursor_y(cursor_y: u16, scroll: u16, height: u16) -> u16 {
+    cursor_y
+        .saturating_sub(scroll)
+        .min(height.saturating_sub(1))
 }
 
 fn document(app: &App, width: u16) -> Document {
@@ -101,15 +107,21 @@ fn document(app: &App, width: u16) -> Document {
         lines.push(Line::from(""));
     }
 
+    let mut needs_status_gap = false;
     if let Some(elapsed) = app.processing_elapsed() {
         lines.push(transcript_view::processing_line(elapsed));
+        needs_status_gap = true;
     } else {
         if let Some(notice) = app.run_notice.as_deref() {
             lines.push(transcript_view::notice_line(notice));
         }
         if let Some(duration) = app.last_turn_duration() {
             lines.push(transcript_view::turn_duration_line(duration));
+            needs_status_gap = true;
         }
+    }
+    if needs_status_gap {
+        lines.push(Line::from(""));
     }
 
     let input_y = lines.len() as u16;
@@ -147,7 +159,8 @@ mod tests {
     use super::format::{cached_suffix, context_bar_percent, context_usage_label};
     use super::layout::truncate_start_to_width;
     use super::model_picker::price_label;
-    use super::terminal::terminal_tab_window_start;
+    use super::terminal::{terminal_footer, terminal_tab_window_start};
+    use super::theme::KEY_HINT_COLOR;
     use super::transcript_view::tool_output_preview;
     use super::*;
 
@@ -202,5 +215,33 @@ mod tests {
     fn terminal_tab_window_tracks_active_tab() {
         assert_eq!(terminal_tab_window_start(0, 3, 6), 0);
         assert_eq!(terminal_tab_window_start(6, 10, 4), 4);
+    }
+
+    #[test]
+    fn terminal_footer_uses_shared_key_hint_color() {
+        let footer = terminal_footer(120);
+        let text = footer
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("Ctrl+T switch cursor"));
+        for key in ["Ctrl+T", "Alt+N", "Alt+1-9", "Alt+D"] {
+            let span = footer
+                .spans
+                .iter()
+                .find(|span| span.content.as_ref() == key)
+                .expect("key span");
+            assert_eq!(span.style.fg, Some(KEY_HINT_COLOR));
+        }
+    }
+
+    #[test]
+    fn cursor_y_tracks_document_scroll() {
+        assert_eq!(visible_cursor_y(10, 0, 20), 10);
+        assert_eq!(visible_cursor_y(10, 1, 20), 9);
+        assert_eq!(visible_cursor_y(2, 5, 20), 0);
+        assert_eq!(visible_cursor_y(30, 1, 12), 11);
     }
 }

@@ -61,11 +61,11 @@ pub(super) fn render_status_view(frame: &mut Frame, app: &App, view: &StatusView
         Style::default().fg(MUTED_TEXT_COLOR),
     )));
     lines.push(Line::from(vec![
-        Span::styled("←/→", Style::default().fg(ACCENT_COLOR)),
+        Span::styled("←/→", Style::default().fg(KEY_HINT_COLOR)),
         Span::styled(" tab  ", Style::default().fg(MUTED_TEXT_COLOR)),
-        Span::styled("Tab", Style::default().fg(ACCENT_COLOR)),
+        Span::styled("Tab", Style::default().fg(KEY_HINT_COLOR)),
         Span::styled(" next  ", Style::default().fg(MUTED_TEXT_COLOR)),
-        Span::styled("Esc", Style::default().fg(ACCENT_COLOR)),
+        Span::styled("Esc", Style::default().fg(KEY_HINT_COLOR)),
         Span::styled(" exit", Style::default().fg(MUTED_TEXT_COLOR)),
     ]));
 

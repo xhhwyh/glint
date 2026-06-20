@@ -75,11 +75,11 @@ pub(super) fn render_resume_picker(frame: &mut Frame, picker: &ResumePicker) {
         Style::default().fg(MUTED_TEXT_COLOR),
     )));
     lines.push(Line::from(vec![
-        Span::styled("Enter", Style::default().fg(ACCENT_COLOR)),
+        Span::styled("Enter", Style::default().fg(KEY_HINT_COLOR)),
         Span::styled(" select  ", Style::default().fg(MUTED_TEXT_COLOR)),
-        Span::styled("↑/↓ ←/→", Style::default().fg(ACCENT_COLOR)),
+        Span::styled("↑/↓ ←/→", Style::default().fg(KEY_HINT_COLOR)),
         Span::styled(" switch  ", Style::default().fg(MUTED_TEXT_COLOR)),
-        Span::styled("Esc", Style::default().fg(ACCENT_COLOR)),
+        Span::styled("Esc", Style::default().fg(KEY_HINT_COLOR)),
         Span::styled(" exit", Style::default().fg(MUTED_TEXT_COLOR)),
     ]));
 
