@@ -11,7 +11,7 @@ use crate::app::{App, StatusTab, StatusView};
 
 use super::{
     format::{cached_suffix, context_usage_label, now, parse_price_number, unit_suffix},
-    layout::{pad_to_width, truncate_end_to_width},
+    layout::{pad_to_width, truncate_end_to_width, wrap_text},
     terminal::terminal_status_label,
     theme::*,
 };
@@ -279,16 +279,43 @@ fn status_stat_lines(view: &StatusView, width: usize, available_rows: usize) -> 
             Style::default().fg(MUTED_TEXT_COLOR),
         )));
     } else {
-        let remaining = available_rows.saturating_sub(lines.len()).max(1);
-        for model in stats.model_tokens.iter().take(remaining.min(6)) {
-            lines.push(status_kv_line(
-                &model.model,
-                &format!("{} tokens", format_number(model.tokens)),
-                width,
-            ));
+        let mut remaining = available_rows.saturating_sub(lines.len()).max(1);
+        let mut displayed = false;
+        for model in stats.model_tokens.iter().take(6) {
+            let model_lines = top_model_lines(model, width);
+            if displayed && model_lines.len() > remaining {
+                break;
+            }
+            remaining = remaining.saturating_sub(model_lines.len());
+            displayed = true;
+            lines.extend(model_lines);
+            if remaining == 0 {
+                break;
+            }
         }
     }
 
+    lines
+}
+
+fn top_model_lines(model: &crate::transcript::ModelTokenTotal, width: usize) -> Vec<Line<'static>> {
+    let content_width = width.saturating_sub(2).max(1) as u16;
+    let mut lines = wrap_text(&model.model, content_width)
+        .into_iter()
+        .map(|row| {
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(row, Style::default().fg(TEXT_COLOR)),
+            ])
+        })
+        .collect::<Vec<_>>();
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("{} tokens", format_number(model.tokens)),
+            Style::default().fg(MUTED_TEXT_COLOR),
+        ),
+    ]));
     lines
 }
 
@@ -399,28 +426,16 @@ fn usage_calendar_lines(
         .unwrap_or(0);
     let today = (now() / 86_400) as i64;
     let end_week = today - weekday_index(today) as i64;
-    let max_weeks = width.saturating_sub(5).checked_div(3).unwrap_or(1).max(1);
+    let max_weeks = width
+        .saturating_sub(CALENDAR_LABEL_WIDTH)
+        .checked_div(CALENDAR_CELL_WIDTH)
+        .unwrap_or(1)
+        .max(1);
     let weeks = max_weeks.min(52);
     let start_week = end_week - (weeks.saturating_sub(1) * 7) as i64;
 
     let mut lines = Vec::new();
-    let mut month_spans = vec![Span::raw("     ")];
-    let mut previous_month = None;
-    for week in 0..weeks {
-        let day = start_week + (week * 7) as i64;
-        let (_, month, _) = civil_from_days(day);
-        let label = if previous_month != Some(month) {
-            month_abbrev(month)
-        } else {
-            ""
-        };
-        previous_month = Some(month);
-        month_spans.push(Span::styled(
-            pad_to_width(label, 3),
-            Style::default().fg(MUTED_TEXT_COLOR),
-        ));
-    }
-    lines.push(Line::from(month_spans));
+    lines.push(calendar_month_line(start_week, weeks, today));
 
     for row in 0..7 {
         let mut spans = vec![Span::styled(
@@ -430,12 +445,12 @@ fn usage_calendar_lines(
         for week in 0..weeks {
             let day = start_week + (week * 7 + row) as i64;
             if day > today {
-                spans.push(Span::raw("   "));
+                spans.push(Span::raw(" ".repeat(CALENDAR_CELL_WIDTH)));
                 continue;
             }
             let tokens = day_tokens.get(&day).copied().unwrap_or(0);
             spans.push(Span::styled(
-                "██ ",
+                CALENDAR_CELL,
                 Style::default().fg(calendar_color(tokens, max_tokens)),
             ));
         }
@@ -444,6 +459,45 @@ fn usage_calendar_lines(
     lines.push(calendar_legend_line());
 
     lines
+}
+
+fn calendar_month_line(start_week: i64, weeks: usize, today: i64) -> Line<'static> {
+    let width = CALENDAR_LABEL_WIDTH
+        + weeks.saturating_mul(CALENDAR_CELL_WIDTH)
+        + CALENDAR_MONTH_LABEL_WIDTH.saturating_sub(CALENDAR_CELL_WIDTH);
+    let mut chars = vec![' '; width];
+
+    for week in 0..weeks {
+        let week_start = start_week + (week * 7) as i64;
+        let Some(label) = month_label_for_week(week_start, today) else {
+            continue;
+        };
+        let start = CALENDAR_LABEL_WIDTH + week * CALENDAR_CELL_WIDTH;
+        for (offset, char) in label.chars().enumerate() {
+            if let Some(slot) = chars.get_mut(start + offset) {
+                *slot = char;
+            }
+        }
+    }
+
+    Line::from(Span::styled(
+        chars.into_iter().collect::<String>(),
+        Style::default().fg(MUTED_TEXT_COLOR),
+    ))
+}
+
+fn month_label_for_week(week_start: i64, today: i64) -> Option<&'static str> {
+    for offset in 0..7 {
+        let day = week_start + offset;
+        if day > today {
+            break;
+        }
+        let (_, month, day_of_month) = civil_from_days(day);
+        if day_of_month == 1 {
+            return Some(month_abbrev(month));
+        }
+    }
+    None
 }
 
 fn calendar_color(tokens: u64, max_tokens: u64) -> Color {
@@ -462,16 +516,20 @@ fn calendar_legend_line() -> Line<'static> {
     let mut spans = vec![
         Span::raw("     "),
         Span::styled("Less ", Style::default().fg(MUTED_TEXT_COLOR)),
-        Span::styled("██ ", Style::default().fg(CALENDAR_EMPTY_COLOR)),
+        Span::styled("■ ", Style::default().fg(CALENDAR_EMPTY_COLOR)),
     ];
     for color in CALENDAR_LEVEL_COLORS {
-        spans.push(Span::styled("██ ", Style::default().fg(color)));
+        spans.push(Span::styled("■ ", Style::default().fg(color)));
     }
     spans.push(Span::styled("More", Style::default().fg(MUTED_TEXT_COLOR)));
     Line::from(spans)
 }
 
-const CALENDAR_EMPTY_COLOR: Color = Color::Rgb(219, 234, 254);
+const CALENDAR_EMPTY_COLOR: Color = Color::Rgb(203, 213, 225);
+const CALENDAR_LABEL_WIDTH: usize = 5;
+const CALENDAR_CELL_WIDTH: usize = 2;
+const CALENDAR_CELL: &str = "■ ";
+const CALENDAR_MONTH_LABEL_WIDTH: usize = 3;
 const CALENDAR_LEVEL_COLORS: [Color; 4] = [
     Color::Rgb(191, 219, 254),
     Color::Rgb(147, 197, 253),
@@ -540,4 +598,87 @@ fn format_number(value: u64) -> String {
     }
     chars.clear();
     formatted.chars().rev().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::transcript::{DailyTokenTotal, ModelTokenTotal, WorkspaceUsageStats};
+
+    use super::*;
+
+    #[test]
+    fn usage_calendar_uses_compact_square_cells() {
+        let stats = WorkspaceUsageStats {
+            daily_tokens: vec![DailyTokenTotal {
+                day: (now() / 86_400) as i64,
+                tokens: 100,
+            }],
+            ..WorkspaceUsageStats::default()
+        };
+
+        let rendered = usage_calendar_lines(&stats, 80)
+            .into_iter()
+            .flat_map(|line| line.spans.into_iter())
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+
+        assert!(rendered.contains("■"));
+        assert!(!rendered.contains("██"));
+    }
+
+    #[test]
+    fn calendar_month_labels_use_three_letter_names() {
+        assert_eq!(month_abbrev(6), "Jun");
+        assert_eq!(month_abbrev(7), "Jul");
+    }
+
+    #[test]
+    fn calendar_month_label_skips_partial_leading_month() {
+        let week_start = (0..40_000)
+            .find(|day| {
+                weekday_index(*day) == 0
+                    && (0..7).all(|offset| civil_from_days(*day + offset).2 != 1)
+            })
+            .expect("week without month start");
+
+        assert_eq!(month_label_for_week(week_start, week_start + 6), None);
+    }
+
+    #[test]
+    fn calendar_month_label_shows_visible_month_start() {
+        let first_of_month = (0..40_000)
+            .find(|day| civil_from_days(*day).2 == 1)
+            .expect("first of month");
+        let (_, month, _) = civil_from_days(first_of_month);
+        let week_start = first_of_month - weekday_index(first_of_month) as i64;
+
+        assert_eq!(
+            month_label_for_week(week_start, week_start + 6),
+            Some(month_abbrev(month))
+        );
+    }
+
+    #[test]
+    fn top_model_lines_wrap_without_truncating_model_name() {
+        let model = ModelTokenTotal {
+            model: "provider/super-long-model-name-with-a-lot-of-context".to_owned(),
+            tokens: 12_345,
+        };
+
+        let lines = top_model_lines(&model, 20);
+        let rendered_model = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| span.style.fg == Some(TEXT_COLOR))
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let rendered = lines
+            .into_iter()
+            .flat_map(|line| line.spans.into_iter())
+            .map(|span| span.content.into_owned())
+            .collect::<String>();
+
+        assert_eq!(rendered_model, model.model);
+        assert!(rendered.contains("12,345 tokens"));
+    }
 }
