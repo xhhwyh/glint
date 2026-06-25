@@ -15,9 +15,18 @@ pub struct RuntimeContext {
 }
 
 impl RuntimeContext {
+    #[cfg(test)]
     pub fn current(current_dir: impl Into<String>, shell_tool_mode: ShellToolMode) -> Self {
+        Self::with_time(current_time_label(), current_dir, shell_tool_mode)
+    }
+
+    pub fn with_time(
+        current_time: impl Into<String>,
+        current_dir: impl Into<String>,
+        shell_tool_mode: ShellToolMode,
+    ) -> Self {
         Self {
-            current_time: current_time_label(),
+            current_time: current_time.into(),
             current_dir: current_dir.into(),
             shell: std::env::var("SHELL").unwrap_or_else(|_| "unknown".to_owned()),
             app_name: env!("CARGO_PKG_NAME").to_owned(),
@@ -62,14 +71,11 @@ pub fn build_initial_messages(
     ];
 
     messages.extend(conversation.iter().cloned());
-    messages.push(ModelMessage::user(format!(
-        "<current_user_request>\n{}\n</current_user_request>",
-        current_user_message
-    )));
+    messages.push(ModelMessage::user(current_user_message.to_owned()));
     messages
 }
 
-fn current_time_label() -> String {
+pub fn current_time_label() -> String {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => format!("unix_seconds={}", duration.as_secs()),
         Err(_) => "unavailable".to_owned(),
@@ -93,7 +99,7 @@ mod tests {
     }
 
     #[test]
-    fn places_system_prompt_first_and_runtime_context_second() {
+    fn places_system_prompt_then_runtime_context_before_history() {
         let messages = build_initial_messages("system", &runtime_context(), &[], "hello");
 
         assert_eq!(messages[0].role, ModelRole::System);
@@ -106,6 +112,8 @@ mod tests {
                 .is_some_and(|content| content.contains("<system-reminder>")
                     && content.contains("<runtime_context>"))
         );
+        assert_eq!(messages[2].role, ModelRole::User);
+        assert_eq!(messages[2].content.as_deref(), Some("hello"));
     }
 
     #[test]
@@ -148,10 +156,7 @@ mod tests {
         assert_eq!(messages[4].role, ModelRole::Assistant);
         assert_eq!(messages[4].content.as_deref(), Some("first assistant"));
         assert_eq!(messages[5].role, ModelRole::User);
-        assert_eq!(
-            messages[5].content.as_deref(),
-            Some("<current_user_request>\nsecond user\n</current_user_request>")
-        );
+        assert_eq!(messages[5].content.as_deref(), Some("second user"));
         assert_eq!(
             messages
                 .iter()

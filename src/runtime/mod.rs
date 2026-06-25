@@ -129,6 +129,7 @@ pub struct SessionRuntime {
     terminal_request_tx: Sender<TerminalRequest>,
     terminal_requests: Receiver<TerminalRequest>,
     lsp_manager: LspManager,
+    runtime_time_label: String,
     conversation_permissions: ConversationPermissions,
     read_file_state: ReadFileState,
     pending_prompt_after_compact: Option<String>,
@@ -159,6 +160,7 @@ impl SessionRuntime {
             terminal_request_tx,
             terminal_requests,
             lsp_manager,
+            runtime_time_label: crate::context::current_time_label(),
             conversation_permissions: ConversationPermissions::default(),
             read_file_state: ReadFileState::new(),
             pending_prompt_after_compact: None,
@@ -437,7 +439,8 @@ impl SessionRuntime {
             AgentRunInput {
                 llm: config.llm.clone(),
                 system_prompt: config.system_prompt,
-                runtime_context: RuntimeContext::current(
+                runtime_context: RuntimeContext::with_time(
+                    self.runtime_time_label.clone(),
                     config.runtime_current_dir,
                     config.shell_tool_mode,
                 ),
@@ -504,6 +507,7 @@ impl SessionRuntime {
     fn reset_session_state(&mut self) {
         self.reset_agent_channel();
         self.agent_control_tx = None;
+        self.runtime_time_label = crate::context::current_time_label();
         self.conversation_permissions = ConversationPermissions::default();
         self.read_file_state.clear();
         self.pending_prompt_after_compact = None;

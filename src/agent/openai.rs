@@ -47,6 +47,10 @@ struct ChatRequest {
     temperature: f32,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_retention: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<StreamOptions>,
@@ -205,6 +209,8 @@ fn complete_chat(config: &LlmConfig, request: ModelRequest) -> Result<ModelRespo
             .collect::<Result<Vec<_>>>()?,
         temperature: config.temperature,
         max_tokens: request.max_tokens.unwrap_or(config.max_tokens),
+        prompt_cache_key: config.prompt_cache.key.clone(),
+        prompt_cache_retention: config.prompt_cache.retention.clone(),
         stream: None,
         stream_options: None,
         tools: chat_tools(request.tools),
@@ -241,6 +247,8 @@ fn stream_chat(
             .collect::<Result<Vec<_>>>()?,
         temperature: config.temperature,
         max_tokens: request.max_tokens.unwrap_or(config.max_tokens),
+        prompt_cache_key: config.prompt_cache.key.clone(),
+        prompt_cache_retention: config.prompt_cache.retention.clone(),
         stream: Some(true),
         stream_options: Some(StreamOptions {
             include_usage: true,
@@ -587,6 +595,46 @@ mod tests {
             response.usage.map(|usage| usage.cached_prompt_tokens),
             Some(None)
         );
+    }
+
+    #[test]
+    fn chat_request_serializes_prompt_cache_options_when_configured() {
+        let request = ChatRequest {
+            model: "gpt-5-codex".to_owned(),
+            messages: Vec::new(),
+            temperature: 0.0,
+            max_tokens: 1024,
+            prompt_cache_key: Some("glint-coding".to_owned()),
+            prompt_cache_retention: Some("24h".to_owned()),
+            stream: None,
+            stream_options: None,
+            tools: None,
+        };
+
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["prompt_cache_key"], "glint-coding");
+        assert_eq!(value["prompt_cache_retention"], "24h");
+    }
+
+    #[test]
+    fn chat_request_omits_prompt_cache_options_by_default() {
+        let request = ChatRequest {
+            model: "test-model".to_owned(),
+            messages: Vec::new(),
+            temperature: 0.0,
+            max_tokens: 1024,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            stream: None,
+            stream_options: None,
+            tools: None,
+        };
+
+        let value = serde_json::to_value(request).unwrap();
+
+        assert!(value.get("prompt_cache_key").is_none());
+        assert!(value.get("prompt_cache_retention").is_none());
     }
 
     #[test]

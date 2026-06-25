@@ -245,6 +245,7 @@ mod tests {
                 context_window: Some(1000),
                 api_key: "test-key".to_owned(),
                 default_context_window: Some(1000),
+                prompt_cache: Default::default(),
             },
             conversation: vec![ModelMessage::user("hello")],
             pre_prompt_tokens: Some(42),

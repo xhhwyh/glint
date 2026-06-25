@@ -22,6 +22,7 @@ pub struct LlmConfig {
     pub context_window: Option<u64>,
     pub api_key: String,
     pub default_context_window: Option<u64>,
+    pub prompt_cache: PromptCacheConfig,
 }
 
 #[derive(Clone)]
@@ -31,6 +32,13 @@ pub struct LlmProviderConfig {
     pub models: Vec<String>,
     pub model_context_windows: BTreeMap<String, u64>,
     pub api_key_env: String,
+    pub prompt_cache: PromptCacheConfig,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PromptCacheConfig {
+    pub key: Option<String>,
+    pub retention: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,6 +127,16 @@ struct FileProviderConfig {
     unit: String,
     models: Vec<FileModelConfig>,
     api_key_env: String,
+    #[serde(default)]
+    prompt_cache: Option<FilePromptCacheConfig>,
+}
+
+#[derive(Clone, Deserialize)]
+struct FilePromptCacheConfig {
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    retention: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -264,6 +282,10 @@ impl FileLlmConfig {
                 models,
                 model_context_windows,
                 api_key_env: provider.api_key_env,
+                prompt_cache: provider
+                    .prompt_cache
+                    .map(PromptCacheConfig::from)
+                    .unwrap_or_default(),
             });
         }
 
@@ -277,6 +299,7 @@ impl FileLlmConfig {
             context_window: self.context_window,
             api_key: String::new(),
             default_context_window: self.context_window,
+            prompt_cache: PromptCacheConfig::default(),
         };
         config.switch_model(&selected_provider, &selected_model, resolve_api_key)?;
         Ok(config)
@@ -410,8 +433,23 @@ impl LlmConfig {
             .copied()
             .or(self.default_context_window);
         self.api_key = api_key;
+        self.prompt_cache = provider.prompt_cache;
         Ok(())
     }
+}
+
+impl From<FilePromptCacheConfig> for PromptCacheConfig {
+    fn from(config: FilePromptCacheConfig) -> Self {
+        Self {
+            key: config.key.and_then(non_empty_string),
+            retention: config.retention.and_then(non_empty_string),
+        }
+    }
+}
+
+fn non_empty_string(value: String) -> Option<String> {
+    let value = value.trim().to_owned();
+    (!value.is_empty()).then_some(value)
 }
 
 #[cfg(test)]
@@ -501,6 +539,43 @@ mod tests {
             .into_runtime_config(|_| Some("secret".to_owned()))
             .unwrap();
         assert_eq!(llm.context_window, Some(1_000_000));
+    }
+
+    #[test]
+    fn applies_provider_prompt_cache_config() {
+        let config: FileConfig = serde_yaml::from_str(
+            r#"
+            llm:
+              provider: openai
+              model: gpt-5-codex
+              temperature: 0.7
+              max_tokens: 8196
+              providers:
+                openai:
+                  base_url: https://api.openai.com/v1
+                  models:
+                    - gpt-5-codex
+                  api_key_env: TEST_API_KEY
+                  prompt_cache:
+                    key: glint-coding
+                    retention: 24h
+                other:
+                  base_url: https://example.com
+                  models:
+                    - other-model
+                  api_key_env: TEST_API_KEY
+            "#,
+        )
+        .unwrap();
+
+        let mut llm = config.llm.into_runtime_config(fake_api_key).unwrap();
+
+        assert_eq!(llm.prompt_cache.key.as_deref(), Some("glint-coding"));
+        assert_eq!(llm.prompt_cache.retention.as_deref(), Some("24h"));
+
+        llm.switch_model("other", "other-model", fake_api_key)
+            .unwrap();
+        assert_eq!(llm.prompt_cache, PromptCacheConfig::default());
     }
 
     #[test]

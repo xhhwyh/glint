@@ -63,6 +63,9 @@ llm:
           context: 1000000
           max_tokens: 384000
         - other-model
+      prompt_cache:
+        key: glint-default
+        retention: 24h
       api_key_env: LLM_API_KEY
 lsp:
   servers:
@@ -75,7 +78,7 @@ lsp:
       max_restarts: 3
 ```
 
-Provider entries own `description`, `base_url`, optional token-cost `unit`, `models`, and `api_key_env`; global LLM settings own the selected `provider`, selected `model`, `temperature`, `max_tokens`, and optional `context_window`. A model entry can be a plain model name or an object with `name`, `positioning`, `input`, `output`, `cache_read`, `cache_write`, `context`, `max_tokens`, or `price` for `/model` picker display. Provider `unit` is converted to a price symbol, such as `￥` for RMB/CNY or `$` for USD, and appended to each input/output/cache price value when present. Numeric model `context` values are also used as the status-bar context window, with global `context_window` as fallback. API keys must come from the environment variable named by `api_key_env`; never hardcode or leak secrets. The HTTP client trims trailing slashes from `base_url`, posts to `{base_url}/chat/completions`, and expects `choices[0].message.content`.
+Provider entries own `description`, `base_url`, optional token-cost `unit`, `models`, optional `prompt_cache`, and `api_key_env`; global LLM settings own the selected `provider`, selected `model`, `temperature`, `max_tokens`, and optional `context_window`. A model entry can be a plain model name or an object with `name`, `positioning`, `input`, `output`, `cache_read`, `cache_write`, `context`, `max_tokens`, or `price` for `/model` picker display. Provider `unit` is converted to a price symbol, such as `￥` for RMB/CNY or `$` for USD, and appended to each input/output/cache price value when present. Numeric model `context` values are also used as the status-bar context window, with global `context_window` as fallback. Provider `prompt_cache.key` is sent as OpenAI-compatible `prompt_cache_key`, and `prompt_cache.retention` is sent as `prompt_cache_retention`; only enable it for endpoints that accept those request fields. API keys must come from the environment variable named by `api_key_env`; never hardcode or leak secrets. The HTTP client trims trailing slashes from `base_url`, posts to `{base_url}/chat/completions`, and expects `choices[0].message.content`.
 
 The optional `lsp.servers` block configures stdio language servers by file extension. If `lsp.servers` is omitted, Glint registers the Rust default shown above. If it is present, the configured servers replace the default set.
 
