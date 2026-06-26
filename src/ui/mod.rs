@@ -17,15 +17,16 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Position, Rect},
     style::Style,
-    text::Line,
+    text::{Line, Span},
     widgets::Paragraph,
 };
+use unicode_width::UnicodeWidthChar;
 
-use crate::app::App;
+use crate::app::{App, TextSelection};
 use crate::approval::ApprovalFocus;
 
 use layout::box_top;
-use theme::BG_COLOR;
+use theme::{ACCENT_COLOR, BG_COLOR};
 
 pub use terminal::{terminal_content_width, terminal_height_for_app};
 
@@ -59,9 +60,9 @@ pub fn render(frame: &mut Frame, app: &App) {
 
 fn render_document(frame: &mut Frame, app: &App, area: Rect) {
     let width = area.width.max(1);
-    let document = document(app, width);
-    let max_scroll = document.lines.len().saturating_sub(area.height as usize) as u16;
-    let scroll = max_scroll.saturating_sub(app.scroll);
+    let mut document = document(app, width);
+    let scroll = document_scroll_for_len(document.lines.len(), app.scroll, area.height);
+    document.lines = apply_text_selection(document.lines, app.text_selection, width);
 
     frame.render_widget(
         Paragraph::new(document.lines)
@@ -69,16 +70,37 @@ fn render_document(frame: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().bg(BG_COLOR)),
         area,
     );
-    frame.set_cursor_position(Position::new(
-        area.x + document.cursor_x.min(width.saturating_sub(1)),
-        area.y + visible_cursor_y(document.cursor_y, scroll, area.height),
-    ));
+    if let Some(cursor_y) = visible_cursor_y(document.cursor_y, scroll, area.height) {
+        frame.set_cursor_position(Position::new(
+            area.x + document.cursor_x.min(width.saturating_sub(1)),
+            area.y + cursor_y,
+        ));
+    }
 }
 
-fn visible_cursor_y(cursor_y: u16, scroll: u16, height: u16) -> u16 {
-    cursor_y
-        .saturating_sub(scroll)
-        .min(height.saturating_sub(1))
+pub fn document_scroll_top(app: &App, width: u16, height: u16) -> u16 {
+    let document = document(app, width.max(1));
+    document_scroll_for_len(document.lines.len(), app.scroll, height)
+}
+
+pub fn selected_text(app: &App, width: u16) -> Option<String> {
+    let selection = app.text_selection?;
+    let document = document(app, width.max(1));
+    selected_text_from_lines(&document.lines, selection, width.max(1))
+}
+
+fn visible_cursor_y(cursor_y: u16, scroll: u16, height: u16) -> Option<u16> {
+    if height == 0 || cursor_y < scroll {
+        return None;
+    }
+
+    let visible_y = cursor_y - scroll;
+    (visible_y < height).then_some(visible_y)
+}
+
+fn document_scroll_for_len(line_count: usize, scroll_offset: u16, height: u16) -> u16 {
+    let max_scroll = line_count.saturating_sub(height as usize) as u16;
+    max_scroll.saturating_sub(scroll_offset)
 }
 
 fn document(app: &App, width: u16) -> Document {
@@ -154,6 +176,170 @@ fn document(app: &App, width: u16) -> Document {
     }
 }
 
+fn apply_text_selection(
+    lines: Vec<Line<'static>>,
+    selection: Option<TextSelection>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let Some(selection) = selection else {
+        return lines;
+    };
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(row, line)| {
+            let Some((start, end)) = selection_columns_for_row(row as u16, selection, width) else {
+                return line;
+            };
+            highlight_line_selection(line, start, end)
+        })
+        .collect()
+}
+
+fn selected_text_from_lines(
+    lines: &[Line<'static>],
+    selection: TextSelection,
+    width: u16,
+) -> Option<String> {
+    let (start, end) = selection.ordered()?;
+    if lines.is_empty() || start.row as usize >= lines.len() {
+        return None;
+    }
+
+    let end_row = end.row.min((lines.len() - 1) as u16);
+    let rows = (start.row..=end_row)
+        .map(|row| {
+            let Some((start_column, end_column)) = selection_columns_for_row(row, selection, width)
+            else {
+                return String::new();
+            };
+            selected_text_from_line(&lines[row as usize], start_column, end_column)
+        })
+        .collect::<Vec<_>>();
+    let text = rows.join("\n");
+
+    text.chars()
+        .any(|character| character != '\n')
+        .then_some(text)
+}
+
+fn selected_text_from_line(line: &Line<'static>, start_column: u16, end_column: u16) -> String {
+    let mut selected = String::new();
+    let mut column = 0usize;
+    let start_column = start_column as usize;
+    let end_column = end_column as usize;
+
+    for span in &line.spans {
+        for character in span.content.chars() {
+            let character_width = character.width().unwrap_or(0);
+            let character_end = column + character_width;
+            if character_end > start_column && column < end_column {
+                selected.push(character);
+            }
+            column = character_end;
+        }
+    }
+
+    selected
+}
+
+fn selection_columns_for_row(row: u16, selection: TextSelection, width: u16) -> Option<(u16, u16)> {
+    let (start, end) = selection.ordered()?;
+    if row < start.row || row > end.row {
+        return None;
+    }
+
+    let start_column = if row == start.row { start.column } else { 0 }.min(width);
+    let end_column = if row == end.row {
+        end.column.saturating_add(1)
+    } else {
+        width
+    }
+    .min(width);
+
+    (end_column > start_column).then_some((start_column, end_column))
+}
+
+fn highlight_line_selection(
+    line: Line<'static>,
+    start_column: u16,
+    end_column: u16,
+) -> Line<'static> {
+    let Line {
+        style,
+        alignment,
+        spans,
+    } = line;
+    let mut highlighted = Vec::new();
+    let mut column = 0usize;
+    let start_column = start_column as usize;
+    let end_column = end_column as usize;
+
+    for span in spans {
+        let mut segment = String::new();
+        let mut segment_selected = None;
+        for character in span.content.chars() {
+            let character_width = character.width().unwrap_or(0);
+            let character_end = column + character_width;
+            let selected = character_end > start_column && column < end_column;
+
+            if segment_selected.is_some_and(|current| current != selected) {
+                push_selection_span(
+                    &mut highlighted,
+                    std::mem::take(&mut segment),
+                    span.style,
+                    segment_selected.unwrap_or(false),
+                );
+            }
+
+            segment_selected = Some(selected);
+            segment.push(character);
+            column = character_end;
+        }
+        push_selection_span(
+            &mut highlighted,
+            segment,
+            span.style,
+            segment_selected.unwrap_or(false),
+        );
+    }
+
+    let blank_start = column.max(start_column);
+    if end_column > blank_start {
+        highlighted.push(Span::styled(
+            " ".repeat(end_column - blank_start),
+            selection_style(),
+        ));
+    }
+
+    Line {
+        style,
+        alignment,
+        spans: highlighted,
+    }
+}
+
+fn push_selection_span(
+    spans: &mut Vec<Span<'static>>,
+    content: String,
+    style: Style,
+    selected: bool,
+) {
+    if content.is_empty() {
+        return;
+    }
+    let style = if selected {
+        style.patch(selection_style())
+    } else {
+        style
+    };
+    spans.push(Span::styled(content, style));
+}
+
+fn selection_style() -> Style {
+    Style::default().fg(BG_COLOR).bg(ACCENT_COLOR)
+}
+
 #[cfg(test)]
 mod tests {
     use super::format::{cached_suffix, context_bar_percent, context_usage_label};
@@ -163,6 +349,8 @@ mod tests {
     use super::theme::KEY_HINT_COLOR;
     use super::transcript_view::tool_output_preview;
     use super::*;
+    use crate::app::TextPosition;
+    use ratatui::style::{Color, Modifier};
 
     #[test]
     fn token_labels_show_cached_percentage() {
@@ -239,9 +427,81 @@ mod tests {
 
     #[test]
     fn cursor_y_tracks_document_scroll() {
-        assert_eq!(visible_cursor_y(10, 0, 20), 10);
-        assert_eq!(visible_cursor_y(10, 1, 20), 9);
-        assert_eq!(visible_cursor_y(2, 5, 20), 0);
-        assert_eq!(visible_cursor_y(30, 1, 12), 11);
+        assert_eq!(visible_cursor_y(10, 0, 20), Some(10));
+        assert_eq!(visible_cursor_y(10, 1, 20), Some(9));
+        assert_eq!(visible_cursor_y(2, 5, 20), None);
+        assert_eq!(visible_cursor_y(30, 1, 12), None);
+        assert_eq!(visible_cursor_y(10, 10, 0), None);
+    }
+
+    #[test]
+    fn text_selection_highlights_requested_columns() {
+        let base_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+        let line = Line::from(vec![Span::styled("hello", base_style)]);
+
+        let highlighted = highlight_line_selection(line, 1, 4);
+        let contents = highlighted
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(contents, vec!["h", "ell", "o"]);
+        assert_eq!(highlighted.spans[0].style.fg, Some(Color::Red));
+        assert_eq!(highlighted.spans[1].style.fg, Some(BG_COLOR));
+        assert_eq!(highlighted.spans[1].style.bg, Some(ACCENT_COLOR));
+        assert!(
+            highlighted.spans[1]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn text_selection_columns_cover_multiline_range() {
+        let selection = TextSelection {
+            anchor: TextPosition { row: 2, column: 3 },
+            focus: TextPosition { row: 4, column: 1 },
+            dragging: false,
+        };
+
+        assert_eq!(selection_columns_for_row(1, selection, 10), None);
+        assert_eq!(selection_columns_for_row(2, selection, 10), Some((3, 10)));
+        assert_eq!(selection_columns_for_row(3, selection, 10), Some((0, 10)));
+        assert_eq!(selection_columns_for_row(4, selection, 10), Some((0, 2)));
+        assert_eq!(selection_columns_for_row(5, selection, 10), None);
+    }
+
+    #[test]
+    fn selected_text_extracts_multiline_rendered_text() {
+        let lines = vec![
+            Line::from("zero"),
+            Line::from("abcdef"),
+            Line::from(vec![Span::raw("gh"), Span::styled("ij", Style::default())]),
+            Line::from("klmnop"),
+        ];
+        let selection = TextSelection {
+            anchor: TextPosition { row: 1, column: 2 },
+            focus: TextPosition { row: 3, column: 2 },
+            dragging: false,
+        };
+
+        assert_eq!(
+            selected_text_from_lines(&lines, selection, 20).as_deref(),
+            Some("cdef\nghij\nklm")
+        );
+    }
+
+    #[test]
+    fn selected_text_ignores_empty_line_only_selection() {
+        let lines = vec![Line::from(""), Line::from("")];
+        let selection = TextSelection {
+            anchor: TextPosition { row: 0, column: 0 },
+            focus: TextPosition { row: 1, column: 5 },
+            dragging: false,
+        };
+
+        assert_eq!(selected_text_from_lines(&lines, selection, 20), None);
     }
 }

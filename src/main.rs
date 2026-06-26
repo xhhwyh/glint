@@ -16,7 +16,10 @@ mod tools;
 mod transcript;
 mod ui;
 
-use std::{io, time::Duration};
+use std::{
+    io::{self, Write},
+    time::Duration,
+};
 
 use anyhow::Result;
 use app::App;
@@ -29,7 +32,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use event::{AppEvent, KeyInput, MouseAction};
+use event::{AppEvent, KeyAction, KeyInput, MouseAction};
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 fn main() -> Result<()> {
@@ -64,6 +67,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
     while !app.should_quit {
         let size = terminal.size()?;
         let terminal_height = ui::terminal_height_for_app(&app, size.height);
+        let document_height = size.height.saturating_sub(terminal_height);
         app.set_terminal_top_row(size.height.saturating_sub(terminal_height));
         if terminal_height > 0 {
             app.resize_terminal(
@@ -72,12 +76,28 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
             );
         }
         app.update_terminal();
+        app.set_document_viewport(
+            document_height,
+            ui::document_scroll_top(&app, size.width, document_height),
+        );
         terminal.draw(|frame| ui::render(frame, &app))?;
 
         if term_event::poll(Duration::from_millis(40))? {
             match term_event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    app.update(AppEvent::Key(KeyInput::from(key)));
+                    let input = KeyInput::from(key);
+                    if input.action == KeyAction::Quit {
+                        if let Some(text) = ui::selected_text(&app, size.width) {
+                            match copy_selection_to_clipboard(terminal, &text) {
+                                Ok(()) => app.finish_selection_copy(),
+                                Err(error) => app.fail_selection_copy(&format!("{error:#}")),
+                            }
+                        } else {
+                            app.request_quit();
+                        }
+                    } else {
+                        app.update(AppEvent::Key(input));
+                    }
                 }
                 Event::Mouse(mouse) => app.update(AppEvent::Mouse(MouseAction::from(mouse))),
                 _ => {}
@@ -89,4 +109,62 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
     }
 
     Ok(())
+}
+
+fn copy_selection_to_clipboard(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    text: &str,
+) -> Result<()> {
+    terminal
+        .backend_mut()
+        .write_all(osc52_sequence(text).as_bytes())?;
+    terminal.backend_mut().flush()?;
+    Ok(())
+}
+
+fn osc52_sequence(text: &str) -> String {
+    format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()))
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+
+        encoded.push(TABLE[(b0 >> 2) as usize] as char);
+        encoded.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            encoded.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+
+    encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_encodes_clipboard_payloads() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"hi"), "aGk=");
+        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
+    }
+
+    #[test]
+    fn osc52_sequence_wraps_base64_payload() {
+        assert_eq!(osc52_sequence("hi"), "\x1b]52;c;aGk=\x07");
+    }
 }

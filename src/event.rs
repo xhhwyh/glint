@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::agent::AgentEvent;
 
@@ -8,7 +8,11 @@ pub enum AppEvent {
     Agent(AgentEvent),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MouseAction {
+    LeftDown { column: u16, row: u16 },
+    LeftDrag { column: u16, row: u16 },
+    LeftUp { column: u16, row: u16 },
     ScrollUp { row: u16 },
     ScrollDown { row: u16 },
     None,
@@ -146,6 +150,18 @@ fn control_char(char: char) -> Option<Vec<u8>> {
 impl From<MouseEvent> for MouseAction {
     fn from(event: MouseEvent) -> Self {
         match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => Self::LeftDown {
+                column: event.column,
+                row: event.row,
+            },
+            MouseEventKind::Drag(MouseButton::Left) => Self::LeftDrag {
+                column: event.column,
+                row: event.row,
+            },
+            MouseEventKind::Up(MouseButton::Left) => Self::LeftUp {
+                column: event.column,
+                row: event.row,
+            },
             MouseEventKind::ScrollUp => Self::ScrollUp { row: event.row },
             MouseEventKind::ScrollDown => Self::ScrollDown { row: event.row },
             _ => Self::None,
@@ -155,7 +171,7 @@ impl From<MouseEvent> for MouseAction {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyCode, KeyEvent};
+    use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 
     use super::*;
 
@@ -185,5 +201,35 @@ mod tests {
         let input = KeyInput::from(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT));
 
         assert_eq!(input.action, KeyAction::Char('0'));
+    }
+
+    #[test]
+    fn left_mouse_events_track_selection_coordinates() {
+        let action = MouseAction::from(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 8,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert_eq!(action, MouseAction::LeftDown { column: 8, row: 3 });
+
+        let action = MouseAction::from(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 12,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert_eq!(action, MouseAction::LeftDrag { column: 12, row: 5 });
+
+        let action = MouseAction::from(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 14,
+            row: 6,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert_eq!(action, MouseAction::LeftUp { column: 14, row: 6 });
     }
 }

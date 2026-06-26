@@ -46,7 +46,10 @@ pub struct App {
     pub terminal_init_error: Option<String>,
     pub terminal_visible: bool,
     pub terminal_focused: bool,
+    pub text_selection: Option<TextSelection>,
     terminal_top_row: u16,
+    document_top_row: u16,
+    document_height: u16,
     turn_started_at: Option<Instant>,
     last_turn_duration: Option<Duration>,
     runtime: SessionRuntime,
@@ -83,6 +86,40 @@ pub enum StatusTab {
     General,
     Usage,
     Stat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TextPosition {
+    pub row: u16,
+    pub column: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextSelection {
+    pub anchor: TextPosition,
+    pub focus: TextPosition,
+    pub dragging: bool,
+}
+
+impl TextSelection {
+    fn new(position: TextPosition) -> Self {
+        Self {
+            anchor: position,
+            focus: position,
+            dragging: true,
+        }
+    }
+
+    pub fn ordered(self) -> Option<(TextPosition, TextPosition)> {
+        if self.anchor == self.focus {
+            return None;
+        }
+        if self.anchor <= self.focus {
+            Some((self.anchor, self.focus))
+        } else {
+            Some((self.focus, self.anchor))
+        }
+    }
 }
 
 impl StatusTab {
@@ -133,7 +170,10 @@ impl App {
             terminal_init_error: None,
             terminal_visible: false,
             terminal_focused: false,
+            text_selection: None,
             terminal_top_row: 0,
+            document_top_row: 0,
+            document_height: 0,
             turn_started_at: None,
             last_turn_duration: None,
             runtime,
@@ -213,6 +253,24 @@ impl App {
 
     pub fn set_terminal_top_row(&mut self, row: u16) {
         self.terminal_top_row = row;
+    }
+
+    pub fn set_document_viewport(&mut self, height: u16, top_row: u16) {
+        self.document_height = height;
+        self.document_top_row = top_row;
+    }
+
+    pub fn finish_selection_copy(&mut self) {
+        self.text_selection = None;
+        self.run_notice = Some("Copied selection to clipboard.".to_owned());
+    }
+
+    pub fn fail_selection_copy(&mut self, error: &str) {
+        self.run_notice = Some(format!("Failed to copy selection: {error}"));
+    }
+
+    pub fn request_quit(&mut self) {
+        self.should_quit = true;
     }
 
     pub fn active_terminal_tab(&self) -> Option<&TerminalTab> {
@@ -713,6 +771,27 @@ impl App {
 
     fn update_mouse(&mut self, mouse: MouseAction) {
         match mouse {
+            MouseAction::LeftDown { column, row } if !self.mouse_over_terminal_area(row) => {
+                self.text_selection = self.document_position(column, row).map(TextSelection::new);
+            }
+            MouseAction::LeftDown { .. } => self.text_selection = None,
+            MouseAction::LeftDrag { column, row } => {
+                if let Some(position) = self.clamped_document_position(column, row)
+                    && let Some(selection) = &mut self.text_selection
+                    && selection.dragging
+                {
+                    selection.focus = position;
+                }
+            }
+            MouseAction::LeftUp { column, row } => {
+                if let Some(position) = self.clamped_document_position(column, row)
+                    && let Some(selection) = &mut self.text_selection
+                    && selection.dragging
+                {
+                    selection.focus = position;
+                    selection.dragging = false;
+                }
+            }
             MouseAction::ScrollUp { row } if self.mouse_over_terminal(row) => {
                 if let Some(tab) = self.active_terminal_tab_mut() {
                     tab.scroll_up(3);
@@ -729,8 +808,34 @@ impl App {
         }
     }
 
+    fn document_position(&self, column: u16, row: u16) -> Option<TextPosition> {
+        if self.document_height == 0 || row >= self.document_height {
+            return None;
+        }
+        Some(TextPosition {
+            row: self.document_top_row.saturating_add(row),
+            column,
+        })
+    }
+
+    fn clamped_document_position(&self, column: u16, row: u16) -> Option<TextPosition> {
+        if self.document_height == 0 {
+            return None;
+        }
+        Some(TextPosition {
+            row: self
+                .document_top_row
+                .saturating_add(row.min(self.document_height.saturating_sub(1))),
+            column,
+        })
+    }
+
     fn mouse_over_terminal(&self, row: u16) -> bool {
-        self.terminal_visible && !self.terminal_tabs.is_empty() && row >= self.terminal_top_row
+        self.mouse_over_terminal_area(row) && !self.terminal_tabs.is_empty()
+    }
+
+    fn mouse_over_terminal_area(&self, row: u16) -> bool {
+        self.terminal_visible && row >= self.terminal_top_row
     }
 
     fn toggle_terminal(&mut self) {
@@ -1299,7 +1404,10 @@ mod tests {
             terminal_init_error: None,
             terminal_visible: false,
             terminal_focused: false,
+            text_selection: None,
             terminal_top_row: 0,
+            document_top_row: 0,
+            document_height: 0,
             turn_started_at: None,
             last_turn_duration: None,
             runtime: SessionRuntime::test_empty(
@@ -1323,6 +1431,31 @@ mod tests {
         assert!(names.contains(&"/status"));
         assert!(names.contains(&"/compact"));
         assert!(names.contains(&"/terminal"));
+    }
+
+    #[test]
+    fn mouse_drag_updates_text_selection_in_document_coordinates() {
+        let mut app = app();
+        app.set_document_viewport(20, 10);
+
+        app.update(AppEvent::Mouse(MouseAction::LeftDown { column: 2, row: 3 }));
+        app.update(AppEvent::Mouse(MouseAction::LeftDrag { column: 8, row: 5 }));
+        app.update(AppEvent::Mouse(MouseAction::LeftUp { column: 9, row: 5 }));
+
+        let selection = app.text_selection.expect("selection should be active");
+        assert_eq!(selection.anchor, TextPosition { row: 13, column: 2 });
+        assert_eq!(selection.focus, TextPosition { row: 15, column: 9 });
+        assert!(!selection.dragging);
+    }
+
+    #[test]
+    fn mouse_down_outside_document_does_not_start_selection() {
+        let mut app = app();
+        app.set_document_viewport(4, 0);
+
+        app.update(AppEvent::Mouse(MouseAction::LeftDown { column: 2, row: 5 }));
+
+        assert!(app.text_selection.is_none());
     }
 
     #[test]

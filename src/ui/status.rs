@@ -6,6 +6,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::Paragraph,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, StatusTab, StatusView};
 
@@ -117,50 +118,47 @@ fn status_general_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         "default"
     };
 
-    vec![
-        status_section_line("Runtime"),
-        status_kv_line("State", &format!("{:?}", app.status), width),
-        status_kv_line("Workspace", &app.current_dir, width),
-        status_kv_line("Terminal", &terminal_status, width),
-        status_kv_line("Shell tool", terminal_mode, width),
-        status_kv_line("Permissions", edit_permission, width),
-        Line::from(""),
-        status_section_line("Model"),
-        status_kv_line("Provider", &app.config.llm.provider, width),
-        status_kv_line("Model", &app.config.llm.model, width),
-        status_kv_line("Endpoint", &app.config.llm.base_url, width),
-        status_kv_line(
-            "API key env",
-            provider
-                .map(|provider| provider.api_key_env.as_str())
-                .unwrap_or(""),
-            width,
-        ),
-        status_kv_line(
-            "Temperature",
-            &format!("{:.2}", app.config.llm.temperature),
-            width,
-        ),
-        status_kv_line(
-            "Max tokens",
-            &format_number(app.config.llm.max_tokens as u64),
-            width,
-        ),
-        status_kv_line(
-            "Context window",
-            &app.config
-                .llm
-                .context_window
-                .map(format_number)
-                .unwrap_or_else(|| "unknown".to_owned()),
-            width,
-        ),
-        status_kv_line(
-            "LSP servers",
-            &app.config.lsp.servers.len().to_string(),
-            width,
-        ),
-    ]
+    status_section_columns(
+        StatusSection {
+            title: "Runtime",
+            entries: vec![
+                ("State", format!("{:?}", app.status)),
+                ("Workspace", app.current_dir.clone()),
+                ("Terminal", terminal_status),
+                ("Shell tool", terminal_mode.to_owned()),
+                ("Permissions", edit_permission.to_owned()),
+            ],
+        },
+        StatusSection {
+            title: "Model",
+            entries: vec![
+                ("Provider", app.config.llm.provider.clone()),
+                ("Model", app.config.llm.model.clone()),
+                ("Endpoint", app.config.llm.base_url.clone()),
+                (
+                    "API key env",
+                    provider
+                        .map(|provider| provider.api_key_env.clone())
+                        .unwrap_or_default(),
+                ),
+                ("Temperature", format!("{:.2}", app.config.llm.temperature)),
+                (
+                    "Max tokens",
+                    format_number(app.config.llm.max_tokens as u64),
+                ),
+                (
+                    "Context window",
+                    app.config
+                        .llm
+                        .context_window
+                        .map(format_number)
+                        .unwrap_or_else(|| "unknown".to_owned()),
+                ),
+                ("LSP servers", app.config.lsp.servers.len().to_string()),
+            ],
+        },
+        width,
+    )
 }
 
 fn status_usage_lines(app: &App, width: usize) -> Vec<Line<'static>> {
@@ -179,69 +177,48 @@ fn status_usage_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         .map(|cost| format_cost(cost, &price.unit))
         .unwrap_or_else(|| "unavailable".to_owned());
 
-    vec![
-        status_section_line("Current Conversation"),
-        status_kv_line("Total tokens", &format_number(usage.total_tokens), width),
-        status_kv_line(
-            "Input tokens",
-            &format_number(usage.total_prompt_tokens),
-            width,
-        ),
-        status_kv_line(
-            "Output tokens",
-            &format_number(usage.total_completion_tokens),
-            width,
-        ),
-        status_kv_line(
-            "Cached input",
-            &format_number(usage.total_cached_prompt_tokens),
-            width,
-        ),
-        status_kv_line("Billable input", &format_number(billable_prompt), width),
-        status_kv_line(
-            "Last input",
-            &format_number(last_usage.prompt_tokens),
-            width,
-        ),
-        status_kv_line(
-            "Last output",
-            &format_number(last_usage.completion_tokens),
-            width,
-        ),
-        status_kv_line(
-            "Last cache",
-            &cached_suffix(app.usage.cache_percent()),
-            width,
-        ),
-        status_kv_line(
-            "Context",
-            &context_usage_label(context_tokens, app.config.llm.context_window),
-            width,
-        ),
-        status_kv_line("Estimated cost", &cost_label, width),
-        Line::from(""),
-        status_section_line("Current Model Pricing"),
-        status_kv_line(
-            "Input / 1M",
-            &price_rate_label(price.input, &price.unit),
-            width,
-        ),
-        status_kv_line(
-            "Output / 1M",
-            &price_rate_label(price.output, &price.unit),
-            width,
-        ),
-        status_kv_line(
-            "Cache read / 1M",
-            &price_rate_label(price.cache_read, &price.unit),
-            width,
-        ),
-        status_kv_line(
-            "Cache write / 1M",
-            &price_rate_label(price.cache_write, &price.unit),
-            width,
-        ),
-    ]
+    status_section_columns(
+        StatusSection {
+            title: "Current Conversation",
+            entries: vec![
+                ("Total tokens", format_number(usage.total_tokens)),
+                ("Input tokens", format_number(usage.total_prompt_tokens)),
+                (
+                    "Output tokens",
+                    format_number(usage.total_completion_tokens),
+                ),
+                (
+                    "Cached input",
+                    format_number(usage.total_cached_prompt_tokens),
+                ),
+                ("Billable input", format_number(billable_prompt)),
+                ("Last input", format_number(last_usage.prompt_tokens)),
+                ("Last output", format_number(last_usage.completion_tokens)),
+                ("Last cache", cached_suffix(app.usage.cache_percent())),
+                (
+                    "Context",
+                    context_usage_label(context_tokens, app.config.llm.context_window),
+                ),
+                ("Estimated cost", cost_label),
+            ],
+        },
+        StatusSection {
+            title: "Current Model Pricing",
+            entries: vec![
+                ("Input / 1M", price_rate_label(price.input, &price.unit)),
+                ("Output / 1M", price_rate_label(price.output, &price.unit)),
+                (
+                    "Cache read / 1M",
+                    price_rate_label(price.cache_read, &price.unit),
+                ),
+                (
+                    "Cache write / 1M",
+                    price_rate_label(price.cache_write, &price.unit),
+                ),
+            ],
+        },
+        width,
+    )
 }
 
 fn status_stat_lines(view: &StatusView, width: usize, available_rows: usize) -> Vec<Line<'static>> {
@@ -326,6 +303,79 @@ fn status_section_line(title: &str) -> Line<'static> {
             .fg(ACCENT_COLOR)
             .add_modifier(Modifier::BOLD),
     ))
+}
+
+struct StatusSection {
+    title: &'static str,
+    entries: Vec<(&'static str, String)>,
+}
+
+fn status_section_columns(
+    left: StatusSection,
+    right: StatusSection,
+    width: usize,
+) -> Vec<Line<'static>> {
+    const TWO_COLUMN_MIN_WIDTH: usize = 92;
+    const GUTTER_WIDTH: usize = 4;
+
+    if width < TWO_COLUMN_MIN_WIDTH {
+        let mut lines = status_section_lines(left, width);
+        lines.push(Line::from(""));
+        lines.extend(status_section_lines(right, width));
+        return lines;
+    }
+
+    let left_width = (width - GUTTER_WIDTH) / 2;
+    let right_width = width - GUTTER_WIDTH - left_width;
+    let left_lines = status_section_lines(left, left_width);
+    let right_lines = status_section_lines(right, right_width);
+    let row_count = left_lines.len().max(right_lines.len());
+    (0..row_count)
+        .map(|index| {
+            status_join_columns(
+                left_lines.get(index).cloned(),
+                right_lines.get(index).cloned(),
+                left_width,
+                GUTTER_WIDTH,
+            )
+        })
+        .collect()
+}
+
+fn status_section_lines(section: StatusSection, width: usize) -> Vec<Line<'static>> {
+    let mut lines = vec![status_section_line(section.title)];
+    lines.extend(
+        section
+            .entries
+            .into_iter()
+            .map(|(label, value)| status_kv_line(label, &value, width)),
+    );
+    lines
+}
+
+fn status_join_columns(
+    left: Option<Line<'static>>,
+    right: Option<Line<'static>>,
+    left_width: usize,
+    gutter_width: usize,
+) -> Line<'static> {
+    let left = left.unwrap_or_else(|| Line::from(""));
+    let left_line_width = line_width(&left);
+    let mut spans = left.spans;
+    spans.push(Span::raw(
+        " ".repeat(left_width.saturating_sub(left_line_width) + gutter_width),
+    ));
+    if let Some(right) = right {
+        spans.extend(right.spans);
+    }
+    Line::from(spans)
+}
+
+fn line_width(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref().width())
+        .sum()
 }
 
 fn status_kv_line(label: &str, value: &str, width: usize) -> Line<'static> {
@@ -605,6 +655,53 @@ mod tests {
     use crate::transcript::{DailyTokenTotal, ModelTokenTotal, WorkspaceUsageStats};
 
     use super::*;
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn status_sections_use_two_columns_when_wide() {
+        let lines = status_section_columns(
+            StatusSection {
+                title: "Runtime",
+                entries: vec![("State", "Idle".to_owned())],
+            },
+            StatusSection {
+                title: "Model",
+                entries: vec![("Provider", "default".to_owned())],
+            },
+            100,
+        );
+
+        assert_eq!(lines.len(), 2);
+        assert!(line_text(&lines[0]).contains("Runtime"));
+        assert!(line_text(&lines[0]).contains("Model"));
+        assert!(line_text(&lines[1]).contains("State"));
+        assert!(line_text(&lines[1]).contains("Provider"));
+    }
+
+    #[test]
+    fn status_sections_fall_back_to_single_column_when_narrow() {
+        let lines = status_section_columns(
+            StatusSection {
+                title: "Runtime",
+                entries: vec![("State", "Idle".to_owned())],
+            },
+            StatusSection {
+                title: "Model",
+                entries: vec![("Provider", "default".to_owned())],
+            },
+            80,
+        );
+
+        assert_eq!(line_text(&lines[0]), "Runtime");
+        assert_eq!(line_text(&lines[2]), "");
+        assert_eq!(line_text(&lines[3]), "Model");
+    }
 
     #[test]
     fn usage_calendar_uses_compact_square_cells() {
