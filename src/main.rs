@@ -68,7 +68,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         let size = terminal.size()?;
         let terminal_height = ui::terminal_height_for_app(&app, size.height);
         let document_height = size.height.saturating_sub(terminal_height);
-        app.set_terminal_top_row(size.height.saturating_sub(terminal_height));
+        let terminal_top_row = size.height.saturating_sub(terminal_height);
+        app.set_terminal_top_row(terminal_top_row);
         if terminal_height > 0 {
             app.resize_terminal(
                 terminal_height.saturating_sub(2),
@@ -80,6 +81,20 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
             document_height,
             ui::document_scroll_top(&app, size.width, document_height),
         );
+        let (input_top_row, input_rows, input_content_width) =
+            ui::composer_hitbox(&app, size.width);
+        app.set_input_hitbox(input_top_row, input_rows, input_content_width);
+        app.set_return_bottom_button_hitbox(ui::return_bottom_button_hitbox(
+            &app,
+            size.width,
+            document_height,
+        ));
+        app.set_terminal_tab_hitbox(ui::terminal_tab_hitbox(
+            &app,
+            terminal_top_row,
+            size.width,
+            terminal_height,
+        ));
         terminal.draw(|frame| ui::render(frame, &app))?;
 
         if term_event::poll(Duration::from_millis(40))? {
@@ -87,13 +102,27 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     let input = KeyInput::from(key);
                     if input.action == KeyAction::Quit {
-                        if let Some(text) = ui::selected_text(&app, size.width) {
+                        if let Some(text) = app.selected_input_text() {
+                            match copy_selection_to_clipboard(terminal, &text) {
+                                Ok(()) => app.finish_input_selection_copy(),
+                                Err(error) => app.fail_selection_copy(&format!("{error:#}")),
+                            }
+                        } else if let Some(text) = ui::selected_text(&app, size.width) {
                             match copy_selection_to_clipboard(terminal, &text) {
                                 Ok(()) => app.finish_selection_copy(),
                                 Err(error) => app.fail_selection_copy(&format!("{error:#}")),
                             }
                         } else {
                             app.request_quit();
+                        }
+                    } else if input.action == KeyAction::Cut {
+                        if let Some(text) = app.selected_input_text() {
+                            match copy_selection_to_clipboard(terminal, &text) {
+                                Ok(()) => app.finish_input_selection_cut(),
+                                Err(error) => app.fail_selection_copy(&format!("{error:#}")),
+                            }
+                        } else {
+                            app.update(AppEvent::Key(input));
                         }
                     } else {
                         app.update(AppEvent::Key(input));

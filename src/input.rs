@@ -22,8 +22,38 @@ impl InputState {
         }
     }
 
-    pub fn newline(&mut self) {
-        self.push('\n');
+    pub fn delete_forward(&mut self) {
+        if let Some(char) = self.value[self.cursor..].chars().next() {
+            let end = self.cursor + char.len_utf8();
+            self.value.drain(self.cursor..end);
+            self.history_index = None;
+        }
+    }
+
+    pub fn delete_range(&mut self, start: usize, end: usize) {
+        if start >= end
+            || end > self.value.len()
+            || !self.value.is_char_boundary(start)
+            || !self.value.is_char_boundary(end)
+        {
+            return;
+        }
+        self.value.drain(start..end);
+        self.cursor = start;
+        self.history_index = None;
+    }
+
+    pub fn replace_range(&mut self, start: usize, end: usize, replacement: &str) {
+        if start > end
+            || end > self.value.len()
+            || !self.value.is_char_boundary(start)
+            || !self.value.is_char_boundary(end)
+        {
+            return;
+        }
+        self.value.replace_range(start..end, replacement);
+        self.cursor = start + replacement.len();
+        self.history_index = None;
     }
 
     pub fn set(&mut self, value: impl Into<String>) {
@@ -110,6 +140,43 @@ impl InputState {
             .unwrap_or_else(|| self.history_draft.clone());
         self.cursor = self.value.len();
     }
+
+    pub fn visual_position_byte_index(
+        &self,
+        target_row: usize,
+        target_column: usize,
+        width: usize,
+    ) -> usize {
+        let mut row = 0;
+        let mut column = 0;
+
+        for (index, char) in self.value.char_indices() {
+            if char == '\n' {
+                if row == target_row {
+                    return index;
+                }
+                row += 1;
+                column = 0;
+                continue;
+            }
+
+            let char_width = unicode_width::UnicodeWidthChar::width(char).unwrap_or(0);
+            if column + char_width > width && column > 0 {
+                if row == target_row {
+                    return index;
+                }
+                row += 1;
+                column = 0;
+            }
+
+            if row == target_row && target_column <= column {
+                return index;
+            }
+            column += char_width;
+        }
+
+        self.value.len()
+    }
 }
 
 fn byte_index_for_column(text: &str, column: usize) -> usize {
@@ -117,4 +184,78 @@ fn byte_index_for_column(text: &str, column: usize) -> usize {
         .nth(column)
         .map(|(index, _)| index)
         .unwrap_or(text.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visual_position_byte_index_tracks_single_line() {
+        let mut input = InputState::default();
+        input.set("hello");
+
+        assert_eq!(input.visual_position_byte_index(0, 3, 20), 3);
+    }
+
+    #[test]
+    fn visual_position_byte_index_tracks_newlines() {
+        let mut input = InputState::default();
+        input.set("hello\nworld");
+
+        assert_eq!(
+            input.visual_position_byte_index(1, 2, 20),
+            "hello\nwo".len()
+        );
+    }
+
+    #[test]
+    fn visual_position_byte_index_tracks_wrapped_rows() {
+        let mut input = InputState::default();
+        input.set("abcdef");
+
+        assert_eq!(input.visual_position_byte_index(1, 1, 3), 4);
+    }
+
+    #[test]
+    fn visual_position_byte_index_handles_wide_characters() {
+        let mut input = InputState::default();
+        input.set("a中b");
+
+        assert_eq!(input.visual_position_byte_index(0, 2, 20), "a中".len());
+    }
+
+    #[test]
+    fn delete_forward_removes_character_after_cursor() {
+        let mut input = InputState::default();
+        input.set("hello");
+        input.cursor = 1;
+
+        input.delete_forward();
+
+        assert_eq!(input.value, "hllo");
+        assert_eq!(input.cursor, 1);
+    }
+
+    #[test]
+    fn delete_range_removes_selected_text_and_moves_cursor_to_start() {
+        let mut input = InputState::default();
+        input.set("hello");
+
+        input.delete_range(1, 4);
+
+        assert_eq!(input.value, "ho");
+        assert_eq!(input.cursor, 1);
+    }
+
+    #[test]
+    fn replace_range_replaces_selected_text() {
+        let mut input = InputState::default();
+        input.set("hello");
+
+        input.replace_range(1, 4, "i");
+
+        assert_eq!(input.value, "hio");
+        assert_eq!(input.cursor, 2);
+    }
 }

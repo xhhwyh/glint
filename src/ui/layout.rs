@@ -137,23 +137,19 @@ pub(super) fn box_top_spans(title: Vec<Span<'static>>, width: u16) -> Line<'stat
     Line::from(spans)
 }
 
-pub(super) fn box_input_body(text: &str, width: u16) -> Line<'static> {
+pub(super) fn box_input_body_line(body: Line<'static>, width: u16) -> Line<'static> {
     let width = width as usize;
     if width < 4 {
-        return Line::from(Span::styled(
-            text.to_owned(),
-            Style::default().fg(TEXT_COLOR),
-        ));
+        return body;
     }
 
-    let text_width = text.width();
+    let text_width: usize = body.spans.iter().map(|span| span.width()).sum();
     let padding = width.saturating_sub(text_width + 4);
-    Line::from(vec![
-        Span::styled("│ ", Style::default().fg(ACCENT_COLOR)),
-        Span::styled(text.to_owned(), Style::default().fg(TEXT_COLOR)),
-        Span::raw(" ".repeat(padding)),
-        Span::styled(" │", Style::default().fg(ACCENT_COLOR)),
-    ])
+    let mut spans = vec![Span::styled("│ ", Style::default().fg(ACCENT_COLOR))];
+    spans.extend(body.spans);
+    spans.push(Span::raw(" ".repeat(padding)));
+    spans.push(Span::styled(" │", Style::default().fg(ACCENT_COLOR)));
+    Line::from(spans)
 }
 
 pub(super) fn box_bottom(width: u16) -> Line<'static> {

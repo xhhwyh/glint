@@ -44,6 +44,53 @@ pub fn terminal_content_width(total_width: u16) -> u16 {
     total_width.saturating_sub(tab_width + 4).max(1)
 }
 
+pub fn terminal_tab_hitbox(
+    app: &App,
+    top_row: u16,
+    width: u16,
+    height: u16,
+) -> Option<(u16, u16, u16, u16, usize, usize)> {
+    terminal_tab_hitbox_for(
+        app.active_terminal_tab,
+        app.terminal_tabs.len(),
+        top_row,
+        width,
+        height,
+    )
+}
+
+pub(super) fn terminal_tab_hitbox_for(
+    active_tab: usize,
+    tab_count: usize,
+    top_row: u16,
+    width: u16,
+    height: u16,
+) -> Option<(u16, u16, u16, u16, usize, usize)> {
+    if tab_count == 0 || height <= 2 {
+        return None;
+    }
+    let tab_width = terminal_tab_column_width(width);
+    if tab_width == 0 {
+        return None;
+    }
+
+    let rows = height.saturating_sub(2) as usize;
+    let first_tab = terminal_tab_window_start(active_tab, tab_count, rows);
+    let visible_rows = (tab_count - first_tab).min(rows) as u16;
+    if visible_rows == 0 {
+        return None;
+    }
+
+    Some((
+        top_row + 1,
+        top_row + 1 + visible_rows,
+        1,
+        1 + tab_width,
+        first_tab,
+        tab_count,
+    ))
+}
+
 pub(super) fn render_terminal(frame: &mut Frame, app: &App, area: Rect) {
     if area.height == 0 {
         return;

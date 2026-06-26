@@ -30,6 +30,8 @@ pub enum KeyAction {
     Newline,
     Char(char),
     Backspace,
+    Delete,
+    Cut,
     Left,
     Right,
     Up,
@@ -53,6 +55,7 @@ impl From<KeyEvent> for KeyInput {
                 KeyAction::ForceQuit
             }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyAction::Quit,
+            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyAction::Cut,
             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 KeyAction::CancelConversationPermission
             }
@@ -76,6 +79,7 @@ impl From<KeyEvent> for KeyInput {
             KeyCode::Tab => KeyAction::Tab,
             KeyCode::Esc => KeyAction::Escape,
             KeyCode::Backspace => KeyAction::Backspace,
+            KeyCode::Delete => KeyAction::Delete,
             KeyCode::Left => KeyAction::Left,
             KeyCode::Right => KeyAction::Right,
             KeyCode::Up | KeyCode::PageUp => KeyAction::Up,
@@ -201,6 +205,20 @@ mod tests {
         let input = KeyInput::from(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT));
 
         assert_eq!(input.action, KeyAction::Char('0'));
+    }
+
+    #[test]
+    fn ctrl_x_cuts_selection() {
+        let input = KeyInput::from(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+
+        assert_eq!(input.action, KeyAction::Cut);
+    }
+
+    #[test]
+    fn delete_key_deletes_forward() {
+        let input = KeyInput::from(KeyEvent::new(KeyCode::Delete, KeyModifiers::empty()));
+
+        assert_eq!(input.action, KeyAction::Delete);
     }
 
     #[test]

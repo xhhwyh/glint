@@ -3,37 +3,31 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use crate::{app::App, message::Role};
+use crate::message::Role;
 
 use super::{format::duration_label, layout::wrap_text, markdown, theme::*};
 
-pub(super) fn transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
-    app.messages
-        .iter()
-        .flat_map(|message| {
-            if message.role == Role::Tool {
-                return tool_message_lines(message, width);
-            }
+pub(super) fn message_lines(message: &crate::message::Message, width: u16) -> Vec<Line<'static>> {
+    if message.role == Role::Tool {
+        return tool_message_lines(message, width);
+    }
 
-            if message.role == Role::User {
-                return user_message_lines(message, width);
-            }
+    if message.role == Role::User {
+        return user_message_lines(message, width);
+    }
 
-            if message.role == Role::Assistant && message.content.is_empty() {
-                return Vec::new();
-            }
+    if message.role == Role::Assistant && message.content.is_empty() {
+        return Vec::new();
+    }
 
-            let mut lines = vec![Line::from("")];
-            let markdown_lines =
-                markdown::render_markdown(&message.content, width.saturating_sub(2));
-            for mut line in markdown_lines {
-                let mut spans = vec![Span::raw("  ")];
-                spans.append(&mut line.spans);
-                lines.push(Line::from(spans));
-            }
-            lines
-        })
-        .collect()
+    let mut lines = vec![Line::from("")];
+    let markdown_lines = markdown::render_markdown(&message.content, width.saturating_sub(2));
+    for mut line in markdown_lines {
+        let mut spans = vec![Span::raw("  ")];
+        spans.append(&mut line.spans);
+        lines.push(Line::from(spans));
+    }
+    lines
 }
 
 pub(super) fn processing_line(elapsed: std::time::Duration) -> Line<'static> {

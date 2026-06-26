@@ -6,15 +6,20 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::App;
 
-use super::{layout::wrap_text, theme::*};
+use super::theme::*;
 
 const MAX_SLASH_COMMAND_ROWS: usize = 5;
 
-pub(super) fn input_rows(value: &str, width: u16) -> Vec<String> {
-    wrap_text(value, input_content_width(width) as u16)
+struct InputRow {
+    text: String,
+    start: usize,
+}
+
+pub(super) fn input_rows(app: &App, width: u16) -> Vec<Line<'static>> {
+    visual_input_rows(&app.input.value, input_content_width(width))
         .into_iter()
         .enumerate()
-        .map(|(index, row)| format!("{}{}", if index == 0 { "❯ " } else { "  " }, row))
+        .map(|(index, row)| input_row_line(index, row, app.input_selection_range()))
         .collect()
 }
 
@@ -41,8 +46,93 @@ pub(super) fn input_cursor_position(app: &App, width: u16) -> (u16, u16) {
     (column as u16 + 4, row as u16)
 }
 
-fn input_content_width(width: u16) -> usize {
+pub(super) fn input_content_width(width: u16) -> usize {
     width.saturating_sub(6).max(1) as usize
+}
+
+fn visual_input_rows(value: &str, width: usize) -> Vec<InputRow> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut row_start = 0;
+    let mut row_width = 0;
+
+    for (index, character) in value.char_indices() {
+        if character == '\n' {
+            rows.push(InputRow {
+                text: value[row_start..index].to_owned(),
+                start: row_start,
+            });
+            row_start = index + character.len_utf8();
+            row_width = 0;
+            continue;
+        }
+
+        let character_width = character.width().unwrap_or(0);
+        if row_width + character_width > width && row_width > 0 {
+            rows.push(InputRow {
+                text: value[row_start..index].to_owned(),
+                start: row_start,
+            });
+            row_start = index;
+            row_width = 0;
+        }
+        row_width += character_width;
+    }
+
+    rows.push(InputRow {
+        text: value[row_start..].to_owned(),
+        start: row_start,
+    });
+    rows
+}
+
+fn input_row_line(index: usize, row: InputRow, selection: Option<(usize, usize)>) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        if index == 0 { "❯ " } else { "  " },
+        Style::default().fg(TEXT_COLOR),
+    )];
+    push_input_row_spans(&mut spans, &row, selection);
+    Line::from(spans)
+}
+
+fn push_input_row_spans(
+    spans: &mut Vec<Span<'static>>,
+    row: &InputRow,
+    selection: Option<(usize, usize)>,
+) {
+    let mut segment = String::new();
+    let mut segment_selected = None;
+    let (selection_start, selection_end) = selection.unwrap_or((0, 0));
+
+    for (relative_index, character) in row.text.char_indices() {
+        let absolute_index = row.start + relative_index;
+        let character_end = absolute_index + character.len_utf8();
+        let selected = selection_start < character_end && absolute_index < selection_end;
+
+        if segment_selected.is_some_and(|current| current != selected) {
+            push_input_span(
+                spans,
+                std::mem::take(&mut segment),
+                segment_selected.unwrap_or(false),
+            );
+        }
+
+        segment_selected = Some(selected);
+        segment.push(character);
+    }
+    push_input_span(spans, segment, segment_selected.unwrap_or(false));
+}
+
+fn push_input_span(spans: &mut Vec<Span<'static>>, content: String, selected: bool) {
+    if content.is_empty() {
+        return;
+    }
+    let style = if selected {
+        Style::default().fg(BG_COLOR).bg(ACCENT_COLOR)
+    } else {
+        Style::default().fg(TEXT_COLOR)
+    };
+    spans.push(Span::styled(content, style));
 }
 
 pub(super) fn slash_command_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
@@ -118,5 +208,40 @@ mod tests {
         assert_eq!(slash_command_window_start(5, 7, 5), 1);
         assert_eq!(slash_command_window_start(6, 7, 5), 2);
         assert_eq!(slash_command_window_start(6, 5, 5), 0);
+    }
+
+    #[test]
+    fn visual_input_rows_track_wrapped_byte_offsets() {
+        let rows = visual_input_rows("abcdef", 3);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].text, "abc");
+        assert_eq!(rows[0].start, 0);
+        assert_eq!(rows[1].text, "def");
+        assert_eq!(rows[1].start, 3);
+    }
+
+    #[test]
+    fn input_row_line_highlights_selected_text_only() {
+        let row = InputRow {
+            text: "hello".to_owned(),
+            start: 0,
+        };
+        let line = input_row_line(0, row, Some((1, 4)));
+        let spans = line
+            .spans
+            .iter()
+            .map(|span| (span.content.as_ref(), span.style.fg, span.style.bg))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            spans,
+            vec![
+                ("❯ ", Some(TEXT_COLOR), None),
+                ("h", Some(TEXT_COLOR), None),
+                ("ell", Some(BG_COLOR), Some(ACCENT_COLOR)),
+                ("o", Some(TEXT_COLOR), None),
+            ]
+        );
     }
 }

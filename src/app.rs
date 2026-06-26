@@ -47,9 +47,15 @@ pub struct App {
     pub terminal_visible: bool,
     pub terminal_focused: bool,
     pub text_selection: Option<TextSelection>,
+    input_selection: Option<InputSelection>,
     terminal_top_row: u16,
     document_top_row: u16,
     document_height: u16,
+    input_body_top_row: u16,
+    input_body_rows: u16,
+    input_content_width: u16,
+    return_bottom_button: Option<ReturnBottomButton>,
+    terminal_tab_hitbox: Option<TerminalTabHitbox>,
     turn_started_at: Option<Instant>,
     last_turn_duration: Option<Duration>,
     runtime: SessionRuntime,
@@ -101,6 +107,30 @@ pub struct TextSelection {
     pub dragging: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputSelection {
+    anchor: usize,
+    focus: usize,
+    dragging: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReturnBottomButton {
+    row: u16,
+    start_column: u16,
+    end_column: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalTabHitbox {
+    start_row: u16,
+    end_row: u16,
+    start_column: u16,
+    end_column: u16,
+    first_tab: usize,
+    tab_count: usize,
+}
+
 impl TextSelection {
     fn new(position: TextPosition) -> Self {
         Self {
@@ -115,6 +145,27 @@ impl TextSelection {
             return None;
         }
         if self.anchor <= self.focus {
+            Some((self.anchor, self.focus))
+        } else {
+            Some((self.focus, self.anchor))
+        }
+    }
+}
+
+impl InputSelection {
+    fn new(position: usize) -> Self {
+        Self {
+            anchor: position,
+            focus: position,
+            dragging: true,
+        }
+    }
+
+    fn ordered(self) -> Option<(usize, usize)> {
+        if self.anchor == self.focus {
+            return None;
+        }
+        if self.anchor < self.focus {
             Some((self.anchor, self.focus))
         } else {
             Some((self.focus, self.anchor))
@@ -171,9 +222,15 @@ impl App {
             terminal_visible: false,
             terminal_focused: false,
             text_selection: None,
+            input_selection: None,
             terminal_top_row: 0,
             document_top_row: 0,
             document_height: 0,
+            input_body_top_row: 0,
+            input_body_rows: 0,
+            input_content_width: 1,
+            return_bottom_button: None,
+            terminal_tab_hitbox: None,
             turn_started_at: None,
             last_turn_duration: None,
             runtime,
@@ -260,9 +317,65 @@ impl App {
         self.document_top_row = top_row;
     }
 
+    pub fn set_input_hitbox(&mut self, top_row: u16, rows: u16, content_width: u16) {
+        self.input_body_top_row = top_row;
+        self.input_body_rows = rows;
+        self.input_content_width = content_width.max(1);
+    }
+
+    pub fn set_return_bottom_button_hitbox(&mut self, hitbox: Option<(u16, u16, u16)>) {
+        self.return_bottom_button =
+            hitbox.map(|(row, start_column, end_column)| ReturnBottomButton {
+                row,
+                start_column,
+                end_column,
+            });
+    }
+
+    pub fn set_terminal_tab_hitbox(&mut self, hitbox: Option<(u16, u16, u16, u16, usize, usize)>) {
+        self.terminal_tab_hitbox = hitbox.map(
+            |(start_row, end_row, start_column, end_column, first_tab, tab_count)| {
+                TerminalTabHitbox {
+                    start_row,
+                    end_row,
+                    start_column,
+                    end_column,
+                    first_tab,
+                    tab_count,
+                }
+            },
+        );
+    }
+
+    pub fn input_selection_range(&self) -> Option<(usize, usize)> {
+        let (start, end) = self.input_selection?.ordered()?;
+        (end <= self.input.value.len()
+            && self.input.value.is_char_boundary(start)
+            && self.input.value.is_char_boundary(end))
+        .then_some((start, end))
+    }
+
+    pub fn selected_input_text(&self) -> Option<String> {
+        if !self.input_mouse_enabled() {
+            return None;
+        }
+        let (start, end) = self.input_selection_range()?;
+        self.input.value.get(start..end).map(str::to_owned)
+    }
+
+    pub fn finish_input_selection_copy(&mut self) {
+        self.input_selection = None;
+        self.run_notice = None;
+    }
+
+    pub fn finish_input_selection_cut(&mut self) {
+        self.delete_input_selection();
+        self.run_notice = None;
+    }
+
     pub fn finish_selection_copy(&mut self) {
         self.text_selection = None;
-        self.run_notice = Some("Copied selection to clipboard.".to_owned());
+        self.run_notice = None;
     }
 
     pub fn fail_selection_copy(&mut self, error: &str) {
@@ -345,13 +458,38 @@ impl App {
             KeyAction::Quit => self.should_quit = true,
             KeyAction::ForceQuit => self.should_quit = true,
             KeyAction::Submit if self.status == AgentStatus::Idle => self.submit(),
-            KeyAction::Newline if self.status == AgentStatus::Idle => self.input.newline(),
-            KeyAction::Char(char) if self.status == AgentStatus::Idle => self.input.push(char),
-            KeyAction::Backspace if self.status == AgentStatus::Idle => self.input.backspace(),
-            KeyAction::Left if self.status == AgentStatus::Idle => self.input.move_left(),
-            KeyAction::Right if self.status == AgentStatus::Idle => self.input.move_right(),
-            KeyAction::Up if self.status == AgentStatus::Idle => self.input.move_up(),
-            KeyAction::Down if self.status == AgentStatus::Idle => self.input.move_down(),
+            KeyAction::Newline if self.status == AgentStatus::Idle => {
+                self.replace_input_selection_or_insert("\n")
+            }
+            KeyAction::Char(char) if self.status == AgentStatus::Idle => {
+                self.replace_input_selection_or_insert(&char.to_string())
+            }
+            KeyAction::Backspace if self.status == AgentStatus::Idle => {
+                if !self.delete_input_selection() {
+                    self.input.backspace();
+                }
+            }
+            KeyAction::Delete if self.status == AgentStatus::Idle => {
+                if !self.delete_input_selection() {
+                    self.input.delete_forward();
+                }
+            }
+            KeyAction::Left if self.status == AgentStatus::Idle => {
+                self.input_selection = None;
+                self.input.move_left();
+            }
+            KeyAction::Right if self.status == AgentStatus::Idle => {
+                self.input_selection = None;
+                self.input.move_right();
+            }
+            KeyAction::Up if self.status == AgentStatus::Idle => {
+                self.input_selection = None;
+                self.input.move_up();
+            }
+            KeyAction::Down if self.status == AgentStatus::Idle => {
+                self.input_selection = None;
+                self.input.move_down();
+            }
             KeyAction::Up => self.scroll = self.scroll.saturating_add(1),
             KeyAction::Down => self.scroll = self.scroll.saturating_sub(1),
             KeyAction::None
@@ -359,6 +497,8 @@ impl App {
             | KeyAction::Newline
             | KeyAction::Char(_)
             | KeyAction::Backspace
+            | KeyAction::Delete
+            | KeyAction::Cut
             | KeyAction::Left
             | KeyAction::Right
             | KeyAction::Tab
@@ -370,6 +510,27 @@ impl App {
             | KeyAction::CancelConversationPermission => {}
         }
         self.clamp_slash_command_selection();
+    }
+
+    fn replace_input_selection_or_insert(&mut self, replacement: &str) {
+        if let Some((start, end)) = self.input_selection_range() {
+            self.input.replace_range(start, end, replacement);
+            self.input_selection = None;
+        } else {
+            for character in replacement.chars() {
+                self.input.push(character);
+            }
+        }
+    }
+
+    fn delete_input_selection(&mut self) -> bool {
+        let Some((start, end)) = self.input_selection_range() else {
+            self.input_selection = None;
+            return false;
+        };
+        self.input.delete_range(start, end);
+        self.input_selection = None;
+        true
     }
 
     fn write_terminal_key(&mut self, key: &KeyInput) -> bool {
@@ -457,6 +618,7 @@ impl App {
 
     fn submit_unknown_slash_command(&mut self) {
         let command = self.input.take_trimmed();
+        self.input_selection = None;
         if command.is_empty() {
             return;
         }
@@ -771,12 +933,46 @@ impl App {
 
     fn update_mouse(&mut self, mouse: MouseAction) {
         match mouse {
-            MouseAction::LeftDown { column, row } if !self.mouse_over_terminal_area(row) => {
-                self.text_selection = self.document_position(column, row).map(TextSelection::new);
+            MouseAction::LeftDown { column, row } if self.mouse_over_return_bottom(column, row) => {
+                self.scroll = 0;
+                self.text_selection = None;
+                self.input_selection = None;
+                self.terminal_focused = false;
             }
-            MouseAction::LeftDown { .. } => self.text_selection = None,
+            MouseAction::LeftDown { column, row } if !self.mouse_over_terminal_area(row) => {
+                self.terminal_focused = false;
+                if let Some(byte_index) = self.input_byte_index_from_mouse(column, row) {
+                    self.input.cursor = byte_index;
+                    self.input_selection = Some(InputSelection::new(byte_index));
+                    self.text_selection = None;
+                } else {
+                    self.input_selection = None;
+                    self.text_selection =
+                        self.document_position(column, row).map(TextSelection::new);
+                }
+            }
+            MouseAction::LeftDown { column, row } => {
+                self.text_selection = None;
+                self.input_selection = None;
+                self.terminal_focused = true;
+                if let Some(index) = self.terminal_tab_at(column, row) {
+                    self.active_terminal_tab = index;
+                    self.terminal_visible = true;
+                    self.run_notice = None;
+                }
+            }
             MouseAction::LeftDrag { column, row } => {
-                if let Some(position) = self.clamped_document_position(column, row)
+                if self
+                    .input_selection
+                    .is_some_and(|selection| selection.dragging)
+                {
+                    if let Some(byte_index) = self.clamped_input_byte_index_from_mouse(column, row)
+                        && let Some(selection) = &mut self.input_selection
+                    {
+                        selection.focus = byte_index;
+                        self.input.cursor = byte_index;
+                    }
+                } else if let Some(position) = self.clamped_document_position(column, row)
                     && let Some(selection) = &mut self.text_selection
                     && selection.dragging
                 {
@@ -784,7 +980,21 @@ impl App {
                 }
             }
             MouseAction::LeftUp { column, row } => {
-                if let Some(position) = self.clamped_document_position(column, row)
+                if self
+                    .input_selection
+                    .is_some_and(|selection| selection.dragging)
+                {
+                    if let Some(byte_index) = self.clamped_input_byte_index_from_mouse(column, row)
+                        && let Some(selection) = &mut self.input_selection
+                    {
+                        selection.focus = byte_index;
+                        selection.dragging = false;
+                        self.input.cursor = byte_index;
+                    }
+                    if self.input_selection_range().is_none() {
+                        self.input_selection = None;
+                    }
+                } else if let Some(position) = self.clamped_document_position(column, row)
                     && let Some(selection) = &mut self.text_selection
                     && selection.dragging
                 {
@@ -830,12 +1040,88 @@ impl App {
         })
     }
 
+    fn input_byte_index_from_mouse(&self, column: u16, row: u16) -> Option<usize> {
+        if !self.input_mouse_enabled() {
+            return None;
+        }
+        let position = self.document_position(column, row)?;
+        self.input_byte_index_at_document_position(position)
+    }
+
+    fn input_byte_index_at_document_position(&self, position: TextPosition) -> Option<usize> {
+        let input_row = position.row.checked_sub(self.input_body_top_row)?;
+        if input_row >= self.input_body_rows {
+            return None;
+        }
+
+        let input_column = position.column.saturating_sub(4) as usize;
+        Some(self.input.visual_position_byte_index(
+            input_row as usize,
+            input_column,
+            self.input_content_width as usize,
+        ))
+    }
+
+    fn clamped_input_byte_index_from_mouse(&self, column: u16, row: u16) -> Option<usize> {
+        if !self.input_mouse_enabled() || self.document_height == 0 || self.input_body_rows == 0 {
+            return None;
+        }
+
+        let document_row = self
+            .document_top_row
+            .saturating_add(row.min(self.document_height.saturating_sub(1)));
+        let first_input_row = self.input_body_top_row;
+        let last_input_row = first_input_row.saturating_add(self.input_body_rows - 1);
+        let clamped_row = document_row.clamp(first_input_row, last_input_row);
+        let input_column = if document_row < first_input_row {
+            0
+        } else if document_row > last_input_row {
+            self.input_content_width as usize
+        } else {
+            column.saturating_sub(4) as usize
+        };
+
+        Some(self.input.visual_position_byte_index(
+            (clamped_row - first_input_row) as usize,
+            input_column,
+            self.input_content_width as usize,
+        ))
+    }
+
+    fn input_mouse_enabled(&self) -> bool {
+        self.status == AgentStatus::Idle
+            && self.approval.is_none()
+            && self.model_picker.is_none()
+            && self.resume_picker.is_none()
+            && self.status_view.is_none()
+    }
+
+    fn mouse_over_return_bottom(&self, column: u16, row: u16) -> bool {
+        self.return_bottom_button.is_some_and(|button| {
+            row == button.row && column >= button.start_column && column < button.end_column
+        })
+    }
+
     fn mouse_over_terminal(&self, row: u16) -> bool {
         self.mouse_over_terminal_area(row) && !self.terminal_tabs.is_empty()
     }
 
     fn mouse_over_terminal_area(&self, row: u16) -> bool {
         self.terminal_visible && row >= self.terminal_top_row
+    }
+
+    fn terminal_tab_at(&self, column: u16, row: u16) -> Option<usize> {
+        let hitbox = self.terminal_tab_hitbox?;
+        if row < hitbox.start_row
+            || row >= hitbox.end_row
+            || column < hitbox.start_column
+            || column >= hitbox.end_column
+        {
+            return None;
+        }
+
+        let index = hitbox.first_tab + (row - hitbox.start_row) as usize;
+        (index < hitbox.tab_count).then_some(index)
     }
 
     fn toggle_terminal(&mut self) {
@@ -862,10 +1148,7 @@ impl App {
     fn new_terminal_tab(&mut self) {
         if self.create_terminal_tab() {
             self.terminal_visible = true;
-            self.run_notice = Some(format!(
-                "Terminal tab {} created.",
-                self.active_terminal_tab + 1
-            ));
+            self.run_notice = None;
         }
     }
 
@@ -882,12 +1165,12 @@ impl App {
             self.active_terminal_tab = 0;
             self.terminal_visible = false;
             self.terminal_focused = false;
-            self.run_notice = Some("Terminal closed. Bash is active.".to_owned());
+            self.run_notice = None;
             return;
         }
 
         self.active_terminal_tab = index.min(self.terminal_tabs.len() - 1);
-        self.run_notice = Some("Terminal tab closed.".to_owned());
+        self.run_notice = None;
     }
 
     fn create_terminal_tab(&mut self) -> bool {
@@ -912,7 +1195,7 @@ impl App {
         }
         self.active_terminal_tab = index;
         self.terminal_visible = true;
-        self.run_notice = Some(format!("Terminal tab {} selected.", index + 1));
+        self.run_notice = None;
     }
 
     fn run_new_session(&mut self) {
@@ -981,6 +1264,7 @@ impl App {
 
     fn submit(&mut self) {
         let prompt = self.input.take_trimmed();
+        self.input_selection = None;
         if prompt.is_empty() {
             return;
         }
@@ -1405,9 +1689,15 @@ mod tests {
             terminal_visible: false,
             terminal_focused: false,
             text_selection: None,
+            input_selection: None,
             terminal_top_row: 0,
             document_top_row: 0,
             document_height: 0,
+            input_body_top_row: 0,
+            input_body_rows: 0,
+            input_content_width: 1,
+            return_bottom_button: None,
+            terminal_tab_hitbox: None,
             turn_started_at: None,
             last_turn_duration: None,
             runtime: SessionRuntime::test_empty(
@@ -1455,6 +1745,204 @@ mod tests {
 
         app.update(AppEvent::Mouse(MouseAction::LeftDown { column: 2, row: 5 }));
 
+        assert!(app.text_selection.is_none());
+    }
+
+    #[test]
+    fn mouse_down_in_document_area_focuses_chat() {
+        let mut app = app();
+        app.terminal_visible = true;
+        app.terminal_focused = true;
+        app.set_terminal_top_row(10);
+        app.set_document_viewport(10, 0);
+
+        app.update(AppEvent::Mouse(MouseAction::LeftDown { column: 2, row: 3 }));
+
+        assert!(!app.terminal_focused);
+        assert!(app.text_selection.is_some());
+    }
+
+    #[test]
+    fn mouse_down_in_terminal_area_focuses_terminal() {
+        let mut app = app();
+        app.terminal_visible = true;
+        app.terminal_focused = false;
+        app.text_selection = Some(TextSelection {
+            anchor: TextPosition { row: 1, column: 1 },
+            focus: TextPosition { row: 2, column: 2 },
+            dragging: false,
+        });
+        app.input_selection = Some(InputSelection {
+            anchor: 1,
+            focus: 3,
+            dragging: false,
+        });
+        app.set_terminal_top_row(10);
+        app.set_document_viewport(10, 0);
+
+        app.update(AppEvent::Mouse(MouseAction::LeftDown {
+            column: 2,
+            row: 11,
+        }));
+
+        assert!(app.terminal_focused);
+        assert!(app.text_selection.is_none());
+        assert!(app.input_selection.is_none());
+    }
+
+    #[test]
+    fn mouse_down_on_terminal_tab_selects_that_tab() {
+        let mut app = app();
+        app.terminal_visible = true;
+        app.active_terminal_tab = 0;
+        app.set_terminal_top_row(10);
+        app.set_terminal_tab_hitbox(Some((11, 14, 1, 13, 1, 4)));
+
+        app.update(AppEvent::Mouse(MouseAction::LeftDown {
+            column: 4,
+            row: 12,
+        }));
+
+        assert!(app.terminal_focused);
+        assert_eq!(app.active_terminal_tab, 2);
+        assert!(app.run_notice.is_none());
+    }
+
+    #[test]
+    fn mouse_down_in_terminal_content_does_not_switch_tabs() {
+        let mut app = app();
+        app.terminal_visible = true;
+        app.active_terminal_tab = 1;
+        app.set_terminal_top_row(10);
+        app.set_terminal_tab_hitbox(Some((11, 14, 1, 13, 1, 4)));
+
+        app.update(AppEvent::Mouse(MouseAction::LeftDown {
+            column: 20,
+            row: 12,
+        }));
+
+        assert!(app.terminal_focused);
+        assert_eq!(app.active_terminal_tab, 1);
+        assert!(app.run_notice.is_none());
+    }
+
+    #[test]
+    fn mouse_down_in_input_moves_cursor_without_starting_selection() {
+        let mut app = app();
+        app.input.set("hello");
+        app.terminal_focused = true;
+        app.set_document_viewport(20, 0);
+        app.set_input_hitbox(3, 1, 80);
+
+        app.update(AppEvent::Mouse(MouseAction::LeftDown { column: 7, row: 3 }));
+
+        assert_eq!(app.input.cursor, 3);
+        assert!(!app.terminal_focused);
+        assert!(app.text_selection.is_none());
+    }
+
+    #[test]
+    fn mouse_down_in_wrapped_input_moves_cursor_to_visual_row() {
+        let mut app = app();
+        app.input.set("abcdef");
+        app.set_document_viewport(20, 0);
+        app.set_input_hitbox(3, 2, 3);
+
+        app.update(AppEvent::Mouse(MouseAction::LeftDown { column: 5, row: 4 }));
+
+        assert_eq!(app.input.cursor, 4);
+        assert!(app.text_selection.is_none());
+    }
+
+    #[test]
+    fn mouse_drag_in_input_selects_text() {
+        let mut app = app();
+        app.input.set("hello");
+        app.set_document_viewport(20, 0);
+        app.set_input_hitbox(3, 1, 80);
+
+        app.update(AppEvent::Mouse(MouseAction::LeftDown { column: 5, row: 3 }));
+        app.update(AppEvent::Mouse(MouseAction::LeftDrag { column: 8, row: 3 }));
+        app.update(AppEvent::Mouse(MouseAction::LeftUp { column: 8, row: 3 }));
+
+        assert_eq!(app.selected_input_text().as_deref(), Some("ell"));
+        assert_eq!(app.input.cursor, 4);
+        assert!(app.text_selection.is_none());
+    }
+
+    #[test]
+    fn delete_key_removes_input_selection() {
+        let mut app = app();
+        app.input.set("hello");
+        app.input_selection = Some(InputSelection {
+            anchor: 1,
+            focus: 4,
+            dragging: false,
+        });
+
+        app.update(AppEvent::Key(KeyInput {
+            action: KeyAction::Delete,
+            terminal_input: None,
+        }));
+
+        assert_eq!(app.input.value, "ho");
+        assert_eq!(app.input.cursor, 1);
+        assert!(app.input_selection.is_none());
+    }
+
+    #[test]
+    fn typed_character_replaces_input_selection() {
+        let mut app = app();
+        app.input.set("hello");
+        app.input_selection = Some(InputSelection {
+            anchor: 1,
+            focus: 4,
+            dragging: false,
+        });
+
+        app.update(AppEvent::Key(KeyInput {
+            action: KeyAction::Char('i'),
+            terminal_input: None,
+        }));
+
+        assert_eq!(app.input.value, "hio");
+        assert_eq!(app.input.cursor, 2);
+        assert!(app.input_selection.is_none());
+    }
+
+    #[test]
+    fn cut_completion_deletes_input_selection() {
+        let mut app = app();
+        app.input.set("hello");
+        app.input_selection = Some(InputSelection {
+            anchor: 1,
+            focus: 4,
+            dragging: false,
+        });
+
+        app.finish_input_selection_cut();
+
+        assert_eq!(app.input.value, "ho");
+        assert!(app.run_notice.is_none());
+    }
+
+    #[test]
+    fn mouse_down_on_return_bottom_button_scrolls_to_bottom() {
+        let mut app = app();
+        app.scroll = 12;
+        app.text_selection = Some(TextSelection {
+            anchor: TextPosition { row: 2, column: 1 },
+            focus: TextPosition { row: 3, column: 4 },
+            dragging: false,
+        });
+        app.set_return_bottom_button_hitbox(Some((8, 20, 30)));
+
+        app.update(AppEvent::Mouse(MouseAction::LeftDown {
+            column: 24,
+            row: 8,
+        }));
+
+        assert_eq!(app.scroll, 0);
         assert!(app.text_selection.is_none());
     }
 

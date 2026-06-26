@@ -18,22 +18,33 @@ use ratatui::{
     layout::{Constraint, Layout, Position, Rect},
     style::Style,
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Clear, Paragraph},
 };
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, TextSelection};
 use crate::approval::ApprovalFocus;
+use crate::message::{Message, Role};
 
 use layout::box_top;
 use theme::{ACCENT_COLOR, BG_COLOR};
 
-pub use terminal::{terminal_content_width, terminal_height_for_app};
+pub use terminal::{terminal_content_width, terminal_height_for_app, terminal_tab_hitbox};
 
 struct Document {
     lines: Vec<Line<'static>>,
+    line_meta: Vec<DocumentLineMeta>,
     cursor_x: u16,
     cursor_y: u16,
+    input_body_y: u16,
+    input_body_rows: u16,
+    input_content_width: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DocumentLineMeta {
+    message_index: Option<usize>,
+    role: Option<Role>,
 }
 
 pub fn render(frame: &mut Frame, app: &App) {
@@ -62,6 +73,8 @@ fn render_document(frame: &mut Frame, app: &App, area: Rect) {
     let width = area.width.max(1);
     let mut document = document(app, width);
     let scroll = document_scroll_for_len(document.lines.len(), app.scroll, area.height);
+    let sticky_question = sticky_question_lines(app, &document, scroll, area.height, width);
+    let return_bottom_button_row = return_bottom_button_row(app.scroll, area.height);
     document.lines = apply_text_selection(document.lines, app.text_selection, width);
 
     frame.render_widget(
@@ -76,6 +89,23 @@ fn render_document(frame: &mut Frame, app: &App, area: Rect) {
             area.y + cursor_y,
         ));
     }
+    if let Some(lines) = sticky_question {
+        let sticky_height = (lines.len() as u16).min(area.height);
+        let sticky_area = Rect::new(area.x, area.y, area.width, sticky_height);
+        frame.render_widget(Clear, sticky_area);
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(BG_COLOR)),
+            sticky_area,
+        );
+    }
+    if let Some(button_row) = return_bottom_button_row
+        && let Some(line) = return_bottom_button_line(app, width)
+    {
+        frame.render_widget(
+            Paragraph::new(vec![line]).style(Style::default().bg(BG_COLOR)),
+            Rect::new(area.x, area.y + button_row, area.width, 1),
+        );
+    }
 }
 
 pub fn document_scroll_top(app: &App, width: u16, height: u16) -> u16 {
@@ -87,6 +117,22 @@ pub fn selected_text(app: &App, width: u16) -> Option<String> {
     let selection = app.text_selection?;
     let document = document(app, width.max(1));
     selected_text_from_lines(&document.lines, selection, width.max(1))
+}
+
+pub fn composer_hitbox(app: &App, width: u16) -> (u16, u16, u16) {
+    let document = document(app, width.max(1));
+    (
+        document.input_body_y,
+        document.input_body_rows,
+        document.input_content_width,
+    )
+}
+
+pub fn return_bottom_button_hitbox(app: &App, width: u16, height: u16) -> Option<(u16, u16, u16)> {
+    let width = width.max(1);
+    let row = return_bottom_button_row(app.scroll, height)?;
+    let (start, end) = return_bottom_button_columns(width.max(1));
+    Some((row, start, end))
 }
 
 fn visible_cursor_y(cursor_y: u16, scroll: u16, height: u16) -> Option<u16> {
@@ -105,11 +151,20 @@ fn document_scroll_for_len(line_count: usize, scroll_offset: u16, height: u16) -
 
 fn document(app: &App, width: u16) -> Document {
     let mut lines = dashboard::idle_panel_lines(app, width);
+    let mut line_meta = vec![DocumentLineMeta::default(); lines.len()];
     let has_status_line = app.processing_elapsed().is_some()
         || app.run_notice.is_some()
         || app.last_turn_duration().is_some();
 
-    lines.extend(transcript_view::transcript_lines(app, width));
+    for (message_index, message) in app.messages.iter().enumerate() {
+        let message_lines = transcript_view::message_lines(message, width);
+        let meta = DocumentLineMeta {
+            message_index: Some(message_index),
+            role: Some(message.role),
+        };
+        line_meta.extend(vec![meta; message_lines.len()]);
+        lines.extend(message_lines);
+    }
     if !app.messages.is_empty() && !has_status_line {
         lines.push(Line::from(""));
     }
@@ -147,11 +202,15 @@ fn document(app: &App, width: u16) -> Document {
     }
 
     let input_y = lines.len() as u16;
+    let input_rows = input_view::input_rows(app, width);
+    let input_body_y = input_y + 1;
+    let input_body_rows = input_rows.len() as u16;
+    let input_content_width = input_view::input_content_width(width) as u16;
     lines.push(box_top("COMPOSER", width));
     lines.extend(
-        input_view::input_rows(&app.input.value, width)
+        input_rows
             .into_iter()
-            .map(|row| layout::box_input_body(&row, width)),
+            .map(|row| layout::box_input_body_line(row, width)),
     );
     lines.push(layout::box_bottom(width));
     if app.model_picker.is_some() {
@@ -169,11 +228,95 @@ fn document(app: &App, width: u16) -> Document {
     let (input_cursor_x, input_cursor_row) = input_view::input_cursor_position(app, width);
     let (cursor_x, cursor_y) =
         approval_cursor.unwrap_or((input_cursor_x, input_y + input_cursor_row + 1));
+    line_meta.resize(lines.len(), DocumentLineMeta::default());
     Document {
         lines,
+        line_meta,
         cursor_x,
         cursor_y,
+        input_body_y,
+        input_body_rows,
+        input_content_width,
     }
+}
+
+fn sticky_question_lines(
+    app: &App,
+    document: &Document,
+    scroll: u16,
+    height: u16,
+    width: u16,
+) -> Option<Vec<Line<'static>>> {
+    let question_index = sticky_question_index(&app.messages, &document.line_meta, scroll, height)?;
+    let question = app.messages.get(question_index)?;
+
+    Some(sticky_question_block(question, width))
+}
+
+fn sticky_question_index(
+    messages: &[Message],
+    line_meta: &[DocumentLineMeta],
+    scroll: u16,
+    height: u16,
+) -> Option<usize> {
+    if height == 0 || line_meta.is_empty() {
+        return None;
+    }
+
+    let start = scroll as usize;
+    let end = (start + height as usize).min(line_meta.len());
+    let visible = line_meta.get(start..end)?;
+    if visible.iter().any(|meta| meta.role == Some(Role::User)) {
+        return None;
+    }
+
+    let current_message = visible.iter().find_map(|meta| match meta.role {
+        Some(Role::Assistant | Role::Tool) => meta.message_index,
+        _ => None,
+    })?;
+    messages[..current_message]
+        .iter()
+        .rposition(|message| message.role == Role::User)
+}
+
+fn sticky_question_block(message: &Message, width: u16) -> Vec<Line<'static>> {
+    let mut lines = transcript_view::message_lines(message, width);
+    if !lines.is_empty() {
+        lines.remove(0);
+    }
+    lines
+}
+
+const RETURN_BOTTOM_LABEL: &str = "↓ Bottom";
+
+fn return_bottom_button_line(app: &App, width: u16) -> Option<Line<'static>> {
+    if app.scroll == 0 {
+        return None;
+    }
+    let (start, _) = return_bottom_button_columns(width);
+    let button = return_bottom_button_text();
+    Some(Line::from(vec![
+        Span::raw(" ".repeat(start as usize)),
+        Span::styled(button, Style::default().fg(BG_COLOR).bg(ACCENT_COLOR)),
+    ]))
+}
+
+fn return_bottom_button_row(scroll_offset_from_bottom: u16, height: u16) -> Option<u16> {
+    if scroll_offset_from_bottom == 0 || height == 0 {
+        return None;
+    }
+
+    Some(height - 1)
+}
+
+fn return_bottom_button_columns(width: u16) -> (u16, u16) {
+    let button_width = return_bottom_button_text().width() as u16;
+    let start = width.saturating_sub(button_width) / 2;
+    (start, (start + button_width).min(width))
+}
+
+fn return_bottom_button_text() -> String {
+    format!(" {RETURN_BOTTOM_LABEL} ")
 }
 
 fn apply_text_selection(
@@ -345,7 +488,7 @@ mod tests {
     use super::format::{cached_suffix, context_bar_percent, context_usage_label};
     use super::layout::truncate_start_to_width;
     use super::model_picker::price_label;
-    use super::terminal::{terminal_footer, terminal_tab_window_start};
+    use super::terminal::{terminal_footer, terminal_tab_hitbox_for, terminal_tab_window_start};
     use super::theme::KEY_HINT_COLOR;
     use super::transcript_view::tool_output_preview;
     use super::*;
@@ -403,6 +546,16 @@ mod tests {
     fn terminal_tab_window_tracks_active_tab() {
         assert_eq!(terminal_tab_window_start(0, 3, 6), 0);
         assert_eq!(terminal_tab_window_start(6, 10, 4), 4);
+    }
+
+    #[test]
+    fn terminal_tab_hitbox_tracks_visible_tab_rows() {
+        assert_eq!(
+            terminal_tab_hitbox_for(6, 10, 20, 80, 6),
+            Some((21, 25, 1, 13, 4, 10))
+        );
+        assert_eq!(terminal_tab_hitbox_for(0, 0, 20, 80, 6), None);
+        assert_eq!(terminal_tab_hitbox_for(0, 3, 20, 30, 6), None);
     }
 
     #[test]
@@ -474,6 +627,77 @@ mod tests {
     }
 
     #[test]
+    fn sticky_question_pins_visible_reply_question() {
+        let messages = vec![
+            Message::user("first question"),
+            Message::assistant("first answer"),
+            Message::user("second question"),
+            Message::assistant("second answer"),
+        ];
+        let meta = vec![
+            message_meta(0, Role::User),
+            message_meta(1, Role::Assistant),
+            message_meta(1, Role::Assistant),
+            message_meta(2, Role::User),
+            message_meta(3, Role::Assistant),
+            message_meta(3, Role::Assistant),
+        ];
+
+        assert_eq!(sticky_question_index(&messages, &meta, 1, 2), Some(0));
+        assert_eq!(sticky_question_index(&messages, &meta, 4, 2), Some(2));
+    }
+
+    #[test]
+    fn sticky_question_hides_when_question_is_visible() {
+        let messages = vec![
+            Message::user("first question"),
+            Message::assistant("first answer"),
+            Message::user("second question"),
+            Message::assistant("second answer"),
+        ];
+        let meta = vec![
+            message_meta(0, Role::User),
+            message_meta(1, Role::Assistant),
+            message_meta(1, Role::Assistant),
+            message_meta(2, Role::User),
+            message_meta(3, Role::Assistant),
+        ];
+
+        assert_eq!(sticky_question_index(&messages, &meta, 0, 2), None);
+        assert_eq!(sticky_question_index(&messages, &meta, 3, 2), None);
+    }
+
+    #[test]
+    fn sticky_question_uses_user_message_block_without_leading_gap() {
+        let message = Message::user("first question\nsecond line");
+        let sticky = sticky_question_block(&message, 40);
+        let expected = transcript_view::message_lines(&message, 40)
+            .into_iter()
+            .skip(1)
+            .collect::<Vec<_>>();
+
+        assert_eq!(sticky, expected);
+        assert_eq!(line_text(&sticky[1]), "  ▶ first question");
+        assert_eq!(line_text(&sticky[2]), "    second line");
+    }
+
+    #[test]
+    fn return_bottom_button_stays_on_bottom_row() {
+        assert_eq!(return_bottom_button_row(2, 10), Some(9));
+        assert_eq!(return_bottom_button_row(0, 10), None);
+        assert_eq!(return_bottom_button_row(2, 0), None);
+    }
+
+    #[test]
+    fn return_bottom_button_columns_are_centered() {
+        let button_width = return_bottom_button_text().width() as u16;
+        let (start, end) = return_bottom_button_columns(40);
+
+        assert_eq!(start, (40 - button_width) / 2);
+        assert_eq!(end, start + button_width);
+    }
+
+    #[test]
     fn selected_text_extracts_multiline_rendered_text() {
         let lines = vec![
             Line::from("zero"),
@@ -503,5 +727,19 @@ mod tests {
         };
 
         assert_eq!(selected_text_from_lines(&lines, selection, 20), None);
+    }
+
+    fn message_meta(message_index: usize, role: Role) -> DocumentLineMeta {
+        DocumentLineMeta {
+            message_index: Some(message_index),
+            role: Some(role),
+        }
+    }
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 }
