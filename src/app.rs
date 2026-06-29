@@ -25,6 +25,9 @@ use crate::{
     transcript::{TranscriptSessionSummary, WorkspaceUsageStats},
 };
 
+#[cfg(test)]
+use crate::config::{LlmConfig, LlmProviderConfig, LspConfig, ModelCatalog};
+
 pub struct App {
     pub should_quit: bool,
     pub messages: Vec<Message>,
@@ -235,6 +238,71 @@ impl App {
             last_turn_duration: None,
             runtime,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_empty() -> Self {
+        Self {
+            should_quit: false,
+            messages: Vec::new(),
+            input: InputState::default(),
+            status: AgentStatus::Idle,
+            scroll: 0,
+            usage: ConversationUsage::default(),
+            slash_command_selection: 0,
+            model_picker: None,
+            resume_picker: None,
+            status_view: None,
+            config: Config {
+                llm: LlmConfig {
+                    provider: "test".to_owned(),
+                    base_url: "http://localhost".to_owned(),
+                    model: "test-model".to_owned(),
+                    providers: vec![LlmProviderConfig {
+                        name: "test".to_owned(),
+                        base_url: "http://localhost".to_owned(),
+                        models: vec!["test-model".to_owned()],
+                        model_context_windows: Default::default(),
+                        api_key_env: "TEST_API_KEY".to_owned(),
+                        prompt_cache: Default::default(),
+                    }],
+                    temperature: 0.0,
+                    max_tokens: 100,
+                    context_window: Some(1000),
+                    api_key: "test-key".to_owned(),
+                    default_context_window: Some(1000),
+                    prompt_cache: Default::default(),
+                },
+                model_catalog: ModelCatalog::default(),
+                lsp: LspConfig::default(),
+                system_prompt: "system".to_owned(),
+            },
+            current_dir: "/workspace".to_owned(),
+            agent_activity: None,
+            run_notice: None,
+            approval: None,
+            terminal_tabs: Vec::new(),
+            active_terminal_tab: 0,
+            terminal_init_error: None,
+            terminal_visible: false,
+            terminal_focused: false,
+            text_selection: None,
+            input_selection: None,
+            terminal_top_row: 0,
+            document_top_row: 0,
+            document_height: 0,
+            input_body_top_row: 0,
+            input_body_rows: 0,
+            input_content_width: 1,
+            return_bottom_button: None,
+            terminal_tab_hitbox: None,
+            turn_started_at: None,
+            last_turn_duration: None,
+            runtime: SessionRuntime::test_empty(
+                std::env::temp_dir().join(format!("glint-app-test-{}.jsonl", uuid::Uuid::new_v4())),
+                "/workspace".to_owned(),
+            ),
+        }
     }
 
     pub fn update(&mut self, event: AppEvent) {
@@ -1044,17 +1112,12 @@ impl App {
         if !self.input_mouse_enabled() {
             return None;
         }
-        let position = self.document_position(column, row)?;
-        self.input_byte_index_at_document_position(position)
-    }
-
-    fn input_byte_index_at_document_position(&self, position: TextPosition) -> Option<usize> {
-        let input_row = position.row.checked_sub(self.input_body_top_row)?;
+        let input_row = row.checked_sub(self.input_body_top_row)?;
         if input_row >= self.input_body_rows {
             return None;
         }
 
-        let input_column = position.column.saturating_sub(4) as usize;
+        let input_column = column.saturating_sub(4) as usize;
         Some(self.input.visual_position_byte_index(
             input_row as usize,
             input_column,
@@ -1063,19 +1126,16 @@ impl App {
     }
 
     fn clamped_input_byte_index_from_mouse(&self, column: u16, row: u16) -> Option<usize> {
-        if !self.input_mouse_enabled() || self.document_height == 0 || self.input_body_rows == 0 {
+        if !self.input_mouse_enabled() || self.input_body_rows == 0 {
             return None;
         }
 
-        let document_row = self
-            .document_top_row
-            .saturating_add(row.min(self.document_height.saturating_sub(1)));
         let first_input_row = self.input_body_top_row;
         let last_input_row = first_input_row.saturating_add(self.input_body_rows - 1);
-        let clamped_row = document_row.clamp(first_input_row, last_input_row);
-        let input_column = if document_row < first_input_row {
+        let clamped_row = row.clamp(first_input_row, last_input_row);
+        let input_column = if row < first_input_row {
             0
-        } else if document_row > last_input_row {
+        } else if row > last_input_row {
             self.input_content_width as usize
         } else {
             column.saturating_sub(4) as usize
@@ -1634,77 +1694,12 @@ fn home_relative_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        agent::should_auto_compact,
-        commands::SLASH_COMMANDS,
-        config::{LlmConfig, LlmProviderConfig, ModelCatalog},
-        runtime::SessionRuntime,
-    };
+    use crate::{agent::should_auto_compact, commands::SLASH_COMMANDS};
 
     use super::*;
 
     fn app() -> App {
-        App {
-            should_quit: false,
-            messages: Vec::new(),
-            input: InputState::default(),
-            status: AgentStatus::Idle,
-            scroll: 0,
-            usage: ConversationUsage::default(),
-            slash_command_selection: 0,
-            model_picker: None,
-            resume_picker: None,
-            status_view: None,
-            config: Config {
-                llm: LlmConfig {
-                    provider: "test".to_owned(),
-                    base_url: "http://localhost".to_owned(),
-                    model: "test-model".to_owned(),
-                    providers: vec![LlmProviderConfig {
-                        name: "test".to_owned(),
-                        base_url: "http://localhost".to_owned(),
-                        models: vec!["test-model".to_owned()],
-                        model_context_windows: Default::default(),
-                        api_key_env: "TEST_API_KEY".to_owned(),
-                        prompt_cache: Default::default(),
-                    }],
-                    temperature: 0.0,
-                    max_tokens: 100,
-                    context_window: Some(1000),
-                    api_key: "test-key".to_owned(),
-                    default_context_window: Some(1000),
-                    prompt_cache: Default::default(),
-                },
-                model_catalog: ModelCatalog::default(),
-                lsp: crate::config::LspConfig::default(),
-                system_prompt: "system".to_owned(),
-            },
-            current_dir: "/workspace".to_owned(),
-            agent_activity: None,
-            run_notice: None,
-            approval: None,
-            terminal_tabs: Vec::new(),
-            active_terminal_tab: 0,
-            terminal_init_error: None,
-            terminal_visible: false,
-            terminal_focused: false,
-            text_selection: None,
-            input_selection: None,
-            terminal_top_row: 0,
-            document_top_row: 0,
-            document_height: 0,
-            input_body_top_row: 0,
-            input_body_rows: 0,
-            input_content_width: 1,
-            return_bottom_button: None,
-            terminal_tab_hitbox: None,
-            turn_started_at: None,
-            last_turn_duration: None,
-            runtime: SessionRuntime::test_empty(
-                std::env::temp_dir().join(format!("glint-app-test-{}.jsonl", uuid::Uuid::new_v4())),
-                "/workspace".to_owned(),
-            ),
-        }
+        App::test_empty()
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::app::{App, ModelPickerStage};
 
 use super::{format::unit_suffix, layout::pad_to_width, theme::*};
 
-pub(super) fn model_picker_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
+pub(super) fn model_picker_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let Some(picker) = &app.model_picker else {
         return Vec::new();
     };
@@ -25,6 +25,7 @@ pub(super) fn model_picker_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         )),
         model_picker_help_line(picker.stage),
+        picker_separator_line(width),
     ];
 
     match picker.stage {
@@ -104,6 +105,13 @@ pub(super) fn model_picker_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+fn picker_separator_line(width: u16) -> Line<'static> {
+    Line::from(Span::styled(
+        "─".repeat(width.max(1) as usize),
+        Style::default().fg(MUTED_TEXT_COLOR),
+    ))
 }
 
 fn model_picker_help_line(stage: ModelPickerStage) -> Line<'static> {

@@ -1,8 +1,6 @@
 use ratatui::{
-    Frame,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -12,9 +10,13 @@ use super::{
     format::age_label, format::now, layout::pad_to_width, layout::truncate_end_to_width, theme::*,
 };
 
-pub(super) fn render_resume_picker(frame: &mut Frame, picker: &ResumePicker) {
-    let width = frame.area().width.max(1) as usize;
-    let height = frame.area().height as usize;
+pub(super) fn resume_picker_lines(
+    picker: &ResumePicker,
+    width: u16,
+    height: usize,
+) -> Vec<Line<'static>> {
+    let width = width.max(1) as usize;
+    let height = height.max(1);
     let now = now();
     let mut lines = Vec::new();
 
@@ -24,15 +26,16 @@ pub(super) fn render_resume_picker(frame: &mut Frame, picker: &ResumePicker) {
             .fg(ACCENT_COLOR)
             .add_modifier(Modifier::BOLD),
     )));
-    lines.push(Line::from(""));
-
+    lines.push(picker_separator_line(width));
     let footer_rows = 2;
     let list_height = height.saturating_sub(lines.len() + footer_rows);
     if picker.sessions.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "No saved sessions for this workspace",
-            Style::default().fg(MUTED_TEXT_COLOR),
-        )));
+        if list_height > 0 {
+            lines.push(Line::from(Span::styled(
+                "No saved sessions for this workspace",
+                Style::default().fg(MUTED_TEXT_COLOR),
+            )));
+        }
     } else if list_height > 0 {
         let start = resume_window_start(picker.selected, picker.sessions.len(), list_height);
         let end = (start + list_height).min(picker.sessions.len());
@@ -67,23 +70,30 @@ pub(super) fn render_resume_picker(frame: &mut Frame, picker: &ResumePicker) {
         }
     }
 
-    while lines.len() + footer_rows < height {
-        lines.push(Line::from(""));
+    if lines.len() + footer_rows <= height {
+        lines.push(Line::from(Span::styled(
+            "─".repeat(width),
+            Style::default().fg(MUTED_TEXT_COLOR),
+        )));
+        lines.push(Line::from(vec![
+            Span::styled("Enter", Style::default().fg(KEY_HINT_COLOR)),
+            Span::styled(" select  ", Style::default().fg(MUTED_TEXT_COLOR)),
+            Span::styled("↑/↓ ←/→", Style::default().fg(KEY_HINT_COLOR)),
+            Span::styled(" switch  ", Style::default().fg(MUTED_TEXT_COLOR)),
+            Span::styled("Esc", Style::default().fg(KEY_HINT_COLOR)),
+            Span::styled(" exit", Style::default().fg(MUTED_TEXT_COLOR)),
+        ]));
     }
-    lines.push(Line::from(Span::styled(
+
+    lines.truncate(height);
+    lines
+}
+
+fn picker_separator_line(width: usize) -> Line<'static> {
+    Line::from(Span::styled(
         "─".repeat(width),
         Style::default().fg(MUTED_TEXT_COLOR),
-    )));
-    lines.push(Line::from(vec![
-        Span::styled("Enter", Style::default().fg(KEY_HINT_COLOR)),
-        Span::styled(" select  ", Style::default().fg(MUTED_TEXT_COLOR)),
-        Span::styled("↑/↓ ←/→", Style::default().fg(KEY_HINT_COLOR)),
-        Span::styled(" switch  ", Style::default().fg(MUTED_TEXT_COLOR)),
-        Span::styled("Esc", Style::default().fg(KEY_HINT_COLOR)),
-        Span::styled(" exit", Style::default().fg(MUTED_TEXT_COLOR)),
-    ]));
-
-    frame.render_widget(Paragraph::new(lines), frame.area());
+    ))
 }
 
 fn resume_window_start(selected: usize, len: usize, height: usize) -> usize {

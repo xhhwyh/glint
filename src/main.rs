@@ -78,11 +78,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         }
         app.update_terminal();
         app.set_document_viewport(
-            document_height,
+            ui::document_viewport_height(&app, size.width, document_height),
             ui::document_scroll_top(&app, size.width, document_height),
         );
         let (input_top_row, input_rows, input_content_width) =
-            ui::composer_hitbox(&app, size.width);
+            ui::composer_hitbox(&app, size.width, document_height);
         app.set_input_hitbox(input_top_row, input_rows, input_content_width);
         app.set_return_bottom_button_hitbox(ui::return_bottom_button_hitbox(
             &app,

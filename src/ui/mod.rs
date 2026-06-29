@@ -34,11 +34,16 @@ pub use terminal::{terminal_content_width, terminal_height_for_app, terminal_tab
 struct Document {
     lines: Vec<Line<'static>>,
     line_meta: Vec<DocumentLineMeta>,
-    cursor_x: u16,
-    cursor_y: u16,
+    cursor: Option<(u16, u16)>,
+}
+
+struct Composer {
+    lines: Vec<Line<'static>>,
     input_body_y: u16,
     input_body_rows: u16,
     input_content_width: u16,
+    cursor_x: u16,
+    cursor_y: u16,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -52,11 +57,6 @@ pub fn render(frame: &mut Frame, app: &App) {
         status::render_status_view(frame, app, view);
         return;
     }
-    if let Some(picker) = &app.resume_picker {
-        resume::render_resume_picker(frame, picker);
-        return;
-    }
-
     let terminal_height = terminal::terminal_height_for_app(app, frame.area().height);
     if terminal_height == 0 {
         render_document(frame, app, frame.area());
@@ -72,45 +72,89 @@ pub fn render(frame: &mut Frame, app: &App) {
 fn render_document(frame: &mut Frame, app: &App, area: Rect) {
     let width = area.width.max(1);
     let mut document = document(app, width);
-    let scroll = document_scroll_for_len(document.lines.len(), app.scroll, area.height);
-    let sticky_question = sticky_question_lines(app, &document, scroll, area.height, width);
-    let return_bottom_button_row = return_bottom_button_row(app.scroll, area.height);
+    let composer = composer(app, width);
+    let composer_height = composer_visible_height(&composer, area.height);
+    let document_height = area.height.saturating_sub(composer_height);
+    let document_area = Rect::new(area.x, area.y, area.width, document_height);
+    let composer_area = Rect::new(
+        area.x,
+        area.y + document_height,
+        area.width,
+        composer_height,
+    );
+    let scroll = document_scroll_for_len(document.lines.len(), app.scroll, document_height);
+    let sticky_question = sticky_question_lines(app, &document, scroll, document_height, width);
+    let return_bottom_button_row = return_bottom_button_row(app.scroll, document_height);
     document.lines = apply_text_selection(document.lines, app.text_selection, width);
 
+    if document_height > 0 {
+        frame.render_widget(
+            Paragraph::new(document.lines)
+                .scroll((scroll, 0))
+                .style(Style::default().bg(BG_COLOR)),
+            document_area,
+        );
+        if let Some((cursor_x, cursor_y)) = document.cursor
+            && let Some(visible_y) = visible_cursor_y(cursor_y, scroll, document_height)
+        {
+            frame.set_cursor_position(Position::new(
+                document_area.x + cursor_x.min(width.saturating_sub(1)),
+                document_area.y + visible_y,
+            ));
+        }
+        if let Some(lines) = sticky_question {
+            let sticky_height = (lines.len() as u16).min(document_height);
+            let sticky_area = Rect::new(area.x, area.y, area.width, sticky_height);
+            frame.render_widget(Clear, sticky_area);
+            frame.render_widget(
+                Paragraph::new(lines).style(Style::default().bg(BG_COLOR)),
+                sticky_area,
+            );
+        }
+        if let Some(button_row) = return_bottom_button_row
+            && let Some(line) = return_bottom_button_line(app, width)
+        {
+            frame.render_widget(
+                Paragraph::new(vec![line]).style(Style::default().bg(BG_COLOR)),
+                Rect::new(area.x, area.y + button_row, area.width, 1),
+            );
+        }
+    }
+
+    render_composer(frame, &composer, composer_area, document.cursor.is_none());
+}
+
+fn render_composer(frame: &mut Frame, composer: &Composer, area: Rect, show_cursor: bool) {
+    if area.height == 0 {
+        return;
+    }
+
+    let scroll = composer_scroll_for_height(composer.lines.len(), area.height);
     frame.render_widget(
-        Paragraph::new(document.lines)
+        Paragraph::new(composer.lines.clone())
             .scroll((scroll, 0))
             .style(Style::default().bg(BG_COLOR)),
         area,
     );
-    if let Some(cursor_y) = visible_cursor_y(document.cursor_y, scroll, area.height) {
+    if show_cursor && let Some(cursor_y) = visible_cursor_y(composer.cursor_y, scroll, area.height)
+    {
+        let width = area.width.max(1);
         frame.set_cursor_position(Position::new(
-            area.x + document.cursor_x.min(width.saturating_sub(1)),
+            area.x + composer.cursor_x.min(width.saturating_sub(1)),
             area.y + cursor_y,
         ));
-    }
-    if let Some(lines) = sticky_question {
-        let sticky_height = (lines.len() as u16).min(area.height);
-        let sticky_area = Rect::new(area.x, area.y, area.width, sticky_height);
-        frame.render_widget(Clear, sticky_area);
-        frame.render_widget(
-            Paragraph::new(lines).style(Style::default().bg(BG_COLOR)),
-            sticky_area,
-        );
-    }
-    if let Some(button_row) = return_bottom_button_row
-        && let Some(line) = return_bottom_button_line(app, width)
-    {
-        frame.render_widget(
-            Paragraph::new(vec![line]).style(Style::default().bg(BG_COLOR)),
-            Rect::new(area.x, area.y + button_row, area.width, 1),
-        );
     }
 }
 
 pub fn document_scroll_top(app: &App, width: u16, height: u16) -> u16 {
+    let viewport_height = document_viewport_height(app, width, height);
     let document = document(app, width.max(1));
-    document_scroll_for_len(document.lines.len(), app.scroll, height)
+    document_scroll_for_len(document.lines.len(), app.scroll, viewport_height)
+}
+
+pub fn document_viewport_height(app: &App, width: u16, height: u16) -> u16 {
+    let composer = composer(app, width.max(1));
+    height.saturating_sub(composer_visible_height(&composer, height))
 }
 
 pub fn selected_text(app: &App, width: u16) -> Option<String> {
@@ -119,20 +163,56 @@ pub fn selected_text(app: &App, width: u16) -> Option<String> {
     selected_text_from_lines(&document.lines, selection, width.max(1))
 }
 
-pub fn composer_hitbox(app: &App, width: u16) -> (u16, u16, u16) {
-    let document = document(app, width.max(1));
-    (
-        document.input_body_y,
-        document.input_body_rows,
-        document.input_content_width,
-    )
+pub fn composer_hitbox(app: &App, width: u16, height: u16) -> (u16, u16, u16) {
+    let composer = composer(app, width.max(1));
+    composer_input_hitbox_for_height(&composer, height)
 }
 
 pub fn return_bottom_button_hitbox(app: &App, width: u16, height: u16) -> Option<(u16, u16, u16)> {
     let width = width.max(1);
-    let row = return_bottom_button_row(app.scroll, height)?;
+    let document_height = document_viewport_height(app, width, height);
+    let row = return_bottom_button_row(app.scroll, document_height)?;
     let (start, end) = return_bottom_button_columns(width.max(1));
     Some((row, start, end))
+}
+
+fn composer_visible_height(composer: &Composer, height: u16) -> u16 {
+    (composer.lines.len() as u16).min(height)
+}
+
+fn composer_scroll_for_height(line_count: usize, height: u16) -> u16 {
+    line_count.saturating_sub(height as usize) as u16
+}
+
+fn composer_panel_top(composer: &Composer, height: u16) -> u16 {
+    height.saturating_sub(composer_visible_height(composer, height))
+}
+
+fn composer_input_hitbox_for_height(composer: &Composer, height: u16) -> (u16, u16, u16) {
+    let visible_height = composer_visible_height(composer, height);
+    if visible_height == 0 {
+        return (height, 0, composer.input_content_width);
+    }
+
+    let scroll = composer_scroll_for_height(composer.lines.len(), visible_height);
+    let visible_start = scroll as usize;
+    let visible_end = visible_start + visible_height as usize;
+    let input_start = composer.input_body_y as usize;
+    let input_end = input_start + composer.input_body_rows as usize;
+    let visible_input_start = input_start.max(visible_start);
+    let visible_input_end = input_end.min(visible_end);
+
+    if visible_input_end <= visible_input_start {
+        return (height, 0, composer.input_content_width);
+    }
+
+    let row = composer_panel_top(composer, height)
+        + visible_input_start.saturating_sub(visible_start) as u16;
+    (
+        row,
+        (visible_input_end - visible_input_start) as u16,
+        composer.input_content_width,
+    )
 }
 
 fn visible_cursor_y(cursor_y: u16, scroll: u16, height: u16) -> Option<u16> {
@@ -201,6 +281,16 @@ fn document(app: &App, width: u16) -> Document {
         lines.push(Line::from(""));
     }
 
+    line_meta.resize(lines.len(), DocumentLineMeta::default());
+    Document {
+        lines,
+        line_meta,
+        cursor: approval_cursor,
+    }
+}
+
+fn composer(app: &App, width: u16) -> Composer {
+    let mut lines = composer_overlay_lines(app, width);
     let input_y = lines.len() as u16;
     let input_rows = input_view::input_rows(app, width);
     let input_body_y = input_y + 1;
@@ -213,31 +303,40 @@ fn document(app: &App, width: u16) -> Document {
             .map(|row| layout::box_input_body_line(row, width)),
     );
     lines.push(layout::box_bottom(width));
-    if app.model_picker.is_some() {
-        lines.extend(model_picker::model_picker_lines(app, width));
-    } else if app.slash_menu_visible() {
-        lines.extend(input_view::slash_command_lines(app, width));
-    } else {
-        lines.push(status_bar::info_line(app, width));
-        lines.push(status_bar::context_line(app, width));
-        if let Some(line) = status_bar::permission_line(app) {
-            lines.push(line);
-        }
-    }
+    lines.extend(composer_status_lines(app, width));
 
     let (input_cursor_x, input_cursor_row) = input_view::input_cursor_position(app, width);
-    let (cursor_x, cursor_y) =
-        approval_cursor.unwrap_or((input_cursor_x, input_y + input_cursor_row + 1));
-    line_meta.resize(lines.len(), DocumentLineMeta::default());
-    Document {
+    Composer {
         lines,
-        line_meta,
-        cursor_x,
-        cursor_y,
         input_body_y,
         input_body_rows,
         input_content_width,
+        cursor_x: input_cursor_x,
+        cursor_y: input_body_y + input_cursor_row,
     }
+}
+
+fn composer_overlay_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    if let Some(picker) = &app.resume_picker {
+        resume::resume_picker_lines(picker, width, 8)
+    } else if app.model_picker.is_some() {
+        model_picker::model_picker_lines(app, width)
+    } else if app.slash_menu_visible() {
+        input_view::slash_command_lines(app, width)
+    } else {
+        Vec::new()
+    }
+}
+
+fn composer_status_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        status_bar::info_line(app, width),
+        status_bar::context_line(app, width),
+    ];
+    if let Some(line) = status_bar::permission_line(app) {
+        lines.push(line);
+    }
+    lines
 }
 
 fn sticky_question_lines(
@@ -492,7 +591,7 @@ mod tests {
     use super::theme::KEY_HINT_COLOR;
     use super::transcript_view::tool_output_preview;
     use super::*;
-    use crate::app::TextPosition;
+    use crate::app::{ModelPicker, ModelPickerStage, ResumePicker, TextPosition};
     use ratatui::style::{Color, Modifier};
 
     #[test]
@@ -585,6 +684,149 @@ mod tests {
         assert_eq!(visible_cursor_y(2, 5, 20), None);
         assert_eq!(visible_cursor_y(30, 1, 12), None);
         assert_eq!(visible_cursor_y(10, 10, 0), None);
+    }
+
+    #[test]
+    fn fixed_composer_reserves_viewport_height() {
+        let app = crate::app::App::test_empty();
+        let composer = composer(&app, 80);
+
+        assert_eq!(
+            document_viewport_height(&app, 80, 20),
+            20 - composer.lines.len() as u16
+        );
+        assert_eq!(
+            composer_hitbox(&app, 80, 20),
+            (
+                20 - composer.lines.len() as u16 + composer.input_body_y,
+                composer.input_body_rows,
+                composer.input_content_width
+            )
+        );
+    }
+
+    #[test]
+    fn slash_commands_render_above_bottom_input_box() {
+        let mut app = crate::app::App::test_empty();
+        app.input.set("/");
+        let lines = composer(&app, 80).lines;
+        let texts = lines.iter().map(line_text).collect::<Vec<_>>();
+        let slash_row = texts
+            .iter()
+            .position(|line| line.contains("/archive"))
+            .expect("slash command row");
+        let composer_row = texts
+            .iter()
+            .position(|line| line.contains(" COMPOSER "))
+            .expect("composer row");
+        let status_row = texts
+            .iter()
+            .position(|line| line.contains("Context "))
+            .expect("status row");
+
+        assert!(slash_row < composer_row);
+        assert!(composer_row < status_row);
+    }
+
+    #[test]
+    fn model_picker_renders_above_bottom_input_box() {
+        let mut app = crate::app::App::test_empty();
+        app.model_picker = Some(ModelPicker {
+            stage: ModelPickerStage::Provider,
+            selected_provider: 0,
+            selected_model: 0,
+        });
+        let lines = composer(&app, 80).lines;
+        let texts = lines.iter().map(line_text).collect::<Vec<_>>();
+        let picker_row = texts
+            .iter()
+            .position(|line| line.contains("Select Provider"))
+            .expect("model picker row");
+        let help_row = texts
+            .iter()
+            .position(|line| line.contains("Choose a provider endpoint"))
+            .expect("model picker help row");
+        let separator_row = texts[help_row + 1..]
+            .iter()
+            .position(|line| line.starts_with("─"))
+            .map(|offset| help_row + 1 + offset)
+            .expect("model picker separator row");
+        let provider_row = texts
+            .iter()
+            .position(|line| line.contains("test"))
+            .expect("provider row");
+        let composer_row = texts
+            .iter()
+            .position(|line| line.contains(" COMPOSER "))
+            .expect("composer row");
+        let status_row = texts
+            .iter()
+            .position(|line| line.contains("Context "))
+            .expect("status row");
+
+        assert!(picker_row < composer_row);
+        assert!(help_row < separator_row);
+        assert!(separator_row < provider_row);
+        assert!(composer_row < status_row);
+    }
+
+    #[test]
+    fn resume_picker_renders_above_bottom_input_box() {
+        let mut app = crate::app::App::test_empty();
+        app.resume_picker = Some(ResumePicker {
+            sessions: Vec::new(),
+            selected: 0,
+        });
+        let lines = composer(&app, 80).lines;
+        let texts = lines.iter().map(line_text).collect::<Vec<_>>();
+        let picker_row = texts
+            .iter()
+            .position(|line| line.contains("Resume a session"))
+            .expect("resume picker row");
+        let separator_row = texts[picker_row + 1..]
+            .iter()
+            .position(|line| line.starts_with("─"))
+            .map(|offset| picker_row + 1 + offset)
+            .expect("resume picker separator row");
+        let empty_row = texts
+            .iter()
+            .position(|line| line.contains("No saved sessions"))
+            .expect("empty resume row");
+        let composer_row = texts
+            .iter()
+            .position(|line| line.contains(" COMPOSER "))
+            .expect("composer row");
+        let status_row = texts
+            .iter()
+            .position(|line| line.contains("Context "))
+            .expect("status row");
+
+        assert!(picker_row < composer_row);
+        assert!(picker_row < separator_row);
+        assert!(separator_row < empty_row);
+        assert!(composer_row < status_row);
+    }
+
+    #[test]
+    fn status_lines_stay_below_input_box() {
+        let app = crate::app::App::test_empty();
+        let lines = composer(&app, 80).lines;
+        let texts = lines.iter().map(line_text).collect::<Vec<_>>();
+        let composer_row = texts
+            .iter()
+            .position(|line| line.contains(" COMPOSER "))
+            .expect("composer row");
+        let input_bottom_row = texts
+            .iter()
+            .position(|line| line.starts_with("╰"))
+            .expect("input bottom row");
+        let status_row = texts
+            .iter()
+            .position(|line| line.contains("test-model · test"))
+            .expect("status row");
+
+        assert!(composer_row < input_bottom_row);
+        assert!(input_bottom_row < status_row);
     }
 
     #[test]

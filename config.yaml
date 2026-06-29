@@ -8,7 +8,7 @@ llm:
     deepseek:
       description: DeepSeek official OpenAI-compatible endpoint
       base_url: https://api.deepseek.com
-      unit: RMB
+      unit: CNY
       models:
         - name: deepseek-v4-flash
           positioning: Fast general-purpose DeepSeek-style chat
@@ -28,6 +28,7 @@ llm:
     volcengine:
       description: Volcengine Ark endpoint for hosted model deployments
       base_url: https://ark.cn-beijing.volces.com/api/v3
+      unit: CNY
       models:
         - name: doubao-seed-2-1-pro-260628
           input: 6.00
@@ -70,7 +71,7 @@ llm:
     zhipu:
       description: Zhipu GLM endpoint for general Chinese and bilingual work
       base_url: https://open.bigmodel.cn/api/paas/v4/
-      unit: RMB
+      unit: CNY
       models:
         - name: glm-5.2
           input: 8.00
@@ -128,7 +129,7 @@ llm:
     dashscope:
       description: Alibaba DashScope compatible-mode endpoint for Qwen models
       base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-      unit: RMB
+      unit: CNY
       models:
         - name: qwen3.7-max
           input: 12.00

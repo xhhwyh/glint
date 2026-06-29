@@ -20,9 +20,9 @@ pub enum SlashCommandKind {
 
 pub const SLASH_COMMANDS: [SlashCommand; 9] = [
     SlashCommand {
-        name: "/new",
-        description: "Start a fresh session",
-        kind: SlashCommandKind::New,
+        name: "/archive",
+        description: "Archive this session",
+        kind: SlashCommandKind::Archive,
     },
     SlashCommand {
         name: "/clear",
@@ -30,9 +30,9 @@ pub const SLASH_COMMANDS: [SlashCommand; 9] = [
         kind: SlashCommandKind::Clear,
     },
     SlashCommand {
-        name: "/archive",
-        description: "Archive this session",
-        kind: SlashCommandKind::Archive,
+        name: "/compact",
+        description: "Summarize earlier conversation and continue compacted",
+        kind: SlashCommandKind::Compact,
     },
     SlashCommand {
         name: "/delete",
@@ -40,24 +40,24 @@ pub const SLASH_COMMANDS: [SlashCommand; 9] = [
         kind: SlashCommandKind::Delete,
     },
     SlashCommand {
-        name: "/status",
-        description: "Open runtime, usage, and workspace statistics",
-        kind: SlashCommandKind::Status,
-    },
-    SlashCommand {
-        name: "/compact",
-        description: "Summarize earlier conversation and continue compacted",
-        kind: SlashCommandKind::Compact,
-    },
-    SlashCommand {
         name: "/model",
         description: "Switch provider and model",
         kind: SlashCommandKind::Model,
     },
     SlashCommand {
+        name: "/new",
+        description: "Start a fresh session",
+        kind: SlashCommandKind::New,
+    },
+    SlashCommand {
         name: "/resume",
         description: "Resume a saved session",
         kind: SlashCommandKind::Resume,
+    },
+    SlashCommand {
+        name: "/status",
+        description: "Open runtime, usage, and workspace statistics",
+        kind: SlashCommandKind::Status,
     },
     SlashCommand {
         name: "/terminal",
@@ -71,4 +71,21 @@ pub fn matching_slash_commands(query: &str) -> Vec<SlashCommand> {
         .into_iter()
         .filter(|command| command.name[1..].starts_with(query))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slash_commands_are_sorted_by_name() {
+        let names = SLASH_COMMANDS
+            .iter()
+            .map(|command| command.name)
+            .collect::<Vec<_>>();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+
+        assert_eq!(names, sorted);
+    }
 }
