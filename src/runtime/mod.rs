@@ -14,6 +14,7 @@ use crate::{
     config::{LlmConfig, LspConfig},
     message::Message,
     services::lsp::LspManager,
+    tasks::{self, SubagentOutcome, SubagentRequest, TaskManager, TaskSnapshot},
     terminal::TerminalRequest,
     tools::{ReadFileState, ShellToolMode},
     transcript::{
@@ -132,6 +133,7 @@ pub struct SessionRuntime {
     runtime_time_label: String,
     conversation_permissions: ConversationPermissions,
     read_file_state: ReadFileState,
+    task_manager: TaskManager,
     pending_prompt_after_compact: Option<String>,
     auto_compact_failures: u8,
 }
@@ -163,6 +165,7 @@ impl SessionRuntime {
             runtime_time_label: crate::context::current_time_label(),
             conversation_permissions: ConversationPermissions::default(),
             read_file_state: ReadFileState::new(),
+            task_manager: TaskManager::default(),
             pending_prompt_after_compact: None,
             auto_compact_failures: 0,
         }
@@ -255,6 +258,72 @@ impl SessionRuntime {
         self.terminal_requests.try_recv().ok()
     }
 
+    pub fn task_snapshots(&self) -> Vec<TaskSnapshot> {
+        self.task_manager.snapshots()
+    }
+
+    pub fn terminal_request_sender(&self) -> Sender<TerminalRequest> {
+        self.terminal_request_tx.clone()
+    }
+
+    pub fn lsp_manager(&self) -> LspManager {
+        self.lsp_manager.clone()
+    }
+
+    pub fn read_file_state(&self) -> ReadFileState {
+        self.read_file_state.clone()
+    }
+
+    pub fn tool_results_dir(&self) -> PathBuf {
+        self.transcript.tool_results_dir()
+    }
+
+    pub fn start_subagent_task(
+        &mut self,
+        request: &SubagentRequest,
+        terminal_tab: usize,
+    ) -> Result<TaskSnapshot, String> {
+        let task = self.task_manager.start_subagent(request, terminal_tab)?;
+        self.transcript
+            .append_subagent_started(
+                task.id.clone(),
+                task.description.clone(),
+                task.backend.label().to_owned(),
+                task.cwd.clone(),
+            )
+            .ok();
+        Ok(task)
+    }
+
+    pub fn finish_subagent_task(
+        &mut self,
+        task_id: &str,
+        outcome: SubagentOutcome,
+    ) -> Option<TaskSnapshot> {
+        let task = self.task_manager.finish_subagent(task_id, outcome)?;
+        self.transcript
+            .append_subagent_finished(
+                task.id.clone(),
+                task.status.label().to_owned(),
+                task.summary.clone(),
+                task.error.clone(),
+            )
+            .ok();
+        self.transcript
+            .append_hidden_user(tasks::task_model_context_message(&task))
+            .ok();
+        Some(task)
+    }
+
+    pub fn terminal_tab_has_running_task(&self, terminal_tab: usize) -> bool {
+        self.task_manager
+            .terminal_tab_has_running_task(terminal_tab)
+    }
+
+    pub fn handle_terminal_tab_closed(&mut self, closed_index: usize) {
+        self.task_manager.handle_terminal_tab_closed(closed_index);
+    }
+
     pub fn handle_command(&mut self, command: RuntimeCommand) -> RuntimeEvent {
         match command {
             RuntimeCommand::StartManualCompact {
@@ -286,7 +355,7 @@ impl SessionRuntime {
         provider: String,
         model: String,
     ) {
-        self.append_user(user);
+        self.transcript.append_user(user).ok();
         self.record_assistant(AssistantRecord {
             content: assistant,
             provider,
@@ -430,7 +499,7 @@ impl SessionRuntime {
                 config.llm.model.clone(),
             )
             .ok();
-        self.append_user(prompt.clone());
+        self.transcript.append_user(prompt.clone()).ok();
 
         let (control_tx, control_rx) = mpsc::channel();
         self.agent_control_tx = Some(control_tx);
@@ -494,10 +563,6 @@ impl SessionRuntime {
         }
     }
 
-    fn append_user(&mut self, content: String) {
-        self.transcript.append_user(content).ok();
-    }
-
     fn reset_agent_channel(&mut self) {
         let (agent_tx, agent_events) = mpsc::channel();
         self.agent_tx = agent_tx;
@@ -555,4 +620,44 @@ fn usage_from_transcript(transcript: &TranscriptStore) -> ConversationUsage {
 
 fn percent(value: u64, total: u64) -> u8 {
     (value.saturating_mul(100) / total).min(100) as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tasks::SubagentBackend;
+
+    fn runtime() -> SessionRuntime {
+        SessionRuntime::test_empty(
+            std::env::temp_dir().join(format!("glint-runtime-test-{}.jsonl", uuid::Uuid::new_v4())),
+            "/workspace".to_owned(),
+        )
+    }
+
+    fn subagent_request() -> SubagentRequest {
+        SubagentRequest {
+            task_id: "a1".to_owned(),
+            description: "inspect parser".to_owned(),
+            prompt: "look at parser".to_owned(),
+            backend: SubagentBackend::Codex,
+            cwd: "/workspace".to_owned(),
+        }
+    }
+
+    #[test]
+    fn subagent_outcome_is_model_visible_but_not_ui_visible() {
+        let mut runtime = runtime();
+        let request = subagent_request();
+        runtime.start_subagent_task(&request, 0).unwrap();
+        runtime
+            .finish_subagent_task("a1", SubagentOutcome::completed("done"))
+            .unwrap();
+
+        assert!(runtime.ui_messages().is_empty());
+        let history = runtime.model_history();
+        assert_eq!(history.len(), 1);
+        let content = history[0].content.as_deref().unwrap_or_default();
+        assert!(content.contains("<subagent-outcome>"));
+        assert!(content.contains("<result>done</result>"));
+    }
 }

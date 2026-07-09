@@ -1,5 +1,6 @@
 use std::{
     path::{Path, PathBuf},
+    sync::mpsc::Receiver,
     time::{Duration, Instant},
 };
 
@@ -7,8 +8,9 @@ use anyhow::Result;
 
 use crate::{
     agent::{
-        AgentEvent, AgentStatus, TokenUsage,
+        AgentEvent, AgentRunInput, AgentStatus, TokenUsage,
         provider::{FinishReason, ToolCall},
+        spawn_subagent_loop,
     },
     approval::{ApprovalFocus, ApprovalPrompt},
     commands::{SlashCommand, SlashCommandKind, matching_slash_commands},
@@ -20,7 +22,10 @@ use crate::{
         AssistantRecord, ConversationUsage, LoadedTranscript, RuntimeCommand, RuntimeEvent,
         SessionRuntime, StartPromptConfig,
     },
-    terminal::{TerminalRequest, TerminalRunResult, TerminalTab},
+    tasks::{self, SubagentOutcome, SubagentRequest, SubagentStartResponse, TaskSnapshot},
+    terminal::{
+        TerminalMouseScroll, TerminalRequest, TerminalRunResult, TerminalStatus, TerminalTab,
+    },
     tools::ShellToolMode,
     transcript::{TranscriptSessionSummary, WorkspaceUsageStats},
 };
@@ -49,9 +54,13 @@ pub struct App {
     pub terminal_init_error: Option<String>,
     pub terminal_visible: bool,
     pub terminal_focused: bool,
+    pub terminal_tab_switcher: Option<TerminalTabSwitcher>,
     pub text_selection: Option<TextSelection>,
     input_selection: Option<InputSelection>,
     terminal_top_row: u16,
+    terminal_body_rows: u16,
+    terminal_content_column: u16,
+    terminal_content_width: u16,
     document_top_row: u16,
     document_height: u16,
     input_body_top_row: u16,
@@ -59,9 +68,16 @@ pub struct App {
     input_content_width: u16,
     return_bottom_button: Option<ReturnBottomButton>,
     terminal_tab_hitbox: Option<TerminalTabHitbox>,
+    pending_subagent_results: Vec<PendingSubagentRun>,
     turn_started_at: Option<Instant>,
     last_turn_duration: Option<Duration>,
     runtime: SessionRuntime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalTabSwitcher {
+    pub candidate: usize,
+    pub window_start: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,13 +104,22 @@ pub struct StatusView {
     pub tab: StatusTab,
     pub stats: WorkspaceUsageStats,
     pub error: Option<String>,
+    pub selected_task: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatusTab {
     General,
     Usage,
+    Tasks,
     Stat,
+}
+
+struct PendingSubagentRun {
+    task_id: String,
+    terminal_tab: usize,
+    events: Receiver<AgentEvent>,
+    outcome: Receiver<SubagentOutcome>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -133,6 +158,9 @@ struct TerminalTabHitbox {
     first_tab: usize,
     tab_count: usize,
 }
+
+const TERMINAL_SWITCHER_CARD_WIDTH: u16 = 28;
+const TERMINAL_SWITCHER_CARD_GAP: u16 = 1;
 
 impl TextSelection {
     fn new(position: TextPosition) -> Self {
@@ -181,14 +209,16 @@ impl StatusTab {
         match self {
             Self::General => Self::Stat,
             Self::Usage => Self::General,
-            Self::Stat => Self::Usage,
+            Self::Tasks => Self::Usage,
+            Self::Stat => Self::Tasks,
         }
     }
 
     fn next(self) -> Self {
         match self {
             Self::General => Self::Usage,
-            Self::Usage => Self::Stat,
+            Self::Usage => Self::Tasks,
+            Self::Tasks => Self::Stat,
             Self::Stat => Self::General,
         }
     }
@@ -224,9 +254,13 @@ impl App {
             terminal_init_error: None,
             terminal_visible: false,
             terminal_focused: false,
+            terminal_tab_switcher: None,
             text_selection: None,
             input_selection: None,
             terminal_top_row: 0,
+            terminal_body_rows: 0,
+            terminal_content_column: 0,
+            terminal_content_width: 1,
             document_top_row: 0,
             document_height: 0,
             input_body_top_row: 0,
@@ -234,6 +268,7 @@ impl App {
             input_content_width: 1,
             return_bottom_button: None,
             terminal_tab_hitbox: None,
+            pending_subagent_results: Vec::new(),
             turn_started_at: None,
             last_turn_duration: None,
             runtime,
@@ -286,9 +321,13 @@ impl App {
             terminal_init_error: None,
             terminal_visible: false,
             terminal_focused: false,
+            terminal_tab_switcher: None,
             text_selection: None,
             input_selection: None,
             terminal_top_row: 0,
+            terminal_body_rows: 0,
+            terminal_content_column: 0,
+            terminal_content_width: 1,
             document_top_row: 0,
             document_height: 0,
             input_body_top_row: 0,
@@ -296,6 +335,7 @@ impl App {
             input_content_width: 1,
             return_bottom_button: None,
             terminal_tab_hitbox: None,
+            pending_subagent_results: Vec::new(),
             turn_started_at: None,
             last_turn_duration: None,
             runtime: SessionRuntime::test_empty(
@@ -331,6 +371,10 @@ impl App {
         self.runtime.conversation_permissions().edit_always_allowed
     }
 
+    pub fn task_snapshots(&self) -> Vec<TaskSnapshot> {
+        self.runtime.task_snapshots()
+    }
+
     pub fn update_terminal(&mut self) {
         for tab in &mut self.terminal_tabs {
             tab.tick();
@@ -344,8 +388,10 @@ impl App {
                     timeout,
                     response,
                 } => {
-                    if let Some(tab) = self.active_terminal_tab_mut() {
-                        tab.run_noninteractive(command, description, timeout, response);
+                    if let Some(tab_index) = self.terminal_run_tab_index() {
+                        if let Some(tab) = self.terminal_tabs.get_mut(tab_index) {
+                            tab.run_noninteractive(command, description, timeout, response);
+                        }
                     } else {
                         response
                             .send(TerminalRunResult::failed(
@@ -356,6 +402,9 @@ impl App {
                             ))
                             .ok();
                     }
+                }
+                TerminalRequest::StartSubagent { request, response } => {
+                    self.start_subagent_terminal(request, response);
                 }
                 TerminalRequest::CancelActive => {
                     for tab in &mut self.terminal_tabs {
@@ -368,6 +417,216 @@ impl App {
         for tab in &mut self.terminal_tabs {
             tab.tick();
         }
+        self.drain_subagent_results();
+    }
+
+    fn terminal_run_tab_index(&mut self) -> Option<usize> {
+        if self
+            .terminal_tabs
+            .get(self.active_terminal_tab)
+            .is_some_and(TerminalTab::is_pty)
+        {
+            return Some(self.active_terminal_tab);
+        }
+        if let Some(index) = self.terminal_tabs.iter().position(TerminalTab::is_pty) {
+            return Some(index);
+        }
+        match TerminalTab::new_agent() {
+            Ok(tab) => {
+                self.terminal_tabs.push(tab);
+                self.terminal_init_error = None;
+                Some(self.terminal_tabs.len() - 1)
+            }
+            Err(error) => {
+                self.terminal_init_error = Some(format!("{error:#}"));
+                None
+            }
+        }
+    }
+
+    fn start_subagent_terminal(
+        &mut self,
+        request: SubagentRequest,
+        response: std::sync::mpsc::Sender<SubagentStartResponse>,
+    ) {
+        let terminal_tab = self.terminal_tabs.len();
+        let task = match self.runtime.start_subagent_task(&request, terminal_tab) {
+            Ok(task) => task,
+            Err(error) => {
+                response
+                    .send(SubagentStartResponse::failed(request.task_id, error))
+                    .ok();
+                return;
+            }
+        };
+
+        let mut tab = TerminalTab::new_subagent(subagent_terminal_title(&task));
+        tab.append_subagent_message(Message::user(request.prompt.clone()));
+        self.terminal_tabs.push(tab);
+        self.active_terminal_tab = terminal_tab;
+        self.terminal_visible = true;
+        self.terminal_focused = false;
+        self.run_notice = Some(format!("Started Codex subagent {}.", task.id));
+        self.messages
+            .push(Message::assistant(tasks::task_started_message(&task)));
+
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+        let config = self.start_prompt_config();
+        spawn_subagent_loop(
+            AgentRunInput {
+                llm: config.llm,
+                system_prompt: config.system_prompt,
+                runtime_context: crate::context::RuntimeContext::subagent_with_time(
+                    crate::context::current_time_label(),
+                    request.cwd.clone(),
+                ),
+                conversation_permissions: Default::default(),
+                conversation: Vec::new(),
+                current_user_message: request.prompt,
+                tool_results_dir: self.runtime.tool_results_dir(),
+                terminal_requests: self.runtime.terminal_request_sender(),
+                shell_tool_mode: ShellToolMode::TerminalRun,
+                read_file_state: self.runtime.read_file_state(),
+                lsp_manager: self.runtime.lsp_manager(),
+            },
+            event_tx,
+            outcome_tx,
+        );
+        self.pending_subagent_results.push(PendingSubagentRun {
+            task_id: task.id.clone(),
+            terminal_tab,
+            events: event_rx,
+            outcome: outcome_rx,
+        });
+        response
+            .send(SubagentStartResponse::started(task.id, terminal_tab))
+            .ok();
+    }
+
+    fn drain_subagent_results(&mut self) {
+        let mut index = 0;
+        while index < self.pending_subagent_results.len() {
+            let terminal_tab = self.pending_subagent_results[index].terminal_tab;
+            while let Ok(event) = self.pending_subagent_results[index].events.try_recv() {
+                self.update_subagent_tab_event(terminal_tab, event);
+            }
+
+            match self.pending_subagent_results[index].outcome.try_recv() {
+                Ok(outcome) => {
+                    let pending = self.pending_subagent_results.remove(index);
+                    self.finish_subagent_result(pending.task_id, pending.terminal_tab, outcome);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    index += 1;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    let pending = self.pending_subagent_results.remove(index);
+                    self.finish_subagent_result(
+                        pending.task_id,
+                        pending.terminal_tab,
+                        SubagentOutcome::failed("subagent result channel closed", ""),
+                    );
+                }
+            }
+        }
+    }
+
+    fn update_subagent_tab_event(&mut self, terminal_tab: usize, event: AgentEvent) {
+        let Some(tab) = self.terminal_tabs.get_mut(terminal_tab) else {
+            return;
+        };
+        match event {
+            AgentEvent::Started => {
+                tab.set_subagent_activity(Some("Thinking".to_owned()));
+                tab.append_subagent_message(Message::assistant(""));
+            }
+            AgentEvent::AssistantDelta(delta) => {
+                tab.set_subagent_activity(None);
+                tab.append_subagent_assistant_delta(&delta);
+            }
+            AgentEvent::AssistantTurn { .. } => {}
+            AgentEvent::ToolStarted {
+                id,
+                name,
+                input_summary,
+                input_description,
+            } => {
+                tab.set_subagent_activity(Some(format!("Running {name}: {input_summary}")));
+                tab.remove_empty_subagent_assistant_tail();
+                tab.append_subagent_message(Message::tool_with_description(
+                    id,
+                    name,
+                    input_summary,
+                    input_description,
+                ));
+            }
+            AgentEvent::ToolFinished {
+                id,
+                name,
+                output,
+                output_summary,
+                ..
+            } => {
+                tab.set_subagent_activity(Some(format!("Finished {name}: {output_summary}")));
+                if name == "Read" {
+                    if let Some(message) = tab.subagent_tool_message_mut(&id) {
+                        message.tool_finished = true;
+                    }
+                    return;
+                }
+                if let Some(message) = tab.subagent_tool_message_mut(&id) {
+                    message.content = output;
+                    message.tool_finished = true;
+                }
+            }
+            AgentEvent::ToolApprovalRequested(request) => {
+                tab.set_subagent_activity(Some(format!(
+                    "Approval unavailable: {}",
+                    request.command
+                )));
+            }
+            AgentEvent::ConversationPermissionChanged { .. } => {}
+            AgentEvent::CompactStarted
+            | AgentEvent::CompactFinished { .. }
+            | AgentEvent::CompactFailed(_) => {}
+            AgentEvent::AssistantFinished => {
+                tab.set_subagent_activity(None);
+            }
+            AgentEvent::Failed(error) => {
+                tab.set_subagent_activity(None);
+                tab.remove_empty_subagent_assistant_tail();
+                tab.append_subagent_assistant_delta(&error);
+                tab.finish_subagent(TerminalStatus::Error(error));
+            }
+        }
+    }
+
+    fn finish_subagent_result(
+        &mut self,
+        task_id: String,
+        terminal_tab: usize,
+        outcome: SubagentOutcome,
+    ) {
+        let Some(task) = self.runtime.finish_subagent_task(&task_id, outcome) else {
+            return;
+        };
+        if let Some(tab) = self.terminal_tabs.get_mut(terminal_tab) {
+            let status = match task.status {
+                tasks::TaskStatus::Completed => TerminalStatus::Idle,
+                tasks::TaskStatus::Cancelled => TerminalStatus::TimedOut,
+                tasks::TaskStatus::Failed => TerminalStatus::Error(
+                    task.error
+                        .clone()
+                        .unwrap_or_else(|| "subagent failed".to_owned()),
+                ),
+                tasks::TaskStatus::Queued | tasks::TaskStatus::Running => TerminalStatus::Running {
+                    description: format!("Codex subagent {}", task.id),
+                },
+            };
+            tab.finish_subagent(status);
+        }
+        self.run_notice = Some(tasks::task_finished_message(&task));
     }
 
     pub fn resize_terminal(&mut self, rows: u16, cols: u16) {
@@ -378,6 +637,17 @@ impl App {
 
     pub fn set_terminal_top_row(&mut self, row: u16) {
         self.terminal_top_row = row;
+    }
+
+    pub fn set_terminal_content_geometry(
+        &mut self,
+        body_rows: u16,
+        content_column: u16,
+        content_width: u16,
+    ) {
+        self.terminal_body_rows = body_rows;
+        self.terminal_content_column = content_column;
+        self.terminal_content_width = content_width.max(1);
     }
 
     pub fn set_document_viewport(&mut self, height: u16, top_row: u16) {
@@ -454,6 +724,10 @@ impl App {
         self.should_quit = true;
     }
 
+    pub fn should_defer_key_to_terminal(&self, key: &KeyInput) -> bool {
+        self.terminal_focused && key.terminal_input.is_some()
+    }
+
     pub fn active_terminal_tab(&self) -> Option<&TerminalTab> {
         self.terminal_tabs.get(self.active_terminal_tab)
     }
@@ -482,6 +756,20 @@ impl App {
         }
         if action == KeyAction::ToggleTerminalFocus && self.terminal_visible {
             self.terminal_focused = !self.terminal_focused;
+            if !self.terminal_focused {
+                self.terminal_tab_switcher = None;
+            }
+            return;
+        }
+        if self.terminal_focused && self.handle_terminal_switcher_key(action) {
+            return;
+        }
+        if self.terminal_focused
+            && self.terminal_tab_switcher.is_none()
+            && action == KeyAction::CtrlDown
+            && !self.terminal_tabs.is_empty()
+        {
+            self.open_terminal_tab_switcher();
             return;
         }
         if self.terminal_focused && self.write_terminal_key(&key) {
@@ -569,6 +857,8 @@ impl App {
             | KeyAction::Cut
             | KeyAction::Left
             | KeyAction::Right
+            | KeyAction::CtrlUp
+            | KeyAction::CtrlDown
             | KeyAction::Tab
             | KeyAction::Escape
             | KeyAction::ToggleTerminalFocus
@@ -606,6 +896,9 @@ impl App {
             return false;
         };
         if tab.is_running() {
+            if key.terminal_input.as_deref() == Some(&[0x03][..]) {
+                tab.cancel_active();
+            }
             return true;
         }
 
@@ -614,6 +907,60 @@ impl App {
             return true;
         }
         false
+    }
+
+    fn handle_terminal_switcher_key(&mut self, action: KeyAction) -> bool {
+        if self.terminal_tab_switcher.is_none() {
+            return false;
+        }
+        match action {
+            KeyAction::Left => self.move_terminal_tab_switcher(-1),
+            KeyAction::Right => self.move_terminal_tab_switcher(1),
+            KeyAction::CtrlUp | KeyAction::Submit => self.confirm_terminal_tab_switcher(),
+            KeyAction::Up | KeyAction::Down | KeyAction::CtrlDown => {}
+            KeyAction::Escape => self.terminal_tab_switcher = None,
+            _ => return false,
+        }
+        true
+    }
+
+    fn open_terminal_tab_switcher(&mut self) {
+        let len = self.terminal_tabs.len();
+        if len == 0 {
+            return;
+        }
+        let candidate = self.active_terminal_tab.min(len - 1);
+        let visible = self.visible_terminal_switcher_cards();
+        self.terminal_tab_switcher = Some(TerminalTabSwitcher {
+            candidate,
+            window_start: terminal_switcher_open_window_start(candidate, len, visible),
+        });
+    }
+
+    fn move_terminal_tab_switcher(&mut self, direction: isize) {
+        let len = self.terminal_tabs.len();
+        let visible = self.visible_terminal_switcher_cards();
+        let Some(switcher) = self.terminal_tab_switcher.as_mut() else {
+            return;
+        };
+        switcher.candidate = move_index(switcher.candidate, direction, len);
+        switcher.window_start =
+            terminal_switcher_window_start(switcher.window_start, switcher.candidate, len, visible);
+    }
+
+    fn confirm_terminal_tab_switcher(&mut self) {
+        let Some(switcher) = self.terminal_tab_switcher.take() else {
+            return;
+        };
+        self.select_terminal_tab(switcher.candidate);
+    }
+
+    fn visible_terminal_switcher_cards(&self) -> usize {
+        terminal_switcher_visible_cards_for_width(
+            self.terminal_content_width.saturating_add(4),
+            self.terminal_tabs.len(),
+        )
+        .max(1)
     }
 
     pub fn slash_query(&self) -> Option<&str> {
@@ -911,6 +1258,7 @@ impl App {
             tab: StatusTab::General,
             stats,
             error,
+            selected_task: 0,
         });
     }
 
@@ -919,6 +1267,9 @@ impl App {
             KeyAction::Escape => self.close_status_view(),
             KeyAction::Left => self.move_status_view(-1),
             KeyAction::Right | KeyAction::Tab => self.move_status_view(1),
+            KeyAction::Up => self.move_status_task_selection(-1),
+            KeyAction::Down => self.move_status_task_selection(1),
+            KeyAction::Submit => self.open_selected_status_task_terminal(),
             _ => {}
         }
     }
@@ -937,6 +1288,45 @@ impl App {
         } else {
             view.tab.next()
         };
+    }
+
+    fn move_status_task_selection(&mut self, direction: isize) {
+        let task_count = self.runtime.task_snapshots().len();
+        let Some(view) = self.status_view.as_mut() else {
+            return;
+        };
+        if view.tab != StatusTab::Tasks {
+            return;
+        }
+        view.selected_task = move_index(view.selected_task, direction, task_count);
+    }
+
+    fn open_selected_status_task_terminal(&mut self) {
+        let Some(view) = self.status_view.as_ref() else {
+            return;
+        };
+        if view.tab != StatusTab::Tasks {
+            return;
+        }
+        let Some(task) = self
+            .runtime
+            .task_snapshots()
+            .get(view.selected_task)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(tab) = task.terminal_tab else {
+            self.run_notice = Some(format!("Task {} has no terminal tab.", task.id));
+            return;
+        };
+        if tab >= self.terminal_tabs.len() {
+            self.run_notice = Some(format!("Task {} terminal tab is unavailable.", task.id));
+            return;
+        }
+        self.status_view = None;
+        self.input.set("");
+        self.select_terminal_tab(tab);
     }
 
     fn apply_loaded_transcript(&mut self, loaded: LoadedTranscript) {
@@ -1024,9 +1414,8 @@ impl App {
                 self.input_selection = None;
                 self.terminal_focused = true;
                 if let Some(index) = self.terminal_tab_at(column, row) {
-                    self.active_terminal_tab = index;
-                    self.terminal_visible = true;
-                    self.run_notice = None;
+                    self.terminal_tab_switcher = None;
+                    self.select_terminal_tab(index);
                 }
             }
             MouseAction::LeftDrag { column, row } => {
@@ -1070,12 +1459,28 @@ impl App {
                     selection.dragging = false;
                 }
             }
-            MouseAction::ScrollUp { row } if self.mouse_over_terminal(row) => {
+            MouseAction::ScrollUp { column, row }
+                if self.mouse_over_terminal_switcher(column, row) =>
+            {
+                self.move_terminal_tab_switcher(-1);
+            }
+            MouseAction::ScrollDown { column, row }
+                if self.mouse_over_terminal_switcher(column, row) =>
+            {
+                self.move_terminal_tab_switcher(1);
+            }
+            MouseAction::ScrollUp { column, row } if self.mouse_over_terminal(row) => {
+                if self.write_terminal_mouse_scroll(column, row, TerminalMouseScroll::Up) {
+                    return;
+                }
                 if let Some(tab) = self.active_terminal_tab_mut() {
                     tab.scroll_up(3);
                 }
             }
-            MouseAction::ScrollDown { row } if self.mouse_over_terminal(row) => {
+            MouseAction::ScrollDown { column, row } if self.mouse_over_terminal(row) => {
+                if self.write_terminal_mouse_scroll(column, row, TerminalMouseScroll::Down) {
+                    return;
+                }
                 if let Some(tab) = self.active_terminal_tab_mut() {
                     tab.scroll_down(3);
                 }
@@ -1180,8 +1585,50 @@ impl App {
             return None;
         }
 
-        let index = hitbox.first_tab + (row - hitbox.start_row) as usize;
-        (index < hitbox.tab_count).then_some(index)
+        let relative_column = column - hitbox.start_column;
+        let slot_width = TERMINAL_SWITCHER_CARD_WIDTH + TERMINAL_SWITCHER_CARD_GAP;
+        let slot = relative_column / slot_width;
+        let in_slot = relative_column % slot_width;
+        if slot as usize >= hitbox.tab_count || in_slot >= TERMINAL_SWITCHER_CARD_WIDTH {
+            return None;
+        }
+        let index = hitbox.first_tab + slot as usize;
+        (index < self.terminal_tabs.len()).then_some(index)
+    }
+
+    fn mouse_over_terminal_switcher(&self, column: u16, row: u16) -> bool {
+        self.terminal_tab_switcher.is_some()
+            && self.terminal_tab_hitbox.is_some_and(|hitbox| {
+                row >= hitbox.start_row
+                    && row < hitbox.end_row
+                    && column >= hitbox.start_column
+                    && column < hitbox.end_column
+            })
+    }
+
+    fn write_terminal_mouse_scroll(
+        &mut self,
+        column: u16,
+        row: u16,
+        direction: TerminalMouseScroll,
+    ) -> bool {
+        if !self.mouse_over_terminal_body(column, row) {
+            return false;
+        }
+
+        let Some(tab) = self.active_terminal_tab_mut() else {
+            return false;
+        };
+        tab.write_mouse_scroll(direction)
+    }
+
+    fn mouse_over_terminal_body(&self, column: u16, row: u16) -> bool {
+        let body_top_row = self.terminal_top_row.saturating_add(1);
+        let body_bottom_row = body_top_row.saturating_add(self.terminal_body_rows);
+        self.terminal_body_rows > 0
+            && row >= body_top_row
+            && row < body_bottom_row
+            && column >= self.terminal_content_column
     }
 
     fn toggle_terminal(&mut self) {
@@ -1193,6 +1640,7 @@ impl App {
             }
             self.terminal_visible = false;
             self.terminal_focused = false;
+            self.terminal_tab_switcher = None;
             self.run_notice = Some("Terminal hidden. Bash is active.".to_owned());
             return;
         }
@@ -1202,6 +1650,8 @@ impl App {
         }
 
         self.terminal_visible = true;
+        self.terminal_focused = true;
+        self.terminal_tab_switcher = None;
         self.run_notice = Some("Terminal visible. TerminalRun is active.".to_owned());
     }
 
@@ -1216,10 +1666,16 @@ impl App {
         if !self.terminal_visible || self.terminal_tabs.is_empty() {
             return;
         }
+        self.terminal_tab_switcher = None;
 
         let index = self.active_terminal_tab.min(self.terminal_tabs.len() - 1);
+        if self.runtime.terminal_tab_has_running_task(index) {
+            self.run_notice = Some("Codex subagent is running; cannot close this tab.".to_owned());
+            return;
+        }
         let tab = self.terminal_tabs.remove(index);
         tab.close();
+        self.runtime.handle_terminal_tab_closed(index);
 
         if self.terminal_tabs.is_empty() {
             self.active_terminal_tab = 0;
@@ -1238,6 +1694,7 @@ impl App {
             Ok(tab) => {
                 self.terminal_tabs.push(tab);
                 self.active_terminal_tab = self.terminal_tabs.len().saturating_sub(1);
+                self.terminal_tab_switcher = None;
                 self.terminal_init_error = None;
                 true
             }
@@ -1255,6 +1712,7 @@ impl App {
         }
         self.active_terminal_tab = index;
         self.terminal_visible = true;
+        self.terminal_tab_switcher = None;
         self.run_notice = None;
     }
 
@@ -1670,6 +2128,63 @@ fn move_index(index: usize, direction: isize, len: usize) -> usize {
     index.saturating_add_signed(direction).min(len - 1)
 }
 
+fn terminal_switcher_visible_cards_for_width(width: u16, tab_count: usize) -> usize {
+    if tab_count == 0 {
+        return 0;
+    }
+    let inner_width = width.saturating_sub(4).max(TERMINAL_SWITCHER_CARD_WIDTH);
+    let slot = TERMINAL_SWITCHER_CARD_WIDTH + TERMINAL_SWITCHER_CARD_GAP;
+    let visible = ((inner_width + TERMINAL_SWITCHER_CARD_GAP) / slot).max(1) as usize;
+    visible.min(tab_count)
+}
+
+fn terminal_switcher_open_window_start(candidate: usize, len: usize, visible: usize) -> usize {
+    let visible = visible.max(1);
+    if len <= visible {
+        return 0;
+    }
+    candidate.saturating_sub(1).min(len - visible)
+}
+
+fn terminal_switcher_window_start(
+    current_start: usize,
+    candidate: usize,
+    len: usize,
+    visible: usize,
+) -> usize {
+    let visible = visible.max(1);
+    if len <= visible {
+        return 0;
+    }
+    let max_start = len - visible;
+    if candidate < current_start {
+        candidate.min(max_start)
+    } else if candidate >= current_start.saturating_add(visible) {
+        candidate
+            .saturating_add(1)
+            .saturating_sub(visible)
+            .min(max_start)
+    } else {
+        current_start.min(max_start)
+    }
+}
+
+fn subagent_terminal_title(task: &TaskSnapshot) -> String {
+    const MAX_DESCRIPTION_CHARS: usize = 18;
+    let description = if task.description.chars().count() <= MAX_DESCRIPTION_CHARS {
+        task.description.clone()
+    } else {
+        let mut value = task
+            .description
+            .chars()
+            .take(MAX_DESCRIPTION_CHARS.saturating_sub(3))
+            .collect::<String>();
+        value.push_str("...");
+        value
+    };
+    format!("codex {} {}", task.id, description)
+}
+
 fn current_dir_label() -> String {
     std::env::current_dir()
         .map(|path| home_relative_path(&path))
@@ -1700,6 +2215,13 @@ mod tests {
 
     fn app() -> App {
         App::test_empty()
+    }
+
+    fn add_test_tabs(app: &mut App, count: usize) {
+        for index in 0..count {
+            app.terminal_tabs
+                .push(TerminalTab::new_subagent(format!("tab {}", index + 1)));
+        }
     }
 
     #[test]
@@ -1789,17 +2311,23 @@ mod tests {
     fn mouse_down_on_terminal_tab_selects_that_tab() {
         let mut app = app();
         app.terminal_visible = true;
+        add_test_tabs(&mut app, 4);
         app.active_terminal_tab = 0;
+        app.terminal_tab_switcher = Some(TerminalTabSwitcher {
+            candidate: 1,
+            window_start: 1,
+        });
         app.set_terminal_top_row(10);
-        app.set_terminal_tab_hitbox(Some((11, 14, 1, 13, 1, 4)));
+        app.set_terminal_tab_hitbox(Some((11, 12, 2, 89, 1, 3)));
 
         app.update(AppEvent::Mouse(MouseAction::LeftDown {
-            column: 4,
-            row: 12,
+            column: 31,
+            row: 11,
         }));
 
         assert!(app.terminal_focused);
         assert_eq!(app.active_terminal_tab, 2);
+        assert!(app.terminal_tab_switcher.is_none());
         assert!(app.run_notice.is_none());
     }
 
@@ -1807,18 +2335,207 @@ mod tests {
     fn mouse_down_in_terminal_content_does_not_switch_tabs() {
         let mut app = app();
         app.terminal_visible = true;
+        add_test_tabs(&mut app, 4);
         app.active_terminal_tab = 1;
         app.set_terminal_top_row(10);
-        app.set_terminal_tab_hitbox(Some((11, 14, 1, 13, 1, 4)));
+        app.set_terminal_tab_hitbox(Some((11, 12, 2, 89, 1, 3)));
 
         app.update(AppEvent::Mouse(MouseAction::LeftDown {
-            column: 20,
+            column: 10,
             row: 12,
         }));
 
         assert!(app.terminal_focused);
         assert_eq!(app.active_terminal_tab, 1);
         assert!(app.run_notice.is_none());
+    }
+
+    #[test]
+    fn ctrl_down_opens_terminal_tab_switcher_when_terminal_focused() {
+        let mut app = app();
+        app.terminal_visible = true;
+        app.terminal_focused = true;
+        add_test_tabs(&mut app, 4);
+        app.active_terminal_tab = 1;
+        app.set_terminal_content_geometry(5, 2, 116);
+
+        app.update(AppEvent::Key(KeyInput {
+            action: KeyAction::CtrlDown,
+            terminal_input: Some(b"\x1b[B".to_vec()),
+        }));
+
+        assert_eq!(
+            app.terminal_tab_switcher,
+            Some(TerminalTabSwitcher {
+                candidate: 1,
+                window_start: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn switcher_right_moves_candidate_and_window() {
+        let mut app = app();
+        app.terminal_visible = true;
+        app.terminal_focused = true;
+        add_test_tabs(&mut app, 5);
+        app.terminal_tab_switcher = Some(TerminalTabSwitcher {
+            candidate: 1,
+            window_start: 0,
+        });
+        app.set_terminal_content_geometry(5, 2, 58);
+
+        app.update(AppEvent::Key(KeyInput {
+            action: KeyAction::Right,
+            terminal_input: Some(b"\x1b[C".to_vec()),
+        }));
+        app.update(AppEvent::Key(KeyInput {
+            action: KeyAction::Right,
+            terminal_input: Some(b"\x1b[C".to_vec()),
+        }));
+
+        assert_eq!(
+            app.terminal_tab_switcher,
+            Some(TerminalTabSwitcher {
+                candidate: 3,
+                window_start: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn switcher_enter_confirms_and_escape_cancels() {
+        let mut app = app();
+        app.terminal_visible = true;
+        app.terminal_focused = true;
+        add_test_tabs(&mut app, 4);
+        app.active_terminal_tab = 0;
+        app.terminal_tab_switcher = Some(TerminalTabSwitcher {
+            candidate: 2,
+            window_start: 1,
+        });
+
+        app.update(AppEvent::Key(KeyInput {
+            action: KeyAction::Submit,
+            terminal_input: Some(b"\r".to_vec()),
+        }));
+
+        assert_eq!(app.active_terminal_tab, 2);
+        assert!(app.terminal_tab_switcher.is_none());
+
+        app.terminal_tab_switcher = Some(TerminalTabSwitcher {
+            candidate: 3,
+            window_start: 2,
+        });
+        app.update(AppEvent::Key(KeyInput {
+            action: KeyAction::Escape,
+            terminal_input: Some(b"\x1b".to_vec()),
+        }));
+
+        assert_eq!(app.active_terminal_tab, 2);
+        assert!(app.terminal_tab_switcher.is_none());
+    }
+
+    #[test]
+    fn switcher_up_confirms_candidate() {
+        let mut app = app();
+        app.terminal_visible = true;
+        app.terminal_focused = true;
+        add_test_tabs(&mut app, 3);
+        app.active_terminal_tab = 0;
+        app.terminal_tab_switcher = Some(TerminalTabSwitcher {
+            candidate: 1,
+            window_start: 0,
+        });
+
+        app.update(AppEvent::Key(KeyInput {
+            action: KeyAction::CtrlUp,
+            terminal_input: Some(b"\x1b[A".to_vec()),
+        }));
+
+        assert_eq!(app.active_terminal_tab, 1);
+        assert!(app.terminal_tab_switcher.is_none());
+    }
+
+    #[test]
+    fn switcher_plain_down_is_consumed_without_moving_candidate() {
+        let mut app = app();
+        app.terminal_visible = true;
+        app.terminal_focused = true;
+        add_test_tabs(&mut app, 4);
+        app.terminal_tab_switcher = Some(TerminalTabSwitcher {
+            candidate: 1,
+            window_start: 0,
+        });
+        app.set_terminal_content_geometry(5, 2, 58);
+
+        app.update(AppEvent::Key(KeyInput {
+            action: KeyAction::Down,
+            terminal_input: Some(b"\x1b[B".to_vec()),
+        }));
+
+        assert_eq!(
+            app.terminal_tab_switcher,
+            Some(TerminalTabSwitcher {
+                candidate: 1,
+                window_start: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_over_switcher_moves_candidate_horizontally() {
+        let mut app = app();
+        app.terminal_visible = true;
+        app.terminal_focused = true;
+        add_test_tabs(&mut app, 5);
+        app.terminal_tab_switcher = Some(TerminalTabSwitcher {
+            candidate: 1,
+            window_start: 0,
+        });
+        app.set_terminal_top_row(10);
+        app.set_terminal_content_geometry(5, 2, 58);
+        app.set_terminal_tab_hitbox(Some((11, 12, 2, 60, 0, 2)));
+
+        app.update(AppEvent::Mouse(MouseAction::ScrollDown {
+            column: 4,
+            row: 11,
+        }));
+
+        assert_eq!(
+            app.terminal_tab_switcher,
+            Some(TerminalTabSwitcher {
+                candidate: 2,
+                window_start: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn terminal_focus_defers_ctrl_c_to_terminal_input() {
+        let mut app = app();
+        app.terminal_focused = true;
+        let input = KeyInput {
+            action: KeyAction::Quit,
+            terminal_input: Some(vec![0x03]),
+        };
+
+        assert!(app.should_defer_key_to_terminal(&input));
+
+        app.terminal_focused = false;
+        assert!(!app.should_defer_key_to_terminal(&input));
+    }
+
+    #[test]
+    fn terminal_body_hit_test_uses_content_area() {
+        let mut app = app();
+        app.set_terminal_top_row(10);
+        app.set_terminal_content_geometry(5, 14, 80);
+
+        assert!(app.mouse_over_terminal_body(17, 12));
+        assert!(!app.mouse_over_terminal_body(13, 12));
+        assert!(!app.mouse_over_terminal_body(17, 10));
+        assert!(!app.mouse_over_terminal_body(17, 16));
     }
 
     #[test]
@@ -1947,6 +2664,30 @@ mod tests {
 
         assert!(!app.terminal_visible);
         assert!(app.terminal_tabs.is_empty());
+    }
+
+    #[test]
+    fn terminal_command_shows_and_focuses_terminal() {
+        let mut app = app();
+        add_test_tabs(&mut app, 1);
+        app.terminal_focused = false;
+        app.terminal_tab_switcher = Some(TerminalTabSwitcher {
+            candidate: 0,
+            window_start: 0,
+        });
+        app.input.set("/terminal");
+
+        let command = SLASH_COMMANDS
+            .iter()
+            .find(|command| command.name == "/terminal")
+            .copied()
+            .unwrap();
+        app.run_slash_command(command);
+
+        assert!(app.terminal_visible);
+        assert!(app.terminal_focused);
+        assert!(app.terminal_tab_switcher.is_none());
+        assert!(app.input.value.is_empty());
     }
 
     #[test]
@@ -2079,6 +2820,7 @@ mod tests {
             tab: StatusTab::General,
             stats: WorkspaceUsageStats::default(),
             error: None,
+            selected_task: 0,
         });
         app.input.set("/status");
 

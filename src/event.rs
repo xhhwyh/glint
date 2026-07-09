@@ -13,8 +13,8 @@ pub enum MouseAction {
     LeftDown { column: u16, row: u16 },
     LeftDrag { column: u16, row: u16 },
     LeftUp { column: u16, row: u16 },
-    ScrollUp { row: u16 },
-    ScrollDown { row: u16 },
+    ScrollUp { column: u16, row: u16 },
+    ScrollDown { column: u16, row: u16 },
     None,
 }
 
@@ -36,6 +36,8 @@ pub enum KeyAction {
     Right,
     Up,
     Down,
+    CtrlUp,
+    CtrlDown,
     Tab,
     Escape,
     CancelConversationPermission,
@@ -82,6 +84,8 @@ impl From<KeyEvent> for KeyInput {
             KeyCode::Delete => KeyAction::Delete,
             KeyCode::Left => KeyAction::Left,
             KeyCode::Right => KeyAction::Right,
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => KeyAction::CtrlUp,
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => KeyAction::CtrlDown,
             KeyCode::Up | KeyCode::PageUp => KeyAction::Up,
             KeyCode::Down | KeyCode::PageDown => KeyAction::Down,
             _ => KeyAction::None,
@@ -166,8 +170,14 @@ impl From<MouseEvent> for MouseAction {
                 column: event.column,
                 row: event.row,
             },
-            MouseEventKind::ScrollUp => Self::ScrollUp { row: event.row },
-            MouseEventKind::ScrollDown => Self::ScrollDown { row: event.row },
+            MouseEventKind::ScrollUp => Self::ScrollUp {
+                column: event.column,
+                row: event.row,
+            },
+            MouseEventKind::ScrollDown => Self::ScrollDown {
+                column: event.column,
+                row: event.row,
+            },
             _ => Self::None,
         }
     }
@@ -215,10 +225,27 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_c_keeps_terminal_interrupt_bytes() {
+        let input = KeyInput::from(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert_eq!(input.action, KeyAction::Quit);
+        assert_eq!(input.terminal_input.as_deref(), Some(&[0x03][..]));
+    }
+
+    #[test]
     fn delete_key_deletes_forward() {
         let input = KeyInput::from(KeyEvent::new(KeyCode::Delete, KeyModifiers::empty()));
 
         assert_eq!(input.action, KeyAction::Delete);
+    }
+
+    #[test]
+    fn ctrl_arrows_drive_terminal_tab_switcher() {
+        let up = KeyInput::from(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+        let down = KeyInput::from(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+
+        assert_eq!(up.action, KeyAction::CtrlUp);
+        assert_eq!(down.action, KeyAction::CtrlDown);
     }
 
     #[test]
@@ -249,5 +276,17 @@ mod tests {
         });
 
         assert_eq!(action, MouseAction::LeftUp { column: 14, row: 6 });
+    }
+
+    #[test]
+    fn scroll_mouse_events_keep_pointer_coordinates() {
+        let action = MouseAction::from(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 8,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert_eq!(action, MouseAction::ScrollUp { column: 8, row: 3 });
     }
 }

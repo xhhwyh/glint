@@ -74,6 +74,9 @@ pub enum ResponseItem {
     Message {
         role: TranscriptRole,
         content: Vec<ContentBlock>,
+        #[serde(default)]
+        #[serde(skip_serializing_if = "is_false")]
+        hidden: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -145,6 +148,18 @@ pub enum EventMsg {
     TurnAborted {
         turn_id: Option<String>,
         reason: String,
+    },
+    SubagentStarted {
+        task_id: String,
+        description: String,
+        backend: String,
+        cwd: String,
+    },
+    SubagentFinished {
+        task_id: String,
+        status: String,
+        summary: Option<String>,
+        error: Option<String>,
     },
 }
 
@@ -417,28 +432,35 @@ impl TranscriptStore {
         let mut messages = Vec::new();
         let mut tool_indexes = HashMap::new();
 
-        for item in self.response_items() {
-            match item {
-                ResponseItem::Message {
+        for entry in &self.entries {
+            match &entry.payload {
+                TranscriptPayload::ResponseItem(ResponseItem::Message {
                     role: TranscriptRole::User,
                     content,
+                    hidden,
                     ..
-                } => messages.push(Message::user(content_text(content))),
-                ResponseItem::Message {
+                }) => {
+                    let text = content_text(content);
+                    if !hidden {
+                        messages.push(Message::user(text));
+                    }
+                }
+                TranscriptPayload::ResponseItem(ResponseItem::Message {
                     role: TranscriptRole::Assistant,
                     content,
+                    hidden,
                     ..
-                } => {
+                }) => {
                     let text = content_text(content);
-                    if !text.is_empty() {
+                    if !hidden && !text.is_empty() {
                         messages.push(Message::assistant(text));
                     }
                 }
-                ResponseItem::FunctionCall {
+                TranscriptPayload::ResponseItem(ResponseItem::FunctionCall {
                     call_id,
                     name,
                     arguments,
-                } => {
+                }) => {
                     let index = messages.len();
                     messages.push(Message::tool_with_description(
                         call_id.clone(),
@@ -448,11 +470,11 @@ impl TranscriptStore {
                     ));
                     tool_indexes.insert(call_id.as_str(), index);
                 }
-                ResponseItem::FunctionCallOutput {
+                TranscriptPayload::ResponseItem(ResponseItem::FunctionCallOutput {
                     call_id,
                     output,
                     is_error: _,
-                } => {
+                }) => {
                     if let Some(message) = tool_indexes
                         .get(call_id.as_str())
                         .and_then(|index| messages.get_mut(*index))
@@ -461,14 +483,15 @@ impl TranscriptStore {
                         message.tool_finished = true;
                     }
                 }
-                ResponseItem::CompactBoundary { .. } => {
+                TranscriptPayload::ResponseItem(ResponseItem::CompactBoundary { .. }) => {
                     messages.push(Message::assistant(COMPACT_UI_MESSAGE));
                 }
-                ResponseItem::ClearBoundary => {
+                TranscriptPayload::ResponseItem(ResponseItem::ClearBoundary) => {
                     messages.clear();
                     tool_indexes.clear();
                     messages.push(Message::assistant(CLEAR_UI_MESSAGE));
                 }
+                _ => {}
             }
         }
 
@@ -493,6 +516,14 @@ impl TranscriptStore {
     }
 
     pub fn append_user(&mut self, content: String) -> Result<()> {
+        self.append_user_with_visibility(content, true)
+    }
+
+    pub fn append_hidden_user(&mut self, content: String) -> Result<()> {
+        self.append_user_with_visibility(content, false)
+    }
+
+    fn append_user_with_visibility(&mut self, content: String, visible: bool) -> Result<()> {
         self.append(
             TranscriptEntryType::EventMsg,
             TranscriptPayload::EventMsg(EventMsg::UserMessage {
@@ -505,6 +536,7 @@ impl TranscriptStore {
             TranscriptPayload::ResponseItem(ResponseItem::Message {
                 role: TranscriptRole::User,
                 content: vec![ContentBlock::InputText { text: content }],
+                hidden: !visible,
                 provider: None,
                 model: None,
                 finish_reason: None,
@@ -527,6 +559,7 @@ impl TranscriptStore {
                 content: vec![ContentBlock::OutputText {
                     text: assistant.content,
                 }],
+                hidden: false,
                 provider: Some(assistant.provider),
                 model: Some(assistant.model),
                 finish_reason: Some(finish_reason_text(assistant.finish_reason)),
@@ -576,6 +609,42 @@ impl TranscriptStore {
             self.append_usage(usage)?;
         }
         Ok(())
+    }
+
+    pub fn append_subagent_started(
+        &mut self,
+        task_id: String,
+        description: String,
+        backend: String,
+        cwd: String,
+    ) -> Result<()> {
+        self.append(
+            TranscriptEntryType::EventMsg,
+            TranscriptPayload::EventMsg(EventMsg::SubagentStarted {
+                task_id,
+                description,
+                backend,
+                cwd,
+            }),
+        )
+    }
+
+    pub fn append_subagent_finished(
+        &mut self,
+        task_id: String,
+        status: String,
+        summary: Option<String>,
+        error: Option<String>,
+    ) -> Result<()> {
+        self.append(
+            TranscriptEntryType::EventMsg,
+            TranscriptPayload::EventMsg(EventMsg::SubagentFinished {
+                task_id,
+                status,
+                summary,
+                error,
+            }),
+        )
     }
 
     pub fn append_compact_boundary(
@@ -1427,6 +1496,22 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, CLEAR_UI_MESSAGE);
         assert_eq!(messages[1].content, "new user");
+    }
+
+    #[test]
+    fn hidden_user_messages_stay_model_visible_but_not_ui_visible() {
+        let mut transcript = store();
+        transcript
+            .append_hidden_user("<subagent-outcome>done</subagent-outcome>".to_owned())
+            .unwrap();
+
+        assert!(transcript.ui_messages().is_empty());
+        let history = transcript.model_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].content.as_deref(),
+            Some("<subagent-outcome>done</subagent-outcome>")
+        );
     }
 
     #[test]

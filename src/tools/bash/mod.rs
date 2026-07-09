@@ -8,7 +8,8 @@ mod description;
 use super::{
     ToolBehavior,
     utils::{
-        command_result, error, is_protected_path, missing_arg, requires_path_approval, string_arg,
+        command_result, current_tool_dir, error, is_protected_path, missing_arg,
+        requires_path_approval, string_arg,
     },
 };
 
@@ -95,11 +96,12 @@ fn run_bash(call: &ToolCall, command: &str, is_cancelled: &mut dyn FnMut() -> bo
     }
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_owned());
-    command_result(
-        call,
-        Command::new(shell).args(["-lc", command]),
-        is_cancelled,
-    )
+    let mut process = Command::new(shell);
+    process.args(["-lc", command]);
+    if let Ok(cwd) = current_tool_dir() {
+        process.current_dir(cwd);
+    }
+    command_result(call, &mut process, is_cancelled)
 }
 
 #[derive(Clone, Debug)]

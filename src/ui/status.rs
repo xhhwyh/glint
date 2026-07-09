@@ -8,10 +8,15 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, StatusTab, StatusView};
+use crate::{
+    app::{App, StatusTab, StatusView},
+    tasks::{TaskSnapshot, TaskStatus},
+};
 
 use super::{
-    format::{cached_suffix, context_usage_label, now, parse_price_number, unit_suffix},
+    format::{
+        cached_suffix, context_usage_label, duration_label, now, parse_price_number, unit_suffix,
+    },
     layout::{pad_to_width, truncate_end_to_width, wrap_text},
     terminal::terminal_status_label,
     theme::*,
@@ -50,6 +55,7 @@ pub(super) fn render_status_view(frame: &mut Frame, app: &App, view: &StatusView
     let content = match view.tab {
         StatusTab::General => status_general_lines(app, width),
         StatusTab::Usage => status_usage_lines(app, width),
+        StatusTab::Tasks => status_task_lines(app, view, width, available_rows),
         StatusTab::Stat => status_stat_lines(view, width, available_rows),
     };
     lines.extend(content.into_iter().take(available_rows));
@@ -66,6 +72,10 @@ pub(super) fn render_status_view(frame: &mut Frame, app: &App, view: &StatusView
         Span::styled(" tab  ", Style::default().fg(MUTED_TEXT_COLOR)),
         Span::styled("Tab", Style::default().fg(KEY_HINT_COLOR)),
         Span::styled(" next  ", Style::default().fg(MUTED_TEXT_COLOR)),
+        Span::styled("↑/↓", Style::default().fg(KEY_HINT_COLOR)),
+        Span::styled(" select  ", Style::default().fg(MUTED_TEXT_COLOR)),
+        Span::styled("Enter", Style::default().fg(KEY_HINT_COLOR)),
+        Span::styled(" open  ", Style::default().fg(MUTED_TEXT_COLOR)),
         Span::styled("Esc", Style::default().fg(KEY_HINT_COLOR)),
         Span::styled(" exit", Style::default().fg(MUTED_TEXT_COLOR)),
     ]));
@@ -80,6 +90,7 @@ fn status_tab_line(selected: StatusTab) -> Line<'static> {
     let tabs = [
         (StatusTab::General, "General"),
         (StatusTab::Usage, "Usage"),
+        (StatusTab::Tasks, "Tasks"),
         (StatusTab::Stat, "Stat"),
     ];
     let mut spans = Vec::new();
@@ -273,6 +284,115 @@ fn status_stat_lines(view: &StatusView, width: usize, available_rows: usize) -> 
     }
 
     lines
+}
+
+fn status_task_lines(
+    app: &App,
+    view: &StatusView,
+    width: usize,
+    available_rows: usize,
+) -> Vec<Line<'static>> {
+    let tasks = app.task_snapshots();
+    let mut lines = vec![status_section_line("Subagent Tasks")];
+    if tasks.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No subagent tasks",
+            Style::default().fg(MUTED_TEXT_COLOR),
+        )));
+        return lines;
+    }
+
+    let selected = view.selected_task.min(tasks.len().saturating_sub(1));
+    let detail_rows = 8.min(available_rows.saturating_div(2).max(4));
+    let list_rows = available_rows
+        .saturating_sub(lines.len() + detail_rows)
+        .max(1);
+    for (index, task) in tasks.iter().enumerate().take(list_rows) {
+        lines.push(task_list_line(task, index == selected, width));
+    }
+    if tasks.len() > list_rows {
+        lines.push(Line::from(Span::styled(
+            format!("  +{} more", tasks.len() - list_rows),
+            Style::default().fg(MUTED_TEXT_COLOR),
+        )));
+    }
+
+    if let Some(task) = tasks.get(selected) {
+        lines.push(Line::from(""));
+        lines.push(status_section_line("Selected Task"));
+        lines.push(status_kv_line("Task", &task.id, width));
+        lines.push(status_kv_line("Description", &task.description, width));
+        lines.push(status_kv_line("Status", task.status.label(), width));
+        lines.push(status_kv_line("Backend", task.backend.label(), width));
+        lines.push(status_kv_line("Cwd", &task.cwd, width));
+        lines.push(status_kv_line(
+            "Terminal",
+            &task_terminal_label(task),
+            width,
+        ));
+        if let Some(summary) = task
+            .summary
+            .as_deref()
+            .filter(|summary| !summary.is_empty())
+        {
+            lines.push(status_kv_line("Summary", summary, width));
+        }
+        if let Some(error) = task.error.as_deref() {
+            lines.push(status_kv_line("Error", error, width));
+        }
+    }
+    lines
+}
+
+fn task_list_line(task: &TaskSnapshot, selected: bool, width: usize) -> Line<'static> {
+    let marker = if selected { ">" } else { " " };
+    let tab = task_terminal_label(task);
+    let elapsed = task_elapsed_label(task);
+    let prefix = format!(
+        "{marker} {:<9} {:<4} {:<7} ",
+        task.status.label(),
+        task.id,
+        tab
+    );
+    let suffix = format!(" {elapsed}");
+    let description_width = width.saturating_sub(prefix.width() + suffix.width());
+    let description = truncate_end_to_width(&task.description, description_width);
+    Line::from(vec![
+        Span::styled(marker.to_owned(), Style::default().fg(ACCENT_COLOR)),
+        Span::raw(" "),
+        Span::styled(
+            format!("{:<9}", task.status.label()),
+            task_status_style(task.status),
+        ),
+        Span::raw(" "),
+        Span::styled(format!("{:<4}", task.id), Style::default().fg(TEXT_COLOR)),
+        Span::raw(" "),
+        Span::styled(format!("{:<7}", tab), Style::default().fg(MUTED_TEXT_COLOR)),
+        Span::styled(description, Style::default().fg(BORDER_BRIGHT_COLOR)),
+        Span::raw(suffix),
+    ])
+}
+
+fn task_status_style(status: TaskStatus) -> Style {
+    let color = match status {
+        TaskStatus::Queued | TaskStatus::Running => ACCENT_COLOR,
+        TaskStatus::Completed => BORDER_BRIGHT_COLOR,
+        TaskStatus::Failed | TaskStatus::Cancelled => Color::Red,
+    };
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
+fn task_terminal_label(task: &TaskSnapshot) -> String {
+    task.terminal_tab
+        .map(|tab| format!("tab{}", tab + 1))
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn task_elapsed_label(task: &TaskSnapshot) -> String {
+    let end = task
+        .ended_at_ms
+        .unwrap_or_else(|| now().saturating_mul(1000));
+    duration_label(end.saturating_sub(task.started_at_ms) / 1000)
 }
 
 fn top_model_lines(model: &crate::transcript::ModelTokenTotal, width: usize) -> Vec<Line<'static>> {

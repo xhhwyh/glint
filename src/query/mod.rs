@@ -48,10 +48,22 @@ pub struct AgentRunInput {
     pub lsp_manager: LspManager,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct AgentRunOutcome {
+    pub final_message: String,
+}
+
 struct ToolExecutionState<'a> {
     project_settings: &'a mut ProjectSettings,
     conversation_permissions: &'a mut ConversationPermissions,
     tool_result_budget: &'a ToolResultBudget,
+    approvals_enabled: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RunModelTurnsConfig {
+    initial_permissions: ConversationPermissions,
+    approvals_enabled: bool,
 }
 
 pub fn spawn_agent_loop(
@@ -68,12 +80,49 @@ pub fn spawn_agent_loop(
         .with_lsp_manager(input.lsp_manager.clone())
         .with_read_file_state(input.read_file_state.clone());
 
-        match run_agent_loop(input, &mut provider, &registry, &tx, &control_rx) {
-            Ok(()) => {
+        match run_agent_loop(input, &mut provider, &registry, &tx, &control_rx, true) {
+            Ok(_) => {
                 tx.send(AgentEvent::AssistantFinished).ok();
             }
             Err(error) => {
                 tx.send(AgentEvent::Failed(format!("LLM error: {error:#}")))
+                    .ok();
+            }
+        }
+    });
+}
+
+pub fn spawn_subagent_loop(
+    input: AgentRunInput,
+    tx: Sender<AgentEvent>,
+    result_tx: Sender<crate::tasks::SubagentOutcome>,
+) {
+    thread::spawn(move || {
+        let mut provider = OpenAiProvider::new(input.llm.clone());
+        let registry = ToolRegistry::for_subagent(Some(input.terminal_requests.clone()))
+            .with_lsp_manager(input.lsp_manager.clone())
+            .with_read_file_state(input.read_file_state.clone());
+        let (_control_tx, control_rx) = mpsc::channel();
+
+        let cwd = PathBuf::from(input.runtime_context.current_dir.clone());
+        let result = crate::tools::with_tool_cwd(cwd, || {
+            run_agent_loop(input, &mut provider, &registry, &tx, &control_rx, false)
+        });
+
+        match result {
+            Ok(outcome) => {
+                tx.send(AgentEvent::AssistantFinished).ok();
+                result_tx
+                    .send(crate::tasks::SubagentOutcome::completed(
+                        outcome.final_message,
+                    ))
+                    .ok();
+            }
+            Err(error) => {
+                let message = format!("LLM error: {error:#}");
+                tx.send(AgentEvent::Failed(message.clone())).ok();
+                result_tx
+                    .send(crate::tasks::SubagentOutcome::failed(message, ""))
                     .ok();
             }
         }
@@ -86,7 +135,8 @@ fn run_agent_loop(
     registry: &ToolRegistry,
     tx: &Sender<AgentEvent>,
     control_rx: &Receiver<AgentControl>,
-) -> Result<()> {
+    approvals_enabled: bool,
+) -> Result<AgentRunOutcome> {
     tx.send(AgentEvent::Started).ok();
 
     let mut messages = build_initial_messages(
@@ -103,8 +153,11 @@ fn run_agent_loop(
         registry,
         tx,
         control_rx,
-        input.conversation_permissions,
         &tool_result_budget,
+        RunModelTurnsConfig {
+            initial_permissions: input.conversation_permissions,
+            approvals_enabled,
+        },
     )
 }
 
@@ -114,12 +167,12 @@ fn run_model_turns(
     registry: &ToolRegistry,
     tx: &Sender<AgentEvent>,
     control_rx: &Receiver<AgentControl>,
-    initial_permissions: ConversationPermissions,
     tool_result_budget: &ToolResultBudget,
-) -> Result<()> {
+    config: RunModelTurnsConfig,
+) -> Result<AgentRunOutcome> {
     let mut tool_iterations = 0;
     let mut project_settings = ProjectSettings::load();
-    let mut conversation_permissions = initial_permissions;
+    let mut conversation_permissions = config.initial_permissions;
 
     loop {
         if drain_control_messages(control_rx, tx, &mut conversation_permissions) {
@@ -170,6 +223,7 @@ fn run_model_turns(
                 project_settings: &mut project_settings,
                 conversation_permissions: &mut conversation_permissions,
                 tool_result_budget,
+                approvals_enabled: config.approvals_enabled,
             };
             append_tool_turn(
                 messages,
@@ -238,6 +292,7 @@ fn append_serial_tool_call(
         control_rx,
         state.project_settings,
         state.conversation_permissions,
+        state.approvals_enabled,
     )?;
     let tool_name = call.name.clone();
     let result = state.tool_result_budget.apply(&tool_name, result);
@@ -403,6 +458,7 @@ fn execute_tool_with_approval(
     control_rx: &Receiver<AgentControl>,
     project_settings: &mut ProjectSettings,
     conversation_permissions: &mut ConversationPermissions,
+    approvals_enabled: bool,
 ) -> Result<ToolResult> {
     if drain_control_messages(control_rx, tx, conversation_permissions) {
         bail!("cancelled");
@@ -421,6 +477,13 @@ fn execute_tool_with_approval(
             control_rx,
             conversation_permissions,
         );
+    }
+    if !approvals_enabled {
+        return Ok(ToolResult {
+            call_id: call.id,
+            content: "Approval is unavailable inside a subagent for this tool call.".to_owned(),
+            is_error: true,
+        });
     }
 
     let request = ApprovalRequest {
@@ -567,9 +630,10 @@ fn next_approval_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-fn finish_without_tools(response: ModelResponse) -> Result<()> {
+fn finish_without_tools(response: ModelResponse) -> Result<AgentRunOutcome> {
+    let final_message = response.assistant_text.clone().unwrap_or_default();
     match response.finish_reason {
-        FinishReason::Stop => Ok(()),
+        FinishReason::Stop => Ok(AgentRunOutcome { final_message }),
         FinishReason::Length => bail!("model stopped because max_tokens was reached"),
         FinishReason::ToolCalls => {
             bail!("model stopped for tool calls without any tool call payload")
@@ -716,6 +780,7 @@ mod tests {
             project_settings,
             conversation_permissions,
             tool_result_budget,
+            approvals_enabled: true,
         }
     }
 
@@ -726,10 +791,12 @@ mod tests {
         let mut provider = FakeProvider::new(vec![final_response("done")]);
 
         let control_rx = control_rx();
-        run_agent_loop(input(), &mut provider, &registry, &tx, &control_rx).unwrap();
+        let outcome =
+            run_agent_loop(input(), &mut provider, &registry, &tx, &control_rx, true).unwrap();
 
         let events: Vec<_> = rx.try_iter().collect();
         assert_eq!(provider.requests.len(), 1);
+        assert_eq!(outcome.final_message, "done");
         assert!(matches!(events.first(), Some(AgentEvent::Started)));
         assert!(
             events
@@ -745,7 +812,7 @@ mod tests {
         let mut provider = FakeProvider::new(vec![tool_response("one"), final_response("done")]);
 
         let control_rx = control_rx();
-        run_agent_loop(input(), &mut provider, &registry, &tx, &control_rx).unwrap();
+        run_agent_loop(input(), &mut provider, &registry, &tx, &control_rx, true).unwrap();
 
         assert_eq!(provider.requests.len(), 2);
         let second_request = &provider.requests[1];
@@ -918,7 +985,7 @@ mod tests {
 
         let control_rx = control_rx();
         let error =
-            run_agent_loop(input(), &mut provider, &registry, &tx, &control_rx).unwrap_err();
+            run_agent_loop(input(), &mut provider, &registry, &tx, &control_rx, true).unwrap_err();
 
         assert_eq!(provider.requests.len(), MAX_TOOL_ITERATIONS + 1);
         assert!(format!("{error:#}").contains("maximum tool iterations exceeded"));

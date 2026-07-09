@@ -29,7 +29,9 @@ use crate::message::{Message, Role};
 use layout::box_top;
 use theme::{ACCENT_COLOR, BG_COLOR};
 
-pub use terminal::{terminal_content_width, terminal_height_for_app, terminal_tab_hitbox};
+pub use terminal::{
+    terminal_content_width, terminal_content_x_offset, terminal_height_for_app, terminal_tab_hitbox,
+};
 
 struct Document {
     lines: Vec<Line<'static>>,
@@ -587,11 +589,18 @@ mod tests {
     use super::format::{cached_suffix, context_bar_percent, context_usage_label};
     use super::layout::truncate_start_to_width;
     use super::model_picker::price_label;
-    use super::terminal::{terminal_footer, terminal_tab_hitbox_for, terminal_tab_window_start};
+    use super::terminal::{
+        terminal_footer, terminal_preview_tab_index, terminal_switcher_visible_cards,
+        terminal_tab_hitbox_for,
+    };
     use super::theme::KEY_HINT_COLOR;
     use super::transcript_view::tool_output_preview;
     use super::*;
-    use crate::app::{ModelPicker, ModelPickerStage, ResumePicker, TextPosition};
+    use crate::{
+        app::App,
+        app::{ModelPicker, ModelPickerStage, ResumePicker, TerminalTabSwitcher, TextPosition},
+        terminal::TerminalTab,
+    };
     use ratatui::style::{Color, Modifier};
 
     #[test]
@@ -636,25 +645,48 @@ mod tests {
     }
 
     #[test]
-    fn terminal_content_width_reserves_tab_column_when_roomy() {
-        assert_eq!(terminal_content_width(120), 104);
+    fn terminal_content_width_uses_full_terminal_body() {
+        assert_eq!(terminal_content_width(120), 116);
         assert_eq!(terminal_content_width(30), 26);
     }
 
     #[test]
-    fn terminal_tab_window_tracks_active_tab() {
-        assert_eq!(terminal_tab_window_start(0, 3, 6), 0);
-        assert_eq!(terminal_tab_window_start(6, 10, 4), 4);
+    fn terminal_switcher_visible_card_count_tracks_width() {
+        assert_eq!(terminal_switcher_visible_cards(120, 10), 4);
+        assert_eq!(terminal_switcher_visible_cards(64, 10), 2);
+        assert_eq!(terminal_switcher_visible_cards(30, 10), 1);
+        assert_eq!(terminal_switcher_visible_cards(120, 0), 0);
     }
 
     #[test]
-    fn terminal_tab_hitbox_tracks_visible_tab_rows() {
+    fn terminal_tab_hitbox_tracks_horizontal_switcher_cards() {
+        let switcher = TerminalTabSwitcher {
+            candidate: 6,
+            window_start: 4,
+        };
         assert_eq!(
-            terminal_tab_hitbox_for(6, 10, 20, 80, 6),
-            Some((21, 25, 1, 13, 4, 10))
+            terminal_tab_hitbox_for(Some(&switcher), 10, 20, 80, 6),
+            Some((21, 22, 2, 59, 4, 2))
         );
-        assert_eq!(terminal_tab_hitbox_for(0, 0, 20, 80, 6), None);
-        assert_eq!(terminal_tab_hitbox_for(0, 3, 20, 30, 6), None);
+        assert_eq!(terminal_tab_hitbox_for(None, 10, 20, 80, 6), None);
+        assert_eq!(terminal_tab_hitbox_for(Some(&switcher), 0, 20, 80, 6), None);
+    }
+
+    #[test]
+    fn terminal_preview_tracks_switcher_candidate() {
+        let mut app = App::test_empty();
+        app.terminal_tabs.push(TerminalTab::new_subagent("first"));
+        app.terminal_tabs.push(TerminalTab::new_subagent("second"));
+        app.active_terminal_tab = 0;
+        app.terminal_tab_switcher = Some(TerminalTabSwitcher {
+            candidate: 1,
+            window_start: 0,
+        });
+
+        assert_eq!(terminal_preview_tab_index(&app), Some(1));
+
+        app.terminal_tab_switcher = None;
+        assert_eq!(terminal_preview_tab_index(&app), Some(0));
     }
 
     #[test]
@@ -667,7 +699,9 @@ mod tests {
             .collect::<String>();
 
         assert!(text.contains("Ctrl+T switch cursor"));
-        for key in ["Ctrl+T", "Alt+N", "Alt+1-9", "Alt+D"] {
+        assert!(text.contains("Ctrl+Down tabs"));
+        assert!(text.contains("Ctrl+Up select"));
+        for key in ["Ctrl+T", "Alt+N", "Ctrl+Down", "Ctrl+Up", "Alt+D"] {
             let span = footer
                 .spans
                 .iter()

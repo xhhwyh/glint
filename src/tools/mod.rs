@@ -5,6 +5,7 @@ mod grep;
 mod lsp;
 mod read;
 mod read_state;
+mod subagent;
 mod terminal_run;
 mod utils;
 
@@ -23,7 +24,9 @@ use grep::GrepTool;
 use lsp::LspTool;
 use read::ReadTool;
 pub use read_state::ReadFileState;
+use subagent::SubagentTool;
 use terminal_run::TerminalRunTool;
+pub(crate) use utils::with_tool_cwd;
 use utils::{error, normalize_path_argument, requires_path_approval, truncate_summary};
 
 #[derive(Clone)]
@@ -32,6 +35,7 @@ pub struct ToolRegistry {
     lsp_manager: Option<LspManager>,
     shell_tool_mode: ShellToolMode,
     read_file_state: ReadFileState,
+    subagent: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +51,7 @@ impl ToolRegistry {
             lsp_manager: None,
             shell_tool_mode: ShellToolMode::Bash,
             read_file_state: ReadFileState::new(),
+            subagent: false,
         }
     }
 
@@ -57,6 +62,7 @@ impl ToolRegistry {
             lsp_manager: None,
             shell_tool_mode: ShellToolMode::TerminalRun,
             read_file_state: ReadFileState::new(),
+            subagent: false,
         }
     }
 
@@ -69,6 +75,17 @@ impl ToolRegistry {
             lsp_manager: None,
             shell_tool_mode,
             read_file_state: ReadFileState::new(),
+            subagent: false,
+        }
+    }
+
+    pub fn for_subagent(terminal_requests: Option<Sender<TerminalRequest>>) -> Self {
+        Self {
+            terminal_requests,
+            lsp_manager: None,
+            shell_tool_mode: ShellToolMode::TerminalRun,
+            read_file_state: ReadFileState::new(),
+            subagent: true,
         }
     }
 
@@ -97,7 +114,7 @@ impl ToolRegistry {
         is_cancelled: &mut dyn FnMut() -> bool,
     ) -> ToolResult {
         if call.name == "TerminalRun" {
-            if self.shell_tool_mode != ShellToolMode::TerminalRun {
+            if self.shell_tool_mode != ShellToolMode::TerminalRun && !self.subagent {
                 return error(call, "Tool 'TerminalRun' is not registered.".to_owned());
             }
             return terminal_run::terminal_run(
@@ -107,6 +124,15 @@ impl ToolRegistry {
                 false,
             );
         }
+        if call.name == "Bash" && self.shell_tool_mode != ShellToolMode::Bash && !self.subagent {
+            return error(call, "Tool 'Bash' is not registered.".to_owned());
+        }
+        if call.name == "Subagent" {
+            if self.subagent {
+                return error(call, "Nested Subagent is not registered.".to_owned());
+            }
+            return subagent::subagent(call, self.terminal_requests.as_ref());
+        }
         if call.name == "Read" {
             return read::read(call, &self.read_file_state);
         }
@@ -114,6 +140,9 @@ impl ToolRegistry {
             return lsp::lsp(call, self.lsp_manager.as_ref());
         }
         if call.name == "Edit" {
+            if self.subagent {
+                return error(call, "Edit is not registered inside subagents.".to_owned());
+            }
             return edit::edit(call);
         }
         self.tool_for_name(&call.name)
@@ -142,7 +171,7 @@ impl ToolRegistry {
         is_cancelled: &mut dyn FnMut() -> bool,
     ) -> ToolResult {
         if call.name == "TerminalRun" {
-            if self.shell_tool_mode != ShellToolMode::TerminalRun {
+            if self.shell_tool_mode != ShellToolMode::TerminalRun && !self.subagent {
                 return error(call, "Tool 'TerminalRun' is not registered.".to_owned());
             }
             return terminal_run::terminal_run(
@@ -152,6 +181,15 @@ impl ToolRegistry {
                 true,
             );
         }
+        if call.name == "Bash" && self.shell_tool_mode != ShellToolMode::Bash && !self.subagent {
+            return error(call, "Tool 'Bash' is not registered.".to_owned());
+        }
+        if call.name == "Subagent" {
+            if self.subagent {
+                return error(call, "Nested Subagent is not registered.".to_owned());
+            }
+            return subagent::subagent(call, self.terminal_requests.as_ref());
+        }
         if call.name == "Read" {
             return read::read(call, &self.read_file_state);
         }
@@ -159,6 +197,9 @@ impl ToolRegistry {
             return lsp::lsp(call, self.lsp_manager.as_ref());
         }
         if call.name == "Edit" {
+            if self.subagent {
+                return error(call, "Edit is not registered inside subagents.".to_owned());
+            }
             return edit::edit_approved(call, &self.read_file_state, self.lsp_manager.as_ref());
         }
         self.tool_for_name(&call.name)
@@ -194,18 +235,35 @@ impl ToolRegistry {
             "Read" | "Edit" => normalize_path_argument(&mut call.arguments, "file_path"),
             "Glob" | "Grep" => normalize_path_argument(&mut call.arguments, "path"),
             "LSP" => normalize_path_argument(&mut call.arguments, "file_path"),
+            "Subagent" => normalize_path_argument(&mut call.arguments, "cwd"),
             _ => {}
         }
         call
     }
 
     fn tools(&self) -> Vec<&'static dyn ToolBehavior> {
+        if self.subagent {
+            return vec![
+                &READ_TOOL,
+                &GLOB_TOOL,
+                &GREP_TOOL,
+                &LSP_TOOL,
+                &BASH_TOOL,
+                &TERMINAL_RUN_TOOL,
+            ];
+        }
         let shell_tool: &'static dyn ToolBehavior = match self.shell_tool_mode {
             ShellToolMode::Bash => &BASH_TOOL,
             ShellToolMode::TerminalRun => &TERMINAL_RUN_TOOL,
         };
         vec![
-            &READ_TOOL, &GLOB_TOOL, &GREP_TOOL, &LSP_TOOL, shell_tool, &EDIT_TOOL,
+            &READ_TOOL,
+            &GLOB_TOOL,
+            &GREP_TOOL,
+            &LSP_TOOL,
+            shell_tool,
+            &SUBAGENT_TOOL,
+            &EDIT_TOOL,
         ]
     }
 
@@ -261,14 +319,16 @@ static LSP_TOOL: LspTool = LspTool;
 static BASH_TOOL: BashTool = BashTool;
 static EDIT_TOOL: EditTool = EditTool;
 static TERMINAL_RUN_TOOL: TerminalRunTool = TerminalRunTool;
+static SUBAGENT_TOOL: SubagentTool = SubagentTool;
 
-static ALL_TOOLS: [&dyn ToolBehavior; 7] = [
+static ALL_TOOLS: [&dyn ToolBehavior; 8] = [
     &READ_TOOL,
     &GLOB_TOOL,
     &GREP_TOOL,
     &LSP_TOOL,
     &TERMINAL_RUN_TOOL,
     &BASH_TOOL,
+    &SUBAGENT_TOOL,
     &EDIT_TOOL,
 ];
 
@@ -321,6 +381,39 @@ fn spec(name: &str, description: &str, required: &[&str]) -> ToolSpec {
                 "minimum": 1,
                 "maximum": crate::terminal::TERMINAL_RUN_MAX_TIMEOUT_MS,
                 "description": "Optional command timeout in milliseconds. Defaults to 120000 and cannot exceed 600000."
+            }),
+        );
+    }
+    if name == "Subagent"
+        && let Value::Object(properties) = &mut properties
+    {
+        properties.insert(
+            "description".to_owned(),
+            json!({
+                "type": "string",
+                "description": "Short label for the delegated Codex task."
+            }),
+        );
+        properties.insert(
+            "prompt".to_owned(),
+            json!({
+                "type": "string",
+                "description": "Complete instructions for the Codex subagent. Include all context it needs."
+            }),
+        );
+        properties.insert(
+            "backend".to_owned(),
+            json!({
+                "type": "string",
+                "enum": ["codex"],
+                "description": "Subagent backend. Omit to use codex."
+            }),
+        );
+        properties.insert(
+            "cwd".to_owned(),
+            json!({
+                "type": "string",
+                "description": "Optional working directory. Use a path relative to current_directory or an absolute path. Do not use ~."
             }),
         );
     }
@@ -429,7 +522,10 @@ mod tests {
             .map(|spec| spec.name)
             .collect::<Vec<_>>();
 
-        assert_eq!(names, ["Read", "Glob", "Grep", "LSP", "Bash", "Edit"]);
+        assert_eq!(
+            names,
+            ["Read", "Glob", "Grep", "LSP", "Bash", "Subagent", "Edit"]
+        );
     }
 
     #[test]
@@ -443,8 +539,50 @@ mod tests {
 
         assert_eq!(
             names,
-            ["Read", "Glob", "Grep", "LSP", "TerminalRun", "Edit"]
+            [
+                "Read",
+                "Glob",
+                "Grep",
+                "LSP",
+                "TerminalRun",
+                "Subagent",
+                "Edit"
+            ]
         );
+    }
+
+    #[test]
+    fn subagent_registry_exposes_limited_tool_surface() {
+        let (terminal_tx, _terminal_rx) = mpsc::channel();
+        let registry = ToolRegistry::for_subagent(Some(terminal_tx));
+        let names = registry
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            ["Read", "Glob", "Grep", "LSP", "Bash", "TerminalRun"]
+        );
+
+        let edit = ToolCall {
+            id: "edit".to_owned(),
+            name: "Edit".to_owned(),
+            arguments: json!({ "file_path": "src/main.rs", "old_string": "a", "new_string": "b" }),
+        };
+        let result = registry.execute_approved(&edit);
+        assert!(result.is_error);
+        assert!(result.content.contains("not registered"));
+
+        let nested = ToolCall {
+            id: "subagent".to_owned(),
+            name: "Subagent".to_owned(),
+            arguments: json!({ "description": "nested", "prompt": "work" }),
+        };
+        let result = registry.execute_approved(&nested);
+        assert!(result.is_error);
+        assert!(result.content.contains("Nested Subagent"));
     }
 
     #[test]

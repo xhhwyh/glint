@@ -11,6 +11,7 @@ mod query;
 mod runtime;
 mod services;
 mod settings;
+mod tasks;
 mod terminal;
 mod tools;
 mod transcript;
@@ -71,10 +72,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         let terminal_top_row = size.height.saturating_sub(terminal_height);
         app.set_terminal_top_row(terminal_top_row);
         if terminal_height > 0 {
-            app.resize_terminal(
+            let terminal_content_width = ui::terminal_content_width(size.width);
+            app.resize_terminal(terminal_height.saturating_sub(2), terminal_content_width);
+            app.set_terminal_content_geometry(
                 terminal_height.saturating_sub(2),
-                ui::terminal_content_width(size.width),
+                ui::terminal_content_x_offset(size.width),
+                terminal_content_width,
             );
+        } else {
+            app.set_terminal_content_geometry(0, 0, 1);
         }
         app.update_terminal();
         app.set_document_viewport(
@@ -101,7 +107,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
             match term_event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     let input = KeyInput::from(key);
-                    if input.action == KeyAction::Quit {
+                    if input.action == KeyAction::Quit && !app.should_defer_key_to_terminal(&input)
+                    {
                         if let Some(text) = app.selected_input_text() {
                             match copy_selection_to_clipboard(terminal, &text) {
                                 Ok(()) => app.finish_input_selection_copy(),

@@ -6,7 +6,7 @@ pub(crate) mod openai;
 pub(crate) mod provider;
 
 pub use crate::context::RuntimeContext;
-pub use crate::query::{AgentRunInput, spawn_agent_loop};
+pub use crate::query::{AgentRunInput, spawn_agent_loop, spawn_subagent_loop};
 pub use compact::{CompactRunInput, should_auto_compact, spawn_compact_loop};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]

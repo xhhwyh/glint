@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     env,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -11,6 +12,19 @@ use serde_json::Value;
 use crate::agent::provider::{ToolCall, ToolResult};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+thread_local! {
+    static TOOL_CWD: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn with_tool_cwd<R>(cwd: PathBuf, f: impl FnOnce() -> R) -> R {
+    let previous = TOOL_CWD.with(|slot| slot.replace(Some(cwd)));
+    let result = f();
+    TOOL_CWD.with(|slot| {
+        slot.replace(previous);
+    });
+    result
+}
 
 pub(super) fn requires_path_approval(call: &ToolCall) -> bool {
     let path = string_arg(call, "file_path").or_else(|| string_arg(call, "path"));
@@ -178,8 +192,7 @@ pub(super) fn slice_lines(content: String, call: &ToolCall) -> String {
 }
 
 pub(super) fn resolve_tool_path(path: &str) -> Result<PathBuf, String> {
-    let cwd = std::env::current_dir()
-        .map_err(|err| format!("failed to read current directory: {err}"))?;
+    let cwd = current_tool_dir()?;
     let path = expand_home_path(path);
     let absolute = if path.is_absolute() {
         path
@@ -255,7 +268,7 @@ pub(super) fn truncate_summary(output: &str) -> String {
 }
 
 pub(super) fn display_path(path: &str) -> String {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = current_tool_dir().unwrap_or_else(|_| PathBuf::from("."));
     let cwd = cwd.canonicalize().unwrap_or(cwd);
     let path = expand_home_path(path);
     let absolute = if path.is_absolute() {
@@ -269,6 +282,13 @@ pub(super) fn display_path(path: &str) -> String {
         .strip_prefix(&cwd)
         .map(display_relative_path)
         .unwrap_or_else(|_| display_path_string(&display_path))
+}
+
+pub(super) fn current_tool_dir() -> Result<PathBuf, String> {
+    if let Some(cwd) = TOOL_CWD.with(|slot| slot.borrow().clone()) {
+        return Ok(cwd);
+    }
+    std::env::current_dir().map_err(|err| format!("failed to read current directory: {err}"))
 }
 
 pub(super) fn display_relative_path(path: &Path) -> String {

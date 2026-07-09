@@ -35,6 +35,20 @@ impl RuntimeContext {
         }
     }
 
+    pub fn subagent_with_time(
+        current_time: impl Into<String>,
+        current_dir: impl Into<String>,
+    ) -> Self {
+        Self {
+            current_time: current_time.into(),
+            current_dir: current_dir.into(),
+            shell: std::env::var("SHELL").unwrap_or_else(|_| "unknown".to_owned()),
+            app_name: env!("CARGO_PKG_NAME").to_owned(),
+            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            tool_mode: subagent_tool_mode_context(),
+        }
+    }
+
     pub fn to_model_message(&self) -> ModelMessage {
         ModelMessage::user(format!(
             "<system-reminder>\nAs you answer the user's current request, you can use the following runtime context. This context may or may not be relevant; do not respond to it directly unless it is relevant.\n<runtime_context>\ncurrent_time: {}\ncurrent_directory: {}\nshell: {}\napp: {} {}\ntool_mode: {}\n</runtime_context>\n</system-reminder>",
@@ -46,6 +60,12 @@ impl RuntimeContext {
             self.tool_mode
         ))
     }
+}
+
+fn subagent_tool_mode_context() -> String {
+    format!(
+        "available tools: Read, Glob, Grep, LSP, Bash, TerminalRun. {COMMON_TOOL_CONTEXT} Use Bash or TerminalRun for non-interactive shell-only commands such as git, build/test, package manager, environment, and process commands. Edit and nested Subagent are unavailable."
+    )
 }
 
 fn tool_mode_context(shell_tool_mode: ShellToolMode) -> String {
@@ -132,6 +152,22 @@ mod tests {
                 .contains("available tools: Read, Glob, Grep, LSP, TerminalRun, Edit")
         );
         assert!(terminal.tool_mode.contains("Bash is unavailable"));
+    }
+
+    #[test]
+    fn subagent_context_describes_limited_tool_surface() {
+        let context = RuntimeContext::subagent_with_time("unix_seconds=1", "/workspace");
+
+        assert!(
+            context
+                .tool_mode
+                .contains("available tools: Read, Glob, Grep, LSP, Bash, TerminalRun")
+        );
+        assert!(
+            context
+                .tool_mode
+                .contains("Edit and nested Subagent are unavailable")
+        );
     }
 
     #[test]

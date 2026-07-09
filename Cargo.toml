@@ -17,4 +17,4 @@ shlex = "2"
 ureq = { version = "2", features = ["json"] }
 unicode-width = "0.1"
 uuid = { version = "1", default-features = false, features = ["v4"] }
-vt100 = "=0.15.2"
+vt100 = { path = "vendor/vt100" }
