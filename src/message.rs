@@ -1,8 +1,11 @@
+use crate::progress::TodoUpdate;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     User,
     Assistant,
     Tool,
+    Progress,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -14,6 +17,7 @@ pub struct Message {
     pub tool_input: Option<String>,
     pub tool_description: Option<String>,
     pub tool_finished: bool,
+    pub progress: Option<TodoUpdate>,
 }
 
 impl Message {
@@ -26,6 +30,7 @@ impl Message {
             tool_input: None,
             tool_description: None,
             tool_finished: false,
+            progress: None,
         }
     }
 
@@ -51,6 +56,20 @@ impl Message {
             tool_input: Some(input.into()),
             tool_description: description,
             tool_finished: false,
+            progress: None,
+        }
+    }
+
+    pub fn progress(update: TodoUpdate) -> Self {
+        Self {
+            role: Role::Progress,
+            content: String::new(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_input: None,
+            tool_description: None,
+            tool_finished: true,
+            progress: Some(update),
         }
     }
 }

@@ -22,6 +22,7 @@ use crate::{
     input::InputState,
     message::{Message, Role},
     plugins::{PluginManager, PluginMutationResult},
+    progress::TodoUpdate,
     runtime::{
         AssistantRecord, ConversationUsage, LoadedTranscript, RuntimeCommand, RuntimeEvent,
         SessionRuntime, StartPromptConfig,
@@ -647,6 +648,10 @@ impl App {
         self.runtime.task_snapshots()
     }
 
+    pub fn pinned_progress(&self) -> Option<&TodoUpdate> {
+        self.runtime.pinned_progress()
+    }
+
     pub fn update_terminal(&mut self) {
         for tab in &mut self.terminal_tabs {
             tab.tick();
@@ -769,6 +774,7 @@ impl App {
                 ),
                 conversation_permissions: Default::default(),
                 conversation: Vec::new(),
+                active_progress: None,
                 current_user_message: request.prompt,
                 tool_results_dir: self.runtime.tool_results_dir(),
                 terminal_requests: self.runtime.terminal_request_sender(),
@@ -875,6 +881,7 @@ impl App {
                 )));
             }
             AgentEvent::ConversationPermissionChanged { .. } => {}
+            AgentEvent::TodoUpdated(_) => {}
             AgentEvent::CompactStarted
             | AgentEvent::CompactFinished { .. }
             | AgentEvent::CompactFailed(_) => {}
@@ -3413,7 +3420,13 @@ impl App {
                 });
                 self.scroll = 0;
             }
-            RuntimeEvent::PromptStarted { prompt } => {
+            RuntimeEvent::PromptStarted {
+                prompt,
+                released_progress,
+            } => {
+                if let Some(progress) = released_progress {
+                    self.messages.push(Message::progress(progress));
+                }
                 self.messages.push(Message::user(prompt));
                 self.status = AgentStatus::Thinking;
                 self.start_turn_timer();
@@ -3496,6 +3509,9 @@ impl App {
             } => {
                 self.agent_activity = Some(format!("Running {name}: {input_summary}"));
                 self.remove_empty_assistant_tail();
+                if name == "TodoWrite" {
+                    return;
+                }
                 if name == "Read" && self.merge_read_tool(&input_summary) {
                     return;
                 }
@@ -3516,6 +3532,9 @@ impl App {
                 self.agent_activity = Some(format!("Finished {name}: {output_summary}"));
                 self.runtime
                     .record_tool(id.clone(), output.clone(), is_error);
+                if name == "TodoWrite" {
+                    return;
+                }
                 if name == "Read" {
                     if let Some(message) = self.find_tool_message(&id) {
                         message.tool_finished = true;
@@ -3541,6 +3560,10 @@ impl App {
             } => {
                 self.runtime
                     .sync_conversation_permission(edit_always_allowed, allowed_tool);
+            }
+            AgentEvent::TodoUpdated(update) => {
+                self.runtime.apply_todo_update(update);
+                self.agent_activity = Some("Updated progress checklist".to_owned());
             }
             AgentEvent::AssistantFinished => {
                 self.runtime.complete_turn();

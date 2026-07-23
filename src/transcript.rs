@@ -18,9 +18,10 @@ use crate::{
         provider::{FinishReason, ModelMessage, ToolCall, ToolResult},
     },
     message::Message,
+    progress::{ProgressState, TodoUpdate},
 };
 
-const SCHEMA: u16 = 3;
+const SCHEMA: u16 = 4;
 const COMPACT_UI_MESSAGE: &str = "Compacted conversation";
 const CLEAR_UI_MESSAGE: &str = "Cleared conversation context";
 const SECONDS_PER_DAY: u64 = 86_400;
@@ -104,6 +105,9 @@ pub enum ResponseItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         pre_prompt_tokens: Option<u64>,
     },
+    ProgressSnapshot {
+        update: TodoUpdate,
+    },
     ClearBoundary,
 }
 
@@ -160,6 +164,10 @@ pub enum EventMsg {
         status: String,
         summary: Option<String>,
         error: Option<String>,
+    },
+    TodoUpdated {
+        turn_id: Option<String>,
+        update: TodoUpdate,
     },
 }
 
@@ -418,6 +426,9 @@ impl TranscriptStore {
                     }
                     index += 1;
                 }
+                ResponseItem::ProgressSnapshot { .. } => {
+                    index += 1;
+                }
                 ResponseItem::ClearBoundary => {
                     history.clear();
                     index += 1;
@@ -461,6 +472,9 @@ impl TranscriptStore {
                     name,
                     arguments,
                 }) => {
+                    if name == "TodoWrite" {
+                        continue;
+                    }
                     let index = messages.len();
                     messages.push(Message::tool_with_description(
                         call_id.clone(),
@@ -485,6 +499,9 @@ impl TranscriptStore {
                 }
                 TranscriptPayload::ResponseItem(ResponseItem::CompactBoundary { .. }) => {
                     messages.push(Message::assistant(COMPACT_UI_MESSAGE));
+                }
+                TranscriptPayload::ResponseItem(ResponseItem::ProgressSnapshot { update }) => {
+                    messages.push(Message::progress(update.clone()));
                 }
                 TranscriptPayload::ResponseItem(ResponseItem::ClearBoundary) => {
                     messages.clear();
@@ -513,6 +530,31 @@ impl TranscriptStore {
                 TranscriptPayload::EventMsg(EventMsg::TokenCount { usage, .. }) => Some(*usage),
                 _ => None,
             })
+    }
+
+    pub fn progress_state(&self) -> ProgressState {
+        let last_clear_index = self.entries.iter().rposition(|entry| {
+            matches!(
+                entry.payload,
+                TranscriptPayload::ResponseItem(ResponseItem::ClearBoundary)
+            )
+        });
+        let mut state = ProgressState::default();
+        for (index, entry) in self.entries.iter().enumerate() {
+            if last_clear_index.is_some_and(|clear| index <= clear) {
+                continue;
+            }
+            match &entry.payload {
+                TranscriptPayload::EventMsg(EventMsg::TodoUpdated { update, .. }) => {
+                    state.apply_update(update.clone());
+                }
+                TranscriptPayload::ResponseItem(ResponseItem::ProgressSnapshot { .. }) => {
+                    state.clear();
+                }
+                _ => {}
+            }
+        }
+        state
     }
 
     pub fn append_user(&mut self, content: String) -> Result<()> {
@@ -609,6 +651,23 @@ impl TranscriptStore {
             self.append_usage(usage)?;
         }
         Ok(())
+    }
+
+    pub fn append_todo_update(&mut self, update: TodoUpdate) -> Result<()> {
+        self.append(
+            TranscriptEntryType::EventMsg,
+            TranscriptPayload::EventMsg(EventMsg::TodoUpdated {
+                turn_id: self.current_turn_id.clone(),
+                update,
+            }),
+        )
+    }
+
+    pub fn append_progress_snapshot(&mut self, update: TodoUpdate) -> Result<()> {
+        self.append(
+            TranscriptEntryType::ResponseItem,
+            TranscriptPayload::ResponseItem(ResponseItem::ProgressSnapshot { update }),
+        )
     }
 
     pub fn append_subagent_started(
@@ -1512,6 +1571,50 @@ mod tests {
             history[0].content.as_deref(),
             Some("<subagent-outcome>done</subagent-outcome>")
         );
+    }
+
+    #[test]
+    fn todo_updates_restore_progress_but_do_not_render_as_chat_messages() {
+        let mut transcript = store();
+        let update = TodoUpdate::from_tool_arguments(&serde_json::json!({
+            "todos": [
+                {"content": "Run tests", "active_form": "Running tests", "status": "in_progress"}
+            ]
+        }))
+        .unwrap();
+
+        transcript.append_todo_update(update.clone()).unwrap();
+
+        assert!(transcript.ui_messages().is_empty());
+        assert_eq!(transcript.progress_state().pinned(), Some(&update));
+    }
+
+    #[test]
+    fn progress_snapshot_is_ui_visible_but_not_model_visible() {
+        let mut transcript = store();
+        let update = TodoUpdate::from_tool_arguments(&serde_json::json!({
+            "todos": [
+                {"content": "Run tests", "active_form": "Running tests", "status": "completed"}
+            ]
+        }))
+        .unwrap();
+        transcript.append_user("old prompt".to_owned()).unwrap();
+        transcript.append_todo_update(update.clone()).unwrap();
+        transcript.append_progress_snapshot(update).unwrap();
+        transcript.append_user("next prompt".to_owned()).unwrap();
+
+        let messages = transcript.ui_messages();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.role == crate::message::Role::Progress)
+        );
+        assert!(transcript.progress_state().pinned().is_none());
+
+        let history = transcript.model_history();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content.as_deref(), Some("old prompt"));
+        assert_eq!(history[1].content.as_deref(), Some("next prompt"));
     }
 
     #[test]

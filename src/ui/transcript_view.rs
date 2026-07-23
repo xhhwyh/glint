@@ -5,9 +5,16 @@ use ratatui::{
 
 use crate::message::Role;
 
-use super::{format::duration_label, layout::wrap_text, markdown, theme::*};
+use super::{format::duration_label, layout::wrap_text, markdown, progress, theme::*};
 
 pub(super) fn message_lines(message: &crate::message::Message, width: u16) -> Vec<Line<'static>> {
+    if message.role == Role::Progress {
+        if let Some(update) = message.progress.as_ref() {
+            return progress::transcript_lines(update, width);
+        }
+        return Vec::new();
+    }
+
     if message.role == Role::Tool {
         return tool_message_lines(message, width);
     }

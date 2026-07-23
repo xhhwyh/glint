@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{agent::provider::ModelMessage, tools::ShellToolMode};
+use crate::{agent::provider::ModelMessage, progress::TodoUpdate, tools::ShellToolMode};
 
 const COMMON_TOOL_CONTEXT: &str = "Use paths relative to current_directory for files and directories under current_directory; use absolute paths only for targets outside current_directory. Do not use ~ in tool arguments. Use Read for known file contents. If you do not know the target file path, use narrow Glob or Grep first, then Read the discovered file paths. Use LSP for Rust symbol-aware questions such as definitions, references, hover documentation, document symbols, and workspace symbols. Only batch Read with Glob or Grep when the Read paths are already known from the user request or prior context. Do not start project summaries with broad root Glob patterns like **/*; read orientation files and manifests first. Glob results are capped at 100 files. Glob searches time out after 20 seconds by default, 60 seconds on WSL, or the positive value in GLINT_GLOB_TIMEOUT_SECONDS when set. Large tool outputs may be previewed and persisted outside the model context.";
 
@@ -71,10 +71,10 @@ fn subagent_tool_mode_context() -> String {
 fn tool_mode_context(shell_tool_mode: ShellToolMode) -> String {
     match shell_tool_mode {
         ShellToolMode::Bash => format!(
-            "available tools: Read, Glob, Grep, LSP, Bash, Edit. {COMMON_TOOL_CONTEXT} Use Bash for non-interactive shell-only commands such as git, build/test, package manager, environment, and process commands. TerminalRun is unavailable until the user enables the visible terminal with /terminal."
+            "available tools: Read, Glob, Grep, LSP, Bash, Edit, TodoWrite. {COMMON_TOOL_CONTEXT} Use Bash for non-interactive shell-only commands such as git, build/test, package manager, environment, and process commands. TerminalRun is unavailable until the user enables the visible terminal with /terminal."
         ),
         ShellToolMode::TerminalRun => format!(
-            "available tools: Read, Glob, Grep, LSP, TerminalRun, Edit. {COMMON_TOOL_CONTEXT} Use TerminalRun for non-interactive shell-only commands such as git, build/test, package manager, environment, and process commands so the command and output are visible in the terminal. Bash is unavailable while terminal mode is enabled."
+            "available tools: Read, Glob, Grep, LSP, TerminalRun, Edit, TodoWrite. {COMMON_TOOL_CONTEXT} Use TerminalRun for non-interactive shell-only commands such as git, build/test, package manager, environment, and process commands so the command and output are visible in the terminal. Bash is unavailable while terminal mode is enabled."
         ),
     }
 }
@@ -83,6 +83,7 @@ pub fn build_initial_messages(
     system_prompt: &str,
     runtime_context: &RuntimeContext,
     conversation: &[ModelMessage],
+    active_progress: Option<&TodoUpdate>,
     current_user_message: &str,
 ) -> Vec<ModelMessage> {
     let mut messages = vec![
@@ -91,6 +92,9 @@ pub fn build_initial_messages(
     ];
 
     messages.extend(conversation.iter().cloned());
+    if let Some(progress) = active_progress.filter(|progress| !progress.todos.is_empty()) {
+        messages.push(ModelMessage::user(progress.to_model_reminder()));
+    }
     messages.push(ModelMessage::user(current_user_message.to_owned()));
     messages
 }
@@ -120,7 +124,7 @@ mod tests {
 
     #[test]
     fn places_system_prompt_then_runtime_context_before_history() {
-        let messages = build_initial_messages("system", &runtime_context(), &[], "hello");
+        let messages = build_initial_messages("system", &runtime_context(), &[], None, "hello");
 
         assert_eq!(messages[0].role, ModelRole::System);
         assert_eq!(messages[0].content.as_deref(), Some("system"));
@@ -143,13 +147,13 @@ mod tests {
 
         assert!(
             bash.tool_mode
-                .contains("available tools: Read, Glob, Grep, LSP, Bash, Edit")
+                .contains("available tools: Read, Glob, Grep, LSP, Bash, Edit, TodoWrite")
         );
         assert!(bash.tool_mode.contains("TerminalRun is unavailable"));
         assert!(
             terminal
                 .tool_mode
-                .contains("available tools: Read, Glob, Grep, LSP, TerminalRun, Edit")
+                .contains("available tools: Read, Glob, Grep, LSP, TerminalRun, Edit, TodoWrite")
         );
         assert!(terminal.tool_mode.contains("Bash is unavailable"));
     }
@@ -182,8 +186,13 @@ mod tests {
             ModelMessage::assistant(Some("first assistant".to_owned()), Vec::new()),
         ];
 
-        let messages =
-            build_initial_messages("system", &runtime_context(), &conversation, "second user");
+        let messages = build_initial_messages(
+            "system",
+            &runtime_context(),
+            &conversation,
+            None,
+            "second user",
+        );
 
         assert_eq!(messages[2].role, ModelRole::User);
         assert_eq!(messages[2].content.as_deref(), Some("first user"));
@@ -203,5 +212,27 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn places_progress_reminder_before_current_user() {
+        let progress = TodoUpdate::from_tool_arguments(&serde_json::json!({
+            "todos": [
+                {"content": "Run tests", "active_form": "Running tests", "status": "in_progress"}
+            ]
+        }))
+        .unwrap();
+
+        let messages =
+            build_initial_messages("system", &runtime_context(), &[], Some(&progress), "next");
+
+        assert_eq!(messages[2].role, ModelRole::User);
+        assert!(
+            messages[2]
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("Current progress checklist"))
+        );
+        assert_eq!(messages[3].content.as_deref(), Some("next"));
     }
 }

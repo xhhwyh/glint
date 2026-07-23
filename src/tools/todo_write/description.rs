@@ -1,0 +1,1 @@
+pub const DESCRIPTION: &str = "Update the progress checklist for the current session. Use for complex multi-step work, not for trivial single-step or purely informational requests. Keep exactly one item in_progress while work remains, mark completed items immediately, and do not mark failed or partial work as completed.";

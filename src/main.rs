@@ -8,6 +8,7 @@ mod event;
 mod input;
 mod message;
 mod plugins;
+mod progress;
 mod query;
 mod runtime;
 mod services;

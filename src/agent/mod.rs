@@ -1,4 +1,5 @@
 use crate::approval::ApprovalRequest;
+use crate::progress::TodoUpdate;
 use serde::{Deserialize, Serialize};
 
 mod compact;
@@ -47,6 +48,7 @@ pub enum AgentEvent {
         is_error: bool,
         output_summary: String,
     },
+    TodoUpdated(TodoUpdate),
     ToolApprovalRequested(ApprovalRequest),
     ConversationPermissionChanged {
         edit_always_allowed: bool,

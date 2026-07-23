@@ -27,6 +27,7 @@ use crate::{
     config::LlmConfig,
     context::{RuntimeContext, build_initial_messages},
     plugins::{HookEvent, HookRunner},
+    progress::TodoUpdate,
     services::lsp::LspManager,
     services::tool_results::ToolResultBudget,
     settings::ProjectSettings,
@@ -44,6 +45,7 @@ pub struct AgentRunInput {
     pub runtime_context: RuntimeContext,
     pub conversation_permissions: ConversationPermissions,
     pub conversation: Vec<ModelMessage>,
+    pub active_progress: Option<TodoUpdate>,
     pub current_user_message: String,
     pub tool_results_dir: PathBuf,
     pub terminal_requests: Sender<TerminalRequest>,
@@ -156,6 +158,7 @@ fn run_agent_loop(
         &input.system_prompt,
         &input.runtime_context,
         &input.conversation,
+        input.active_progress.as_ref(),
         &input.current_user_message,
     );
     let tool_result_budget = ToolResultBudget::new(input.tool_results_dir);
@@ -329,6 +332,7 @@ fn append_serial_tool_call(
     let tool_name = call.name.clone();
     let result = apply_after_tool_hook(state.hook_runner, &call, result);
     let result = state.tool_result_budget.apply(&tool_name, result);
+    emit_todo_update_if_needed(tx, &call, &result);
 
     tx.send(AgentEvent::ToolFinished {
         id: call.id,
@@ -341,6 +345,15 @@ fn append_serial_tool_call(
 
     messages.push(ModelMessage::tool_result(&result));
     Ok(())
+}
+
+fn emit_todo_update_if_needed(tx: &Sender<AgentEvent>, call: &ToolCall, result: &ToolResult) {
+    if call.name != "TodoWrite" || result.is_error {
+        return;
+    }
+    if let Ok(update) = TodoUpdate::from_tool_arguments(&call.arguments) {
+        tx.send(AgentEvent::TodoUpdated(update)).ok();
+    }
 }
 
 fn append_concurrent_tool_batch(
@@ -848,6 +861,7 @@ mod tests {
             },
             conversation_permissions: ConversationPermissions::default(),
             conversation: Vec::new(),
+            active_progress: None,
             current_user_message: "hello".to_owned(),
             tool_results_dir: std::env::temp_dir(),
             terminal_requests,
@@ -875,6 +889,27 @@ mod tests {
                 id: format!("tool-{id_suffix}"),
                 name: "read_file".to_owned(),
                 arguments: json!({ "path": "Cargo.toml" }),
+            }],
+            finish_reason: FinishReason::ToolCalls,
+            usage: None,
+        }
+    }
+
+    fn todo_response() -> ModelResponse {
+        ModelResponse {
+            assistant_text: None,
+            tool_calls: vec![ToolCall {
+                id: "todo-one".to_owned(),
+                name: "TodoWrite".to_owned(),
+                arguments: json!({
+                    "todos": [
+                        {
+                            "content": "Run tests",
+                            "active_form": "Running tests",
+                            "status": "in_progress"
+                        }
+                    ]
+                }),
             }],
             finish_reason: FinishReason::ToolCalls,
             usage: None,
@@ -944,6 +979,25 @@ mod tests {
                     .content
                     .as_deref()
                     .is_some_and(|content| content.contains("not registered"))
+        }));
+    }
+
+    #[test]
+    fn todo_write_emits_progress_update_event() {
+        let (tx, rx) = mpsc::channel();
+        let registry = ToolRegistry::new();
+        let mut provider = FakeProvider::new(vec![todo_response(), final_response("done")]);
+
+        let control_rx = control_rx();
+        run_agent_loop(input(), &mut provider, &registry, &tx, &control_rx, true).unwrap();
+
+        let events = rx.try_iter().collect::<Vec<_>>();
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::TodoUpdated(update)
+                    if update.active_label() == Some("Running tests")
+            )
         }));
     }
 

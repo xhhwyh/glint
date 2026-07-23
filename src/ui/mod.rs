@@ -7,6 +7,7 @@ mod markdown;
 mod mcp;
 mod model_picker;
 mod plugins;
+mod progress;
 mod resume;
 mod star;
 mod status;
@@ -31,6 +32,8 @@ use crate::message::{Message, Role};
 
 use layout::box_top;
 use theme::{ACCENT_COLOR, BG_COLOR};
+
+const PROGRESS_ANIMATION_FRAME_MS: u128 = 180;
 
 pub use terminal::{
     terminal_content_width, terminal_content_x_offset, terminal_height_for_app, terminal_tab_hitbox,
@@ -357,7 +360,7 @@ fn composer(app: &App, width: u16) -> Composer {
 }
 
 fn composer_overlay_lines(app: &App, width: u16) -> Vec<Line<'static>> {
-    if let Some(picker) = &app.resume_picker {
+    let mut lines = if let Some(picker) = &app.resume_picker {
         resume::resume_picker_lines(picker, width, 8)
     } else if app.model_picker.is_some() {
         model_picker::model_picker_lines(app, width)
@@ -365,7 +368,32 @@ fn composer_overlay_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         input_view::slash_command_lines(app, width)
     } else {
         Vec::new()
+    };
+
+    if let Some(update) = app.pinned_progress() {
+        let progress_lines = progress::pinned_lines(update, width, progress_animation_frame(app));
+        if app.resume_picker.is_none() && app.model_picker.is_none() && app.slash_menu_visible() {
+            let overlay_lines = lines;
+            lines = progress_lines;
+            if !overlay_lines.is_empty() {
+                lines.push(Line::from(""));
+            }
+            lines.extend(overlay_lines);
+        } else {
+            if !lines.is_empty() {
+                lines.push(Line::from(""));
+            }
+            lines.extend(progress_lines);
+        }
     }
+
+    lines
+}
+
+fn progress_animation_frame(app: &App) -> usize {
+    app.processing_elapsed()
+        .map(|elapsed| (elapsed.as_millis() / PROGRESS_ANIMATION_FRAME_MS) as usize)
+        .unwrap_or(0)
 }
 
 fn composer_status_lines(app: &App, width: u16) -> Vec<Line<'static>> {
@@ -410,7 +438,7 @@ fn sticky_question_index(
     }
 
     let current_message = visible.iter().find_map(|meta| match meta.role {
-        Some(Role::Assistant | Role::Tool) => meta.message_index,
+        Some(Role::Assistant | Role::Tool | Role::Progress) => meta.message_index,
         _ => None,
     })?;
     messages[..current_message]
@@ -635,8 +663,11 @@ mod tests {
     use super::transcript_view::tool_output_preview;
     use super::*;
     use crate::{
+        agent::AgentEvent,
         app::App,
         app::{ModelPicker, ModelPickerStage, ResumePicker, TerminalTabSwitcher, TextPosition},
+        event::AppEvent,
+        progress::{TodoItem, TodoStatus, TodoUpdate},
         terminal::TerminalTab,
     };
     use ratatui::style::{Color, Modifier};
@@ -798,6 +829,45 @@ mod tests {
 
         assert!(slash_row < composer_row);
         assert!(composer_row < status_row);
+    }
+
+    #[test]
+    fn progress_renders_above_slash_commands_while_typing_slash() {
+        let mut app = crate::app::App::test_empty();
+        app.update(AppEvent::Agent(AgentEvent::TodoUpdated(TodoUpdate {
+            explanation: None,
+            todos: vec![
+                TodoItem {
+                    content: "Check layout".to_owned(),
+                    active_form: "Checking layout".to_owned(),
+                    status: TodoStatus::InProgress,
+                },
+                TodoItem {
+                    content: "Verify ordering".to_owned(),
+                    active_form: "Verifying ordering".to_owned(),
+                    status: TodoStatus::Pending,
+                },
+            ],
+        })));
+        app.input.set("/");
+
+        let lines = composer(&app, 80).lines;
+        let texts = lines.iter().map(line_text).collect::<Vec<_>>();
+        let progress_row = texts
+            .iter()
+            .position(|line| line.contains("Progress 0/2"))
+            .expect("progress row");
+        let slash_row = texts
+            .iter()
+            .position(|line| line.contains("/archive"))
+            .expect("slash command row");
+        let composer_row = texts
+            .iter()
+            .position(|line| line.contains(" COMPOSER "))
+            .expect("composer row");
+
+        assert!(progress_row < slash_row);
+        assert!(slash_row < composer_row);
     }
 
     #[test]

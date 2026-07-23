@@ -7,6 +7,7 @@ mod read;
 mod read_state;
 mod subagent;
 mod terminal_run;
+mod todo_write;
 mod utils;
 
 use std::{collections::BTreeMap, sync::Arc, sync::mpsc::Sender};
@@ -26,6 +27,7 @@ use read::ReadTool;
 pub use read_state::ReadFileState;
 use subagent::SubagentTool;
 use terminal_run::TerminalRunTool;
+use todo_write::TodoWriteTool;
 pub(crate) use utils::with_tool_cwd;
 use utils::{error, normalize_path_argument, requires_path_approval, truncate_summary};
 
@@ -202,6 +204,9 @@ impl ToolRegistry {
             }
             return edit::edit(call);
         }
+        if call.name == "TodoWrite" {
+            return todo_write::todo_write(call);
+        }
         if let Some(tool) = self.dynamic_tools.get(&call.name) {
             return tool.execute(call, is_cancelled);
         }
@@ -267,6 +272,9 @@ impl ToolRegistry {
                 return error(call, "Edit is not registered inside subagents.".to_owned());
             }
             return edit::edit_approved(call, &self.read_file_state, self.lsp_manager.as_ref());
+        }
+        if call.name == "TodoWrite" {
+            return todo_write::todo_write(call);
         }
         if let Some(tool) = self.dynamic_tools.get(&call.name) {
             return tool.execute(call, is_cancelled);
@@ -347,6 +355,7 @@ impl ToolRegistry {
             shell_tool,
             &SUBAGENT_TOOL,
             &EDIT_TOOL,
+            &TODO_WRITE_TOOL,
         ]
     }
 
@@ -403,8 +412,9 @@ static BASH_TOOL: BashTool = BashTool;
 static EDIT_TOOL: EditTool = EditTool;
 static TERMINAL_RUN_TOOL: TerminalRunTool = TerminalRunTool;
 static SUBAGENT_TOOL: SubagentTool = SubagentTool;
+static TODO_WRITE_TOOL: TodoWriteTool = TodoWriteTool;
 
-static ALL_TOOLS: [&dyn ToolBehavior; 8] = [
+static ALL_TOOLS: [&dyn ToolBehavior; 9] = [
     &READ_TOOL,
     &GLOB_TOOL,
     &GREP_TOOL,
@@ -413,6 +423,7 @@ static ALL_TOOLS: [&dyn ToolBehavior; 8] = [
     &BASH_TOOL,
     &SUBAGENT_TOOL,
     &EDIT_TOOL,
+    &TODO_WRITE_TOOL,
 ];
 
 fn tool_metadata_for_name(name: &str) -> Option<&'static dyn ToolBehavior> {
@@ -504,6 +515,45 @@ fn spec(name: &str, description: &str, required: &[&str]) -> ToolSpec {
             json!({
                 "type": "string",
                 "description": "Optional working directory. Use a path relative to current_directory or an absolute path. Do not use ~."
+            }),
+        );
+    }
+    if name == "TodoWrite"
+        && let Value::Object(properties) = &mut properties
+    {
+        properties.clear();
+        properties.insert(
+            "explanation".to_owned(),
+            json!({
+                "type": "string",
+                "description": "Optional short reason for this checklist update."
+            }),
+        );
+        properties.insert(
+            "todos".to_owned(),
+            json!({
+                "type": "array",
+                "description": "The full updated checklist. Use an empty list only when the checklist is no longer relevant.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "Imperative task description, such as \"Run tests\"."
+                        },
+                        "active_form": {
+                            "type": "string",
+                            "description": "Present-progress form shown while active, such as \"Running tests\"."
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": ["pending", "in_progress", "completed"],
+                            "description": "Current task status."
+                        }
+                    },
+                    "required": ["content", "active_form", "status"],
+                    "additionalProperties": false
+                }
             }),
         );
     }
@@ -658,7 +708,16 @@ mod tests {
 
         assert_eq!(
             names,
-            ["Read", "Glob", "Grep", "LSP", "Bash", "Subagent", "Edit"]
+            [
+                "Read",
+                "Glob",
+                "Grep",
+                "LSP",
+                "Bash",
+                "Subagent",
+                "Edit",
+                "TodoWrite"
+            ]
         );
     }
 
@@ -680,7 +739,8 @@ mod tests {
                 "LSP",
                 "TerminalRun",
                 "Subagent",
-                "Edit"
+                "Edit",
+                "TodoWrite"
             ]
         );
     }

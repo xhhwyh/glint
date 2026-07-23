@@ -21,6 +21,7 @@ use crate::{
     config::{LlmConfig, LspConfig},
     message::Message,
     plugins::{HookEvent, HookRunner, PluginHook},
+    progress::{ProgressState, TodoUpdate},
     services::{
         lsp::LspManager,
         mcp::{McpConfig, McpElicitation, McpElicitationRequest, McpManager, McpServerStatus},
@@ -101,11 +102,20 @@ pub enum RuntimeCommand {
 
 pub enum RuntimeEvent {
     NoMessagesToCompact,
-    CompactStarted { automatic: bool },
-    PromptStarted { prompt: String },
+    CompactStarted {
+        automatic: bool,
+    },
+    PromptStarted {
+        prompt: String,
+        released_progress: Option<TodoUpdate>,
+    },
     PermissionChanged,
-    Cancelled { was_compacting: bool },
-    Blocked { message: String },
+    Cancelled {
+        was_compacting: bool,
+    },
+    Blocked {
+        message: String,
+    },
 }
 
 pub struct LoadedTranscript {
@@ -150,6 +160,7 @@ pub struct SessionRuntime {
     conversation_permissions: ConversationPermissions,
     read_file_state: ReadFileState,
     task_manager: TaskManager,
+    progress_state: ProgressState,
     pending_prompt_after_compact: Option<String>,
     auto_compact_failures: u8,
 }
@@ -182,6 +193,7 @@ impl SessionRuntime {
         let lsp_manager = LspManager::new(lsp_config, PathBuf::from(&transcript_cwd));
         let mcp_manager = McpManager::new(mcp_config, PathBuf::from(&transcript_cwd));
         let hook_runner = HookRunner::new(hooks);
+        let progress_state = transcript.progress_state();
         Self {
             transcript,
             transcript_cwd,
@@ -198,6 +210,7 @@ impl SessionRuntime {
             conversation_permissions: ConversationPermissions::default(),
             read_file_state: ReadFileState::new(),
             task_manager: TaskManager::default(),
+            progress_state,
             pending_prompt_after_compact: None,
             auto_compact_failures: 0,
         }
@@ -366,6 +379,10 @@ impl SessionRuntime {
         self.task_manager.snapshots()
     }
 
+    pub fn pinned_progress(&self) -> Option<&TodoUpdate> {
+        self.progress_state.pinned()
+    }
+
     pub fn terminal_request_sender(&self) -> Sender<TerminalRequest> {
         self.terminal_request_tx.clone()
     }
@@ -499,8 +516,14 @@ impl SessionRuntime {
         self.transcript.append_tool(call_id, content, is_error).ok();
     }
 
+    pub fn apply_todo_update(&mut self, update: TodoUpdate) {
+        self.progress_state.apply_update(update.clone());
+        self.transcript.append_todo_update(update).ok();
+    }
+
     pub fn complete_turn(&mut self) {
         self.transcript.complete_turn().ok();
+        self.progress_state.mark_completed_for_release();
         self.agent_control_tx = None;
     }
 
@@ -655,6 +678,7 @@ impl SessionRuntime {
                 };
             }
         };
+        let released_progress = self.release_completed_progress();
         self.reset_agent_channel();
         let conversation = self.transcript.model_history();
         self.transcript
@@ -680,6 +704,7 @@ impl SessionRuntime {
                 ),
                 conversation_permissions: self.conversation_permissions.clone(),
                 conversation,
+                active_progress: self.progress_state.pinned().cloned(),
                 current_user_message: prompt.clone(),
                 tool_results_dir: self.transcript.tool_results_dir(),
                 terminal_requests: self.terminal_request_tx.clone(),
@@ -693,7 +718,18 @@ impl SessionRuntime {
             control_rx,
         );
 
-        RuntimeEvent::PromptStarted { prompt }
+        RuntimeEvent::PromptStarted {
+            prompt,
+            released_progress,
+        }
+    }
+
+    fn release_completed_progress(&mut self) -> Option<TodoUpdate> {
+        let update = self.progress_state.release_completed()?;
+        self.transcript
+            .append_progress_snapshot(update.clone())
+            .ok();
+        Some(update)
     }
 
     fn submit_approval_decision(
@@ -752,6 +788,7 @@ impl SessionRuntime {
         self.runtime_time_label = crate::context::current_time_label();
         self.conversation_permissions = ConversationPermissions::default();
         self.read_file_state.clear();
+        self.progress_state = self.transcript.progress_state();
         self.pending_prompt_after_compact = None;
         self.auto_compact_failures = 0;
         self.decline_pending_elicitations();
@@ -815,6 +852,7 @@ fn percent(value: u64, total: u64) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::progress::TodoUpdate;
     use crate::tasks::SubagentBackend;
 
     fn runtime() -> SessionRuntime {
@@ -850,5 +888,31 @@ mod tests {
         let content = history[0].content.as_deref().unwrap_or_default();
         assert!(content.contains("<subagent-outcome>"));
         assert!(content.contains("<result>done</result>"));
+    }
+
+    #[test]
+    fn completed_progress_releases_on_next_prompt_boundary() {
+        let mut runtime = runtime();
+        let update = TodoUpdate::from_tool_arguments(&serde_json::json!({
+            "todos": [
+                {"content": "Inspect", "active_form": "Inspecting", "status": "completed"}
+            ]
+        }))
+        .unwrap();
+
+        runtime.apply_todo_update(update.clone());
+        runtime.complete_turn();
+        assert_eq!(runtime.pinned_progress(), Some(&update));
+
+        let released = runtime.release_completed_progress();
+
+        assert_eq!(released, Some(update));
+        assert!(runtime.pinned_progress().is_none());
+        assert!(
+            runtime
+                .ui_messages()
+                .iter()
+                .any(|message| message.role == crate::message::Role::Progress)
+        );
     }
 }
