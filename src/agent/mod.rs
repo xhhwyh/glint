@@ -50,6 +50,7 @@ pub enum AgentEvent {
     ToolApprovalRequested(ApprovalRequest),
     ConversationPermissionChanged {
         edit_always_allowed: bool,
+        allowed_tool: Option<String>,
     },
     CompactStarted,
     CompactFinished {

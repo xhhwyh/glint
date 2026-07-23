@@ -10,6 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use serde_json::json;
 
 use crate::{
     agent::{
@@ -20,14 +21,17 @@ use crate::{
             ToolResult,
         },
     },
-    approval::{AgentControl, ApprovalDecision, ApprovalRequest, ConversationPermissions},
+    approval::{
+        AgentControl, ApprovalDecision, ApprovalKind, ApprovalRequest, ConversationPermissions,
+    },
     config::LlmConfig,
     context::{RuntimeContext, build_initial_messages},
+    plugins::{HookEvent, HookRunner},
     services::lsp::LspManager,
     services::tool_results::ToolResultBudget,
     settings::ProjectSettings,
     terminal::TerminalRequest,
-    tools::{ReadFileState, ShellToolMode, ToolRegistry},
+    tools::{DynamicTool, ReadFileState, ShellToolMode, ToolRegistry},
 };
 
 const MAX_TOOL_ITERATIONS: usize = 8;
@@ -46,6 +50,8 @@ pub struct AgentRunInput {
     pub shell_tool_mode: ShellToolMode,
     pub read_file_state: ReadFileState,
     pub lsp_manager: LspManager,
+    pub dynamic_tools: Vec<Arc<dyn DynamicTool>>,
+    pub hook_runner: HookRunner,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -58,9 +64,10 @@ struct ToolExecutionState<'a> {
     conversation_permissions: &'a mut ConversationPermissions,
     tool_result_budget: &'a ToolResultBudget,
     approvals_enabled: bool,
+    hook_runner: &'a HookRunner,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct RunModelTurnsConfig {
     initial_permissions: ConversationPermissions,
     approvals_enabled: bool,
@@ -78,7 +85,8 @@ pub fn spawn_agent_loop(
             Some(input.terminal_requests.clone()),
         )
         .with_lsp_manager(input.lsp_manager.clone())
-        .with_read_file_state(input.read_file_state.clone());
+        .with_read_file_state(input.read_file_state.clone())
+        .with_dynamic_tools(input.dynamic_tools.clone());
 
         match run_agent_loop(input, &mut provider, &registry, &tx, &control_rx, true) {
             Ok(_) => {
@@ -101,7 +109,8 @@ pub fn spawn_subagent_loop(
         let mut provider = OpenAiProvider::new(input.llm.clone());
         let registry = ToolRegistry::for_subagent(Some(input.terminal_requests.clone()))
             .with_lsp_manager(input.lsp_manager.clone())
-            .with_read_file_state(input.read_file_state.clone());
+            .with_read_file_state(input.read_file_state.clone())
+            .with_dynamic_tools(input.dynamic_tools.clone());
         let (_control_tx, control_rx) = mpsc::channel();
 
         let cwd = PathBuf::from(input.runtime_context.current_dir.clone());
@@ -137,6 +146,10 @@ fn run_agent_loop(
     control_rx: &Receiver<AgentControl>,
     approvals_enabled: bool,
 ) -> Result<AgentRunOutcome> {
+    input.hook_runner.run(
+        HookEvent::AgentStart,
+        json!({"cwd": input.runtime_context.current_dir}),
+    )?;
     tx.send(AgentEvent::Started).ok();
 
     let mut messages = build_initial_messages(
@@ -147,7 +160,7 @@ fn run_agent_loop(
     );
     let tool_result_budget = ToolResultBudget::new(input.tool_results_dir);
 
-    run_model_turns(
+    let outcome = run_model_turns(
         &mut messages,
         provider,
         registry,
@@ -158,9 +171,15 @@ fn run_agent_loop(
             initial_permissions: input.conversation_permissions,
             approvals_enabled,
         },
-    )
+        &input.hook_runner,
+    );
+    input
+        .hook_runner
+        .run(HookEvent::AgentEnd, json!({"success": outcome.is_ok()}))?;
+    outcome
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_model_turns(
     messages: &mut Vec<ModelMessage>,
     provider: &mut impl ModelProvider,
@@ -169,6 +188,7 @@ fn run_model_turns(
     control_rx: &Receiver<AgentControl>,
     tool_result_budget: &ToolResultBudget,
     config: RunModelTurnsConfig,
+    hook_runner: &HookRunner,
 ) -> Result<AgentRunOutcome> {
     let mut tool_iterations = 0;
     let mut project_settings = ProjectSettings::load();
@@ -181,6 +201,10 @@ fn run_model_turns(
         let mut on_delta = |delta: String| {
             tx.send(AgentEvent::AssistantDelta(delta)).ok();
         };
+        hook_runner.run(
+            HookEvent::BeforeModelCall,
+            json!({"message_count": messages.len(), "tool_count": registry.specs().len()}),
+        )?;
         let response = provider
             .stream(
                 ModelRequest {
@@ -191,6 +215,10 @@ fn run_model_turns(
                 &mut on_delta,
             )
             .context("model request failed")?;
+        hook_runner.run(
+            HookEvent::AfterModelCall,
+            json!({"tool_call_count": response.tool_calls.len(), "has_text": response.assistant_text.is_some()}),
+        )?;
 
         if drain_control_messages(control_rx, tx, &mut conversation_permissions) {
             bail!("cancelled");
@@ -224,6 +252,7 @@ fn run_model_turns(
                 conversation_permissions: &mut conversation_permissions,
                 tool_result_budget,
                 approvals_enabled: config.approvals_enabled,
+                hook_runner,
             };
             append_tool_turn(
                 messages,
@@ -242,12 +271,15 @@ fn run_model_turns(
 
 fn append_tool_turn(
     messages: &mut Vec<ModelMessage>,
-    response: ModelResponse,
+    mut response: ModelResponse,
     registry: &ToolRegistry,
     tx: &Sender<AgentEvent>,
     control_rx: &Receiver<AgentControl>,
     state: &mut ToolExecutionState<'_>,
 ) -> Result<()> {
+    for call in &mut response.tool_calls {
+        apply_before_tool_hook(state.hook_runner, call)?;
+    }
     let assistant_text = response.assistant_text.filter(|text| !text.is_empty());
     messages.push(ModelMessage::assistant(
         assistant_text,
@@ -295,6 +327,7 @@ fn append_serial_tool_call(
         state.approvals_enabled,
     )?;
     let tool_name = call.name.clone();
+    let result = apply_after_tool_hook(state.hook_runner, &call, result);
     let result = state.tool_result_budget.apply(&tool_name, result);
 
     tx.send(AgentEvent::ToolFinished {
@@ -334,11 +367,13 @@ fn append_concurrent_tool_batch(
         let result_tx = result_tx.clone();
         let cancelled = Arc::clone(&cancelled);
         let tool_result_budget = state.tool_result_budget.clone();
+        let hook_runner = state.hook_runner.clone();
         let registry = registry.clone();
         thread::spawn(move || {
             let tool_name = call.name.clone();
             let mut is_cancelled = || cancelled.load(Ordering::Relaxed);
             let result = registry.execute_approved_with_cancel(&call, &mut is_cancelled);
+            let result = apply_after_tool_hook(&hook_runner, &call, result);
             let result = tool_result_budget.apply(&tool_name, result);
             result_tx
                 .send(CompletedTool {
@@ -437,11 +472,15 @@ fn can_run_concurrently(
 ) -> bool {
     let bash_prefix_allowed = bash_prefix_allowed(state.project_settings, call);
     registry.is_concurrency_safe(call)
-        && !registry.requires_approval(
-            call,
-            bash_prefix_allowed,
-            state.conversation_permissions.edit_always_allowed,
-        )
+        && (state
+            .conversation_permissions
+            .allowed_tools
+            .contains(&call.name)
+            || !registry.requires_approval(
+                call,
+                bash_prefix_allowed,
+                state.conversation_permissions.edit_always_allowed,
+            ))
 }
 
 fn bash_prefix_allowed(project_settings: &ProjectSettings, call: &ToolCall) -> bool {
@@ -464,11 +503,12 @@ fn execute_tool_with_approval(
         bail!("cancelled");
     }
     let bash_prefix_allowed = bash_prefix_allowed(project_settings, &call);
-    let requires_approval = registry.requires_approval(
-        &call,
-        bash_prefix_allowed,
-        conversation_permissions.edit_always_allowed,
-    );
+    let requires_approval = !conversation_permissions.allowed_tools.contains(&call.name)
+        && registry.requires_approval(
+            &call,
+            bash_prefix_allowed,
+            conversation_permissions.edit_always_allowed,
+        );
     if !requires_approval {
         return execute_approved_cancellable(
             registry,
@@ -491,6 +531,7 @@ fn execute_tool_with_approval(
         tool_name: call.name.clone(),
         command: summarize_tool_input(&call),
         explanation: approval_explanation(&call),
+        kind: ApprovalKind::Tool,
     };
     tx.send(AgentEvent::ToolApprovalRequested(request.clone()))
         .ok();
@@ -512,6 +553,7 @@ fn execute_tool_with_approval(
                 conversation_permissions.edit_always_allowed = false;
                 tx.send(AgentEvent::ConversationPermissionChanged {
                     edit_always_allowed: false,
+                    allowed_tool: None,
                 })
                 .ok();
             }
@@ -533,6 +575,7 @@ fn drain_control_messages(
                 conversation_permissions.edit_always_allowed = false;
                 tx.send(AgentEvent::ConversationPermissionChanged {
                     edit_always_allowed: false,
+                    allowed_tool: None,
                 })
                 .ok();
             }
@@ -572,6 +615,18 @@ fn handle_approval_decision(
             conversation_permissions.edit_always_allowed = true;
             tx.send(AgentEvent::ConversationPermissionChanged {
                 edit_always_allowed: true,
+                allowed_tool: None,
+            })
+            .ok();
+            execute_approved_cancellable(registry, call, tx, control_rx, conversation_permissions)
+        }
+        ApprovalDecision::AllowConversationTool => {
+            conversation_permissions
+                .allowed_tools
+                .insert(call.name.clone());
+            tx.send(AgentEvent::ConversationPermissionChanged {
+                edit_always_allowed: conversation_permissions.edit_always_allowed,
+                allowed_tool: Some(call.name.clone()),
             })
             .ok();
             execute_approved_cancellable(registry, call, tx, control_rx, conversation_permissions)
@@ -622,6 +677,64 @@ fn approval_explanation(call: &ToolCall) -> String {
         "Edit" => "This Edit will modify a file and always needs approval unless allowed for this conversation.".to_owned(),
         _ => format!("{} needs approval before it can run.", call.name),
     }
+}
+
+fn apply_before_tool_hook(hook_runner: &HookRunner, call: &mut ToolCall) -> Result<()> {
+    let outcome = hook_runner.run(
+        HookEvent::BeforeToolCall,
+        json!({
+            "id": call.id,
+            "name": call.name,
+            "arguments": call.arguments,
+        }),
+    )?;
+    if let Some(arguments) = outcome
+        .replacement
+        .and_then(|replacement| replacement.get("arguments").cloned())
+    {
+        if !arguments.is_object() {
+            bail!("before_tool_call hook replacement.arguments must be an object");
+        }
+        call.arguments = arguments;
+    }
+    Ok(())
+}
+
+fn apply_after_tool_hook(
+    hook_runner: &HookRunner,
+    call: &ToolCall,
+    mut result: ToolResult,
+) -> ToolResult {
+    let outcome = hook_runner.run(
+        HookEvent::AfterToolCall,
+        json!({
+            "id": call.id,
+            "name": call.name,
+            "arguments": call.arguments,
+            "content": result.content,
+            "is_error": result.is_error,
+        }),
+    );
+    match outcome {
+        Ok(outcome) => {
+            if let Some(replacement) = outcome.replacement {
+                if let Some(content) = replacement.get("content").and_then(|value| value.as_str()) {
+                    result.content = content.to_owned();
+                }
+                if let Some(is_error) = replacement
+                    .get("is_error")
+                    .and_then(|value| value.as_bool())
+                {
+                    result.is_error = is_error;
+                }
+            }
+        }
+        Err(error) => {
+            result.content = format!("Tool result blocked by plugin hook: {error:#}");
+            result.is_error = true;
+        }
+    }
+    result
 }
 
 fn next_approval_id() -> u64 {
@@ -741,6 +854,8 @@ mod tests {
             shell_tool_mode: ShellToolMode::Bash,
             read_file_state: ReadFileState::new(),
             lsp_manager: LspManager::new(LspConfig::default(), PathBuf::from("/workspace")),
+            dynamic_tools: Vec::new(),
+            hook_runner: HookRunner::default(),
         }
     }
 
@@ -781,7 +896,13 @@ mod tests {
             conversation_permissions,
             tool_result_budget,
             approvals_enabled: true,
+            hook_runner: empty_hook_runner(),
         }
+    }
+
+    fn empty_hook_runner() -> &'static HookRunner {
+        static RUNNER: std::sync::OnceLock<HookRunner> = std::sync::OnceLock::new();
+        RUNNER.get_or_init(HookRunner::default)
     }
 
     #[test]

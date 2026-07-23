@@ -5,7 +5,39 @@ use crate::agent::AgentEvent;
 pub enum AppEvent {
     Key(KeyInput),
     Mouse(MouseAction),
+    ExtensionMouse(ExtensionMouseAction),
     Agent(AgentEvent),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtensionMouseAction {
+    Mcp(McpMouseAction),
+    Plugins(PluginsMouseAction),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpMouseAction {
+    SelectServer(usize),
+    OpenSelected,
+    MoveServerSelection(isize),
+    ScrollDetails(isize),
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PluginsMouseAction {
+    SelectTab(PluginsMouseTab),
+    SelectItem(usize),
+    MoveSelection(isize),
+    OpenSelected,
+    ScrollDetails(isize),
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PluginsMouseTab {
+    Installed,
+    Marketplaces,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

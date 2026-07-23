@@ -3,12 +3,23 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::{
+    plugins::{ExtensionCatalog, PluginLoadResult, PluginManager, PluginsConfig},
+    services::mcp::McpConfig,
+};
+
 #[derive(Clone)]
 pub struct Config {
     pub llm: LlmConfig,
     pub lsp: LspConfig,
+    pub mcp: McpConfig,
+    pub extensions: ExtensionCatalog,
     pub model_catalog: ModelCatalog,
     pub system_prompt: String,
+    pub(crate) plugins: PluginsConfig,
+    pub(crate) base_lsp: LspConfig,
+    pub(crate) base_mcp: McpConfig,
+    pub(crate) base_system_prompt: String,
 }
 
 #[derive(Clone)]
@@ -100,6 +111,10 @@ struct FileConfig {
     llm: FileLlmConfig,
     #[serde(default)]
     lsp: Option<FileLspConfig>,
+    #[serde(default)]
+    mcp: McpConfig,
+    #[serde(default)]
+    plugins: PluginsConfig,
 }
 
 #[derive(Default, Deserialize)]
@@ -172,19 +187,51 @@ impl Config {
         let file = std::fs::read_to_string("config.yaml").context("failed to read config.yaml")?;
         let config: FileConfig =
             serde_yaml::from_str(&file).context("failed to parse config.yaml")?;
-        let system_prompt = std::fs::read_to_string("prompts/system.md")
+        let base_system_prompt = std::fs::read_to_string("prompts/system.md")
             .context("failed to read prompts/system.md")?;
 
         let model_catalog = config.llm.model_catalog();
-        let lsp = config.lsp_config();
+        let base_lsp = config.lsp_config();
+        let base_mcp = config.mcp.clone();
+        let plugins = config.plugins.clone();
+        let plugin_result = PluginManager::load(
+            &plugins,
+            base_mcp.clone(),
+            base_lsp.clone(),
+            &std::env::current_dir().context("failed to resolve current directory")?,
+        )?;
+        let extension_prompt = plugin_result.catalog.system_prompt_fragment();
+        let system_prompt = if extension_prompt.is_empty() {
+            base_system_prompt.clone()
+        } else {
+            format!("{base_system_prompt}\n\n{extension_prompt}")
+        };
         Ok(Self {
             llm: config
                 .llm
                 .into_runtime_config(|api_key_env| std::env::var(api_key_env).ok())?,
-            lsp,
+            lsp: plugin_result.lsp,
+            mcp: plugin_result.mcp,
+            extensions: plugin_result.catalog,
             model_catalog,
             system_prompt,
+            plugins,
+            base_lsp,
+            base_mcp,
+            base_system_prompt,
         })
+    }
+
+    pub(crate) fn apply_plugin_load(&mut self, result: PluginLoadResult) {
+        let extension_prompt = result.catalog.system_prompt_fragment();
+        self.system_prompt = if extension_prompt.is_empty() {
+            self.base_system_prompt.clone()
+        } else {
+            format!("{}\n\n{extension_prompt}", self.base_system_prompt)
+        };
+        self.lsp = result.lsp;
+        self.mcp = result.mcp;
+        self.extensions = result.catalog;
     }
 }
 

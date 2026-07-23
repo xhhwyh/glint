@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 
 use crate::{
     agent::{
@@ -15,12 +15,20 @@ use crate::{
     approval::{ApprovalFocus, ApprovalPrompt},
     commands::{SlashCommand, SlashCommandKind, matching_slash_commands},
     config::Config,
-    event::{AppEvent, KeyAction, KeyInput, MouseAction},
+    event::{
+        AppEvent, ExtensionMouseAction, KeyAction, KeyInput, McpMouseAction, MouseAction,
+        PluginsMouseAction, PluginsMouseTab,
+    },
     input::InputState,
     message::{Message, Role},
+    plugins::{PluginManager, PluginMutationResult},
     runtime::{
         AssistantRecord, ConversationUsage, LoadedTranscript, RuntimeCommand, RuntimeEvent,
         SessionRuntime, StartPromptConfig,
+    },
+    services::mcp::{
+        McpApprovalPolicy, McpConfig, McpOAuthConfig, McpServerConfig, McpTransportConfig,
+        persist_mcp_server,
     },
     tasks::{self, SubagentOutcome, SubagentRequest, SubagentStartResponse, TaskSnapshot},
     terminal::{
@@ -44,6 +52,8 @@ pub struct App {
     pub model_picker: Option<ModelPicker>,
     pub resume_picker: Option<ResumePicker>,
     pub status_view: Option<StatusView>,
+    pub mcp_view: Option<McpView>,
+    pub plugins_view: Option<PluginsView>,
     pub config: Config,
     pub current_dir: String,
     pub agent_activity: Option<String>,
@@ -69,6 +79,7 @@ pub struct App {
     return_bottom_button: Option<ReturnBottomButton>,
     terminal_tab_hitbox: Option<TerminalTabHitbox>,
     pending_subagent_results: Vec<PendingSubagentRun>,
+    pending_plugin_operation: Option<PendingPluginOperation>,
     turn_started_at: Option<Instant>,
     last_turn_duration: Option<Duration>,
     runtime: SessionRuntime,
@@ -113,6 +124,225 @@ pub enum StatusTab {
     Usage,
     Tasks,
     Stat,
+}
+
+#[derive(Debug)]
+pub struct McpView {
+    pub selected: usize,
+    pub detail_scroll: usize,
+    pub detail_max_scroll: usize,
+    pub focus: McpFocus,
+    pub screen: McpScreen,
+    pub notice: Option<McpNotice>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpFocus {
+    Servers,
+    Details,
+}
+
+#[derive(Debug)]
+pub enum McpScreen {
+    Browse,
+    Details,
+    Add(Box<McpAddForm>),
+    OAuth {
+        server: String,
+        authorization_url: String,
+        callback: InputState,
+    },
+    ConfirmLogout {
+        server: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpNotice {
+    pub message: String,
+    pub failed: bool,
+}
+
+#[derive(Debug)]
+pub struct McpAddForm {
+    pub transport: McpAddTransport,
+    pub focus: usize,
+    pub name: InputState,
+    pub command: InputState,
+    pub arguments: InputState,
+    pub working_directory: InputState,
+    pub environment_variables: InputState,
+    pub url: InputState,
+    pub bearer_token_env: InputState,
+    pub redirect_uri: InputState,
+    pub scopes: InputState,
+    pub approval: McpApprovalPolicy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpAddTransport {
+    Stdio,
+    StreamableHttp,
+    OAuth,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpAddField {
+    Transport,
+    Name,
+    Command,
+    Arguments,
+    WorkingDirectory,
+    EnvironmentVariables,
+    Url,
+    BearerTokenEnv,
+    RedirectUri,
+    Scopes,
+    Approval,
+}
+
+impl Default for McpAddForm {
+    fn default() -> Self {
+        Self {
+            transport: McpAddTransport::Stdio,
+            focus: 0,
+            name: InputState::default(),
+            command: InputState::default(),
+            arguments: InputState::default(),
+            working_directory: InputState::default(),
+            environment_variables: InputState::default(),
+            url: InputState::default(),
+            bearer_token_env: InputState::default(),
+            redirect_uri: InputState::default(),
+            scopes: InputState::default(),
+            approval: McpApprovalPolicy::Prompt,
+        }
+    }
+}
+
+impl McpAddForm {
+    pub fn fields(&self) -> &'static [McpAddField] {
+        match self.transport {
+            McpAddTransport::Stdio => &[
+                McpAddField::Transport,
+                McpAddField::Name,
+                McpAddField::Command,
+                McpAddField::Arguments,
+                McpAddField::WorkingDirectory,
+                McpAddField::EnvironmentVariables,
+                McpAddField::Approval,
+            ],
+            McpAddTransport::StreamableHttp => &[
+                McpAddField::Transport,
+                McpAddField::Name,
+                McpAddField::Url,
+                McpAddField::BearerTokenEnv,
+                McpAddField::Approval,
+            ],
+            McpAddTransport::OAuth => &[
+                McpAddField::Transport,
+                McpAddField::Name,
+                McpAddField::Url,
+                McpAddField::RedirectUri,
+                McpAddField::Scopes,
+                McpAddField::Approval,
+            ],
+        }
+    }
+
+    pub fn selected_field(&self) -> McpAddField {
+        self.fields()[self.focus.min(self.fields().len() - 1)]
+    }
+
+    fn selected_input_mut(&mut self) -> Option<&mut InputState> {
+        match self.selected_field() {
+            McpAddField::Name => Some(&mut self.name),
+            McpAddField::Command => Some(&mut self.command),
+            McpAddField::Arguments => Some(&mut self.arguments),
+            McpAddField::WorkingDirectory => Some(&mut self.working_directory),
+            McpAddField::EnvironmentVariables => Some(&mut self.environment_variables),
+            McpAddField::Url => Some(&mut self.url),
+            McpAddField::BearerTokenEnv => Some(&mut self.bearer_token_env),
+            McpAddField::RedirectUri => Some(&mut self.redirect_uri),
+            McpAddField::Scopes => Some(&mut self.scopes),
+            McpAddField::Transport | McpAddField::Approval => None,
+        }
+    }
+}
+
+impl McpAddTransport {
+    fn previous(self) -> Self {
+        match self {
+            Self::Stdio => Self::OAuth,
+            Self::StreamableHttp => Self::Stdio,
+            Self::OAuth => Self::StreamableHttp,
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Stdio => Self::StreamableHttp,
+            Self::StreamableHttp => Self::OAuth,
+            Self::OAuth => Self::Stdio,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct PluginsView {
+    pub tab: PluginsTab,
+    pub screen: PluginsScreen,
+    pub selected_installed: usize,
+    pub selected_marketplace: usize,
+    pub detail_scroll: usize,
+    pub detail_max_scroll: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PluginsTab {
+    Installed,
+    Marketplaces,
+}
+
+#[derive(Debug)]
+pub enum PluginsScreen {
+    Browse,
+    InstalledDetail(usize),
+    MarketplacePluginDetail(usize),
+    AddMarketplace(InputState),
+    Operation(PluginOperationView),
+}
+
+#[derive(Debug)]
+pub struct PluginOperationView {
+    pub title: String,
+    pub subject: String,
+    pub log: Vec<String>,
+    pub uses_git: bool,
+    pub finished: bool,
+    pub failed: bool,
+}
+
+enum PluginUiMutation {
+    AddMarketplace(String),
+    Install(String),
+    Uninstall(String),
+}
+
+enum PluginOperationEvent {
+    Progress(String),
+    Finished(Box<Result<PluginMutationResult, String>>),
+}
+
+struct PendingPluginOperation {
+    events: Receiver<PluginOperationEvent>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MarketplaceSelection {
+    Add,
+    Marketplace(usize),
+    Plugin(usize),
 }
 
 struct PendingSubagentRun {
@@ -224,13 +454,34 @@ impl StatusTab {
     }
 }
 
+impl PluginsTab {
+    fn previous(self) -> Self {
+        match self {
+            Self::Installed => Self::Marketplaces,
+            Self::Marketplaces => Self::Installed,
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Installed => Self::Marketplaces,
+            Self::Marketplaces => Self::Installed,
+        }
+    }
+}
+
 impl App {
     pub fn new(config: Config) -> Result<Self> {
         let current_dir = current_dir_label();
         let transcript_cwd = std::env::current_dir()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|_| current_dir.clone());
-        let runtime = SessionRuntime::create_new(transcript_cwd, config.lsp.clone())?;
+        let runtime = SessionRuntime::create_new(
+            transcript_cwd,
+            config.lsp.clone(),
+            config.mcp.clone(),
+            config.extensions.hooks.clone(),
+        )?;
         let messages = runtime.ui_messages();
         let usage = runtime.usage();
         Ok(Self {
@@ -244,6 +495,8 @@ impl App {
             model_picker: None,
             resume_picker: None,
             status_view: None,
+            mcp_view: None,
+            plugins_view: None,
             config,
             current_dir,
             agent_activity: None,
@@ -269,6 +522,7 @@ impl App {
             return_bottom_button: None,
             terminal_tab_hitbox: None,
             pending_subagent_results: Vec::new(),
+            pending_plugin_operation: None,
             turn_started_at: None,
             last_turn_duration: None,
             runtime,
@@ -288,6 +542,8 @@ impl App {
             model_picker: None,
             resume_picker: None,
             status_view: None,
+            mcp_view: None,
+            plugins_view: None,
             config: Config {
                 llm: LlmConfig {
                     provider: "test".to_owned(),
@@ -310,7 +566,13 @@ impl App {
                 },
                 model_catalog: ModelCatalog::default(),
                 lsp: LspConfig::default(),
+                mcp: Default::default(),
+                extensions: Default::default(),
                 system_prompt: "system".to_owned(),
+                plugins: Default::default(),
+                base_lsp: LspConfig::default(),
+                base_mcp: Default::default(),
+                base_system_prompt: "system".to_owned(),
             },
             current_dir: "/workspace".to_owned(),
             agent_activity: None,
@@ -336,6 +598,7 @@ impl App {
             return_bottom_button: None,
             terminal_tab_hitbox: None,
             pending_subagent_results: Vec::new(),
+            pending_plugin_operation: None,
             turn_started_at: None,
             last_turn_duration: None,
             runtime: SessionRuntime::test_empty(
@@ -349,6 +612,7 @@ impl App {
         match event {
             AppEvent::Key(key) => self.update_key(key),
             AppEvent::Mouse(mouse) => self.update_mouse(mouse),
+            AppEvent::ExtensionMouse(mouse) => self.update_extension_mouse(mouse),
             AppEvent::Agent(event) => self.update_agent(event),
         }
     }
@@ -356,6 +620,14 @@ impl App {
     pub fn update_agent_events(&mut self) {
         while let Some(event) = self.runtime.try_recv_agent_event() {
             self.update(AppEvent::Agent(event));
+        }
+        self.drain_plugin_operation();
+        if self.approval.is_none()
+            && let Some(request) = self.runtime.try_recv_mcp_elicitation()
+        {
+            self.status = AgentStatus::AwaitingApproval;
+            self.agent_activity = Some("MCP server is requesting input".to_owned());
+            self.approval = Some(ApprovalPrompt::new(request));
         }
     }
 
@@ -446,9 +718,23 @@ impl App {
 
     fn start_subagent_terminal(
         &mut self,
-        request: SubagentRequest,
+        mut request: SubagentRequest,
         response: std::sync::mpsc::Sender<SubagentStartResponse>,
     ) {
+        if let Some(agent) = request.agent.as_deref() {
+            match self.config.extensions.agent_prompt(agent, &request.prompt) {
+                Ok(prompt) => request.prompt = prompt,
+                Err(error) => {
+                    response
+                        .send(SubagentStartResponse::failed(
+                            request.task_id,
+                            format!("{error:#}"),
+                        ))
+                        .ok();
+                    return;
+                }
+            }
+        }
         let terminal_tab = self.terminal_tabs.len();
         let task = match self.runtime.start_subagent_task(&request, terminal_tab) {
             Ok(task) => task,
@@ -489,6 +775,8 @@ impl App {
                 shell_tool_mode: ShellToolMode::TerminalRun,
                 read_file_state: self.runtime.read_file_state(),
                 lsp_manager: self.runtime.lsp_manager(),
+                dynamic_tools: self.runtime.dynamic_tools(),
+                hook_runner: self.runtime.hook_runner(),
             },
             event_tx,
             outcome_tx,
@@ -775,6 +1063,9 @@ impl App {
         if self.terminal_focused && self.write_terminal_key(&key) {
             return;
         }
+        if action == KeyAction::Quit && self.pending_plugin_operation.is_some() {
+            return;
+        }
         if action == KeyAction::Quit {
             if self.status == AgentStatus::Idle {
                 self.should_quit = true;
@@ -797,6 +1088,14 @@ impl App {
         }
         if self.status_view.is_some() {
             self.update_status_view_key(action);
+            return;
+        }
+        if self.mcp_view.is_some() {
+            self.update_mcp_view_key(action);
+            return;
+        }
+        if self.plugins_view.is_some() {
+            self.update_plugins_view_key(action);
             return;
         }
         if self.model_picker.is_some() {
@@ -968,6 +1267,8 @@ impl App {
             || self.model_picker.is_some()
             || self.resume_picker.is_some()
             || self.status_view.is_some()
+            || self.mcp_view.is_some()
+            || self.plugins_view.is_some()
         {
             return None;
         }
@@ -983,7 +1284,7 @@ impl App {
         let Some(query) = self.slash_query() else {
             return Vec::new();
         };
-        matching_slash_commands(query)
+        matching_slash_commands(query, &self.config.extensions.commands)
     }
 
     pub fn slash_menu_visible(&self) -> bool {
@@ -998,7 +1299,7 @@ impl App {
                     self.slash_command_selection
                         .min(matches.len().saturating_sub(1)),
                 ) {
-                    self.run_slash_command(*command);
+                    self.run_slash_command(command.clone());
                 } else {
                     self.submit_unknown_slash_command();
                 }
@@ -1017,7 +1318,8 @@ impl App {
         }
     }
 
-    fn run_slash_command(&mut self, command: SlashCommand) {
+    fn run_slash_command(&mut self, command: impl Into<SlashCommand>) {
+        let command = command.into();
         match command.kind {
             SlashCommandKind::New => self.run_new_session(),
             SlashCommandKind::Clear => self.run_clear_context(),
@@ -1028,7 +1330,36 @@ impl App {
             SlashCommandKind::Model => self.open_model_picker(),
             SlashCommandKind::Resume => self.open_resume_picker(),
             SlashCommandKind::Terminal => self.toggle_terminal(),
+            SlashCommandKind::Mcp => self.open_mcp_view(),
+            SlashCommandKind::Plugins => self.open_plugins_view(),
+            SlashCommandKind::PluginPrompt(index) => self.run_plugin_prompt(index),
+            SlashCommandKind::ReloadPlugins => {
+                let result = PluginManager::refresh(
+                    &self.config.plugins,
+                    self.config.base_mcp.clone(),
+                    self.config.base_lsp.clone(),
+                    &plugin_command_cwd(),
+                );
+                self.apply_plugin_mutation("/reload-plugins", result);
+            }
         }
+    }
+
+    fn run_plugin_prompt(&mut self, index: usize) {
+        let Some(command) = self.config.extensions.commands.get(index) else {
+            return;
+        };
+        let prompt = command.expand("");
+        self.input.set("");
+        self.submit_prompt(prompt, true);
+    }
+
+    fn show_local_command(&mut self, command: &str, response: String) {
+        self.input.set("");
+        self.messages.push(Message::user(command));
+        self.record_local_exchange(command.to_owned(), response.clone());
+        self.messages.push(Message::assistant(response));
+        self.scroll = 0;
     }
 
     fn submit_unknown_slash_command(&mut self) {
@@ -1329,6 +1660,927 @@ impl App {
         self.select_terminal_tab(tab);
     }
 
+    fn open_mcp_view(&mut self) {
+        self.input.set("/mcp");
+        self.mcp_view = Some(McpView {
+            selected: usize::from(!self.runtime.mcp_statuses().is_empty()),
+            detail_scroll: 0,
+            detail_max_scroll: 0,
+            focus: McpFocus::Servers,
+            screen: McpScreen::Browse,
+            notice: None,
+        });
+    }
+
+    fn update_mcp_view_key(&mut self, key: KeyAction) {
+        if matches!(
+            self.mcp_view.as_ref().map(|view| &view.screen),
+            Some(McpScreen::Add(_))
+        ) {
+            self.update_mcp_add_key(key);
+            return;
+        }
+        if matches!(
+            self.mcp_view.as_ref().map(|view| &view.screen),
+            Some(McpScreen::OAuth { .. })
+        ) {
+            self.update_mcp_oauth_key(key);
+            return;
+        }
+        if matches!(
+            self.mcp_view.as_ref().map(|view| &view.screen),
+            Some(McpScreen::ConfirmLogout { .. })
+        ) {
+            self.update_mcp_logout_key(key);
+            return;
+        }
+
+        let details = matches!(
+            self.mcp_view.as_ref().map(|view| &view.screen),
+            Some(McpScreen::Details)
+        );
+        match key {
+            KeyAction::Escape if details => self.show_mcp_browse(),
+            KeyAction::Escape => self.close_mcp_view(),
+            KeyAction::Submit if details => self.show_mcp_browse(),
+            KeyAction::Submit => self.open_selected_mcp_item(),
+            KeyAction::Tab if !details => self.toggle_mcp_focus(),
+            KeyAction::Left if !details => self.set_mcp_focus(McpFocus::Servers),
+            KeyAction::Right if !details => self.set_mcp_focus(McpFocus::Details),
+            KeyAction::Up => self.move_or_scroll_mcp(-1),
+            KeyAction::Down => self.move_or_scroll_mcp(1),
+            KeyAction::Char('r' | 'R') => self.reconnect_selected_mcp(),
+            KeyAction::Char('a' | 'A') => self.authorize_selected_mcp(),
+            KeyAction::Char('l' | 'L') => self.request_mcp_logout(),
+            _ => {}
+        }
+    }
+
+    fn update_mcp_oauth_key(&mut self, key: KeyAction) {
+        match key {
+            KeyAction::Escape => {
+                self.show_mcp_browse();
+                return;
+            }
+            KeyAction::Submit => {
+                self.complete_mcp_oauth();
+                return;
+            }
+            _ => {}
+        }
+
+        let Some(McpScreen::OAuth { callback, .. }) =
+            self.mcp_view.as_mut().map(|view| &mut view.screen)
+        else {
+            return;
+        };
+        match key {
+            KeyAction::Char(char) => callback.push(char),
+            KeyAction::Backspace => callback.backspace(),
+            KeyAction::Delete => callback.delete_forward(),
+            KeyAction::Left => callback.move_left(),
+            KeyAction::Right => callback.move_right(),
+            _ => {}
+        }
+    }
+
+    fn update_mcp_add_key(&mut self, key: KeyAction) {
+        if !matches!(key, KeyAction::Escape | KeyAction::Submit)
+            && let Some(view) = self.mcp_view.as_mut()
+        {
+            view.notice = None;
+        }
+        match key {
+            KeyAction::Escape => {
+                self.show_mcp_browse();
+                return;
+            }
+            KeyAction::Submit => {
+                self.add_mcp_server();
+                return;
+            }
+            KeyAction::Up => {
+                if let Some(McpScreen::Add(form)) =
+                    self.mcp_view.as_mut().map(|view| &mut view.screen)
+                {
+                    form.focus = form.focus.saturating_sub(1);
+                }
+                return;
+            }
+            KeyAction::Down | KeyAction::Tab => {
+                if let Some(McpScreen::Add(form)) =
+                    self.mcp_view.as_mut().map(|view| &mut view.screen)
+                {
+                    form.focus = (form.focus + 1).min(form.fields().len() - 1);
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        let Some(McpScreen::Add(form)) = self.mcp_view.as_mut().map(|view| &mut view.screen) else {
+            return;
+        };
+        match (form.selected_field(), key) {
+            (McpAddField::Transport, KeyAction::Left) => {
+                form.transport = form.transport.previous();
+                form.focus = 0;
+            }
+            (McpAddField::Transport, KeyAction::Right | KeyAction::Char(' ')) => {
+                form.transport = form.transport.next();
+                form.focus = 0;
+            }
+            (McpAddField::Approval, KeyAction::Left) => {
+                form.approval = previous_mcp_approval(form.approval)
+            }
+            (McpAddField::Approval, KeyAction::Right | KeyAction::Char(' ')) => {
+                form.approval = next_mcp_approval(form.approval)
+            }
+            (_, KeyAction::Char(char)) => {
+                if let Some(input) = form.selected_input_mut() {
+                    input.push(char);
+                }
+            }
+            (_, KeyAction::Backspace) => {
+                if let Some(input) = form.selected_input_mut() {
+                    input.backspace();
+                }
+            }
+            (_, KeyAction::Delete) => {
+                if let Some(input) = form.selected_input_mut() {
+                    input.delete_forward();
+                }
+            }
+            (_, KeyAction::Left) => {
+                if let Some(input) = form.selected_input_mut() {
+                    input.move_left();
+                }
+            }
+            (_, KeyAction::Right) => {
+                if let Some(input) = form.selected_input_mut() {
+                    input.move_right();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn update_mcp_logout_key(&mut self, key: KeyAction) {
+        match key {
+            KeyAction::Submit | KeyAction::Char('y' | 'Y') => self.confirm_mcp_logout(),
+            KeyAction::Escape | KeyAction::Char('n' | 'N') => self.show_mcp_browse(),
+            _ => {}
+        }
+    }
+
+    fn close_mcp_view(&mut self) {
+        self.mcp_view = None;
+        self.input.set("");
+    }
+
+    fn show_mcp_browse(&mut self) {
+        if let Some(view) = self.mcp_view.as_mut() {
+            view.screen = McpScreen::Browse;
+            view.detail_scroll = 0;
+        }
+    }
+
+    fn toggle_mcp_focus(&mut self) {
+        let Some(view) = self.mcp_view.as_mut() else {
+            return;
+        };
+        view.focus = match view.focus {
+            McpFocus::Servers => McpFocus::Details,
+            McpFocus::Details => McpFocus::Servers,
+        };
+    }
+
+    fn open_selected_mcp_item(&mut self) {
+        let selected = self
+            .mcp_view
+            .as_ref()
+            .map(|view| view.selected)
+            .unwrap_or_default();
+        if selected == 0 {
+            if let Some(view) = self.mcp_view.as_mut() {
+                view.screen = McpScreen::Add(Box::default());
+                view.notice = None;
+            }
+        } else if self.runtime.mcp_statuses().get(selected - 1).is_some()
+            && let Some(view) = self.mcp_view.as_mut()
+        {
+            view.screen = McpScreen::Details;
+            view.focus = McpFocus::Details;
+            view.detail_scroll = 0;
+            view.notice = None;
+        }
+    }
+
+    fn set_mcp_focus(&mut self, focus: McpFocus) {
+        if let Some(view) = self.mcp_view.as_mut() {
+            view.focus = focus;
+        }
+    }
+
+    fn move_or_scroll_mcp(&mut self, direction: isize) {
+        let row_count = self.runtime.mcp_statuses().len() + 1;
+        let Some(view) = self.mcp_view.as_mut() else {
+            return;
+        };
+        let selecting = matches!(view.screen, McpScreen::Browse) && view.focus == McpFocus::Servers;
+        if selecting {
+            view.selected = move_index(view.selected, direction, row_count);
+            view.detail_scroll = 0;
+            view.notice = None;
+        } else {
+            view.detail_scroll = view
+                .detail_scroll
+                .saturating_add_signed(direction)
+                .min(view.detail_max_scroll);
+        }
+    }
+
+    fn selected_mcp_server(&self) -> Option<String> {
+        let view = self.mcp_view.as_ref()?;
+        let index = view.selected.checked_sub(1)?;
+        self.runtime
+            .mcp_statuses()
+            .get(index)
+            .map(|status| status.name.clone())
+    }
+
+    fn add_mcp_server(&mut self) {
+        self.add_mcp_server_at(&plugin_command_cwd().join("config.yaml"));
+    }
+
+    fn add_mcp_server_at(&mut self, config_path: &Path) {
+        let result = self
+            .mcp_view
+            .as_ref()
+            .and_then(|view| match &view.screen {
+                McpScreen::Add(form) => Some(mcp_server_from_form(form)),
+                _ => None,
+            })
+            .unwrap_or_else(|| bail!("MCP add form is not open"))
+            .and_then(|(name, server)| {
+                if self.config.mcp.servers.contains_key(&name) {
+                    bail!("MCP server '{name}' already exists");
+                }
+                persist_mcp_server(config_path, &name, &server)?;
+                Ok((name, server))
+            });
+
+        match result {
+            Ok((name, server)) => {
+                self.config
+                    .base_mcp
+                    .servers
+                    .insert(name.clone(), server.clone());
+                self.config.mcp.servers.insert(name.clone(), server);
+                self.runtime.reload_mcp(self.config.mcp.clone());
+                let selected = self
+                    .runtime
+                    .mcp_statuses()
+                    .iter()
+                    .position(|status| status.name == name)
+                    .map(|index| index + 1)
+                    .unwrap_or_default();
+                if let Some(view) = self.mcp_view.as_mut() {
+                    view.selected = selected;
+                    view.detail_scroll = 0;
+                    view.focus = McpFocus::Servers;
+                    view.screen = McpScreen::Browse;
+                }
+                self.set_mcp_notice(
+                    format!("Added MCP server '{name}' and saved it to config.yaml."),
+                    false,
+                );
+            }
+            Err(error) => self.set_mcp_notice(format!("Could not add MCP server: {error:#}"), true),
+        }
+    }
+
+    fn reconnect_selected_mcp(&mut self) {
+        let Some(server) = self.selected_mcp_server() else {
+            return;
+        };
+        if self
+            .config
+            .mcp
+            .servers
+            .get(&server)
+            .is_some_and(|config| !config.enabled)
+        {
+            self.set_mcp_notice(
+                "This server is disabled by configuration; enable it in config.yaml or its plugin.",
+                true,
+            );
+            return;
+        }
+        match self.runtime.reconnect_mcp(&server) {
+            Ok(()) => self.set_mcp_notice(format!("Reconnected MCP server '{server}'."), false),
+            Err(error) => {
+                self.set_mcp_notice(format!("Could not reconnect '{server}': {error:#}"), true)
+            }
+        }
+    }
+
+    fn authorize_selected_mcp(&mut self) {
+        let Some(server) = self.selected_mcp_server() else {
+            return;
+        };
+        match self.runtime.begin_mcp_oauth(&server) {
+            Ok(authorization_url) => {
+                if let Some(view) = self.mcp_view.as_mut() {
+                    view.screen = McpScreen::OAuth {
+                        server,
+                        authorization_url,
+                        callback: InputState::default(),
+                    };
+                    view.notice = None;
+                }
+            }
+            Err(error) => {
+                self.set_mcp_notice(format!("Could not authorize '{server}': {error:#}"), true)
+            }
+        }
+    }
+
+    fn complete_mcp_oauth(&mut self) {
+        let Some((server, callback_url)) = self.mcp_view.as_ref().and_then(|view| {
+            if let McpScreen::OAuth {
+                server, callback, ..
+            } = &view.screen
+            {
+                Some((server.clone(), callback.value.trim().to_owned()))
+            } else {
+                None
+            }
+        }) else {
+            return;
+        };
+        if callback_url.is_empty() {
+            self.set_mcp_notice("Paste the complete callback URL before continuing.", true);
+            return;
+        }
+        match self.runtime.complete_mcp_oauth(&server, &callback_url) {
+            Ok(()) => {
+                self.show_mcp_browse();
+                self.set_mcp_notice(format!("Authorized MCP server '{server}'."), false);
+            }
+            Err(error) => self.set_mcp_notice(
+                format!("Could not complete authorization for '{server}': {error:#}"),
+                true,
+            ),
+        }
+    }
+
+    fn request_mcp_logout(&mut self) {
+        let Some(server) = self.selected_mcp_server() else {
+            return;
+        };
+        if let Some(view) = self.mcp_view.as_mut() {
+            view.screen = McpScreen::ConfirmLogout { server };
+            view.notice = None;
+        }
+    }
+
+    fn confirm_mcp_logout(&mut self) {
+        let Some(server) = self.mcp_view.as_ref().and_then(|view| {
+            if let McpScreen::ConfirmLogout { server } = &view.screen {
+                Some(server.clone())
+            } else {
+                None
+            }
+        }) else {
+            return;
+        };
+        match self.runtime.logout_mcp_oauth(&server) {
+            Ok(()) => {
+                self.show_mcp_browse();
+                self.set_mcp_notice(format!("Logged out of MCP server '{server}'."), false);
+            }
+            Err(error) => {
+                self.show_mcp_browse();
+                self.set_mcp_notice(format!("Could not log out of '{server}': {error:#}"), true);
+            }
+        }
+    }
+
+    fn set_mcp_notice(&mut self, message: impl Into<String>, failed: bool) {
+        if let Some(view) = self.mcp_view.as_mut() {
+            view.notice = Some(McpNotice {
+                message: message.into(),
+                failed,
+            });
+        }
+    }
+
+    pub(crate) fn mcp_statuses(&self) -> Vec<crate::services::mcp::McpServerStatus> {
+        self.runtime.mcp_statuses()
+    }
+
+    pub fn set_mcp_detail_max_scroll(&mut self, max_scroll: usize) {
+        if let Some(view) = self.mcp_view.as_mut() {
+            view.detail_max_scroll = max_scroll;
+            view.detail_scroll = view.detail_scroll.min(max_scroll);
+        }
+    }
+
+    pub fn set_plugins_detail_max_scroll(&mut self, max_scroll: usize) {
+        if let Some(view) = self.plugins_view.as_mut() {
+            view.detail_max_scroll = max_scroll;
+            view.detail_scroll = view.detail_scroll.min(max_scroll);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reload_mcp_for_test(&mut self, config: crate::services::mcp::McpConfig) {
+        self.config.mcp = config.clone();
+        self.config.base_mcp = config.clone();
+        self.runtime
+            .reload_extensions(Default::default(), config, Vec::new());
+    }
+
+    fn open_plugins_view(&mut self) {
+        self.input.set("/plugins");
+        self.plugins_view = Some(PluginsView {
+            tab: PluginsTab::Installed,
+            screen: PluginsScreen::Browse,
+            selected_installed: 0,
+            selected_marketplace: 0,
+            detail_scroll: 0,
+            detail_max_scroll: 0,
+        });
+    }
+
+    fn update_plugins_view_key(&mut self, key: KeyAction) {
+        if matches!(
+            self.plugins_view.as_ref().map(|view| &view.screen),
+            Some(PluginsScreen::AddMarketplace(_))
+        ) {
+            self.update_marketplace_input_key(key);
+            return;
+        }
+
+        if matches!(
+            self.plugins_view.as_ref().map(|view| &view.screen),
+            Some(PluginsScreen::Operation(_))
+        ) {
+            if key == KeyAction::Escape || key == KeyAction::Submit {
+                let finished = self
+                    .plugins_view
+                    .as_ref()
+                    .and_then(|view| match &view.screen {
+                        PluginsScreen::Operation(operation) => Some(operation.finished),
+                        _ => None,
+                    })
+                    .unwrap_or(false);
+                if finished && let Some(view) = self.plugins_view.as_mut() {
+                    view.screen = PluginsScreen::Browse;
+                    view.detail_scroll = 0;
+                }
+            }
+            return;
+        }
+
+        if !matches!(
+            self.plugins_view.as_ref().map(|view| &view.screen),
+            Some(PluginsScreen::Browse)
+        ) {
+            match key {
+                KeyAction::Escape | KeyAction::Submit => {
+                    if let Some(view) = self.plugins_view.as_mut() {
+                        view.screen = PluginsScreen::Browse;
+                        view.detail_scroll = 0;
+                    }
+                }
+                KeyAction::Char(' ') => self.toggle_selected_plugin(),
+                _ => {}
+            }
+            return;
+        }
+
+        match key {
+            KeyAction::Escape => self.close_plugins_view(),
+            KeyAction::Left => self.move_plugins_tab(-1),
+            KeyAction::Right | KeyAction::Tab => self.move_plugins_tab(1),
+            KeyAction::Up => self.move_plugins_selection(-1),
+            KeyAction::Down => self.move_plugins_selection(1),
+            KeyAction::Submit => self.open_selected_plugin_item(),
+            KeyAction::Char(' ') => self.toggle_selected_plugin(),
+            _ => {}
+        }
+    }
+
+    fn update_marketplace_input_key(&mut self, key: KeyAction) {
+        let source = match key {
+            KeyAction::Submit => {
+                self.plugins_view
+                    .as_mut()
+                    .and_then(|view| match &mut view.screen {
+                        PluginsScreen::AddMarketplace(input) => Some(input.take_trimmed()),
+                        _ => None,
+                    })
+            }
+            KeyAction::Escape => {
+                if let Some(view) = self.plugins_view.as_mut() {
+                    view.screen = PluginsScreen::Browse;
+                    view.detail_scroll = 0;
+                }
+                return;
+            }
+            KeyAction::Char(character) => {
+                if let Some(PluginsScreen::AddMarketplace(input)) =
+                    self.plugins_view.as_mut().map(|view| &mut view.screen)
+                {
+                    input.push(character);
+                }
+                return;
+            }
+            KeyAction::Backspace => {
+                if let Some(PluginsScreen::AddMarketplace(input)) =
+                    self.plugins_view.as_mut().map(|view| &mut view.screen)
+                {
+                    input.backspace();
+                }
+                return;
+            }
+            KeyAction::Delete => {
+                if let Some(PluginsScreen::AddMarketplace(input)) =
+                    self.plugins_view.as_mut().map(|view| &mut view.screen)
+                {
+                    input.delete_forward();
+                }
+                return;
+            }
+            KeyAction::Left | KeyAction::Right => {
+                if let Some(PluginsScreen::AddMarketplace(input)) =
+                    self.plugins_view.as_mut().map(|view| &mut view.screen)
+                {
+                    if key == KeyAction::Left {
+                        input.move_left();
+                    } else {
+                        input.move_right();
+                    }
+                }
+                return;
+            }
+            _ => return,
+        };
+        if let Some(source) = source.filter(|source| !source.is_empty()) {
+            self.start_plugin_ui_operation(
+                "Adding marketplace".to_owned(),
+                source.clone(),
+                PluginUiMutation::AddMarketplace(source),
+            );
+        }
+    }
+
+    fn close_plugins_view(&mut self) {
+        if self.pending_plugin_operation.is_some() {
+            return;
+        }
+        self.plugins_view = None;
+        self.input.set("");
+    }
+
+    fn move_plugins_tab(&mut self, direction: isize) {
+        let Some(view) = self.plugins_view.as_mut() else {
+            return;
+        };
+        view.tab = if direction < 0 {
+            view.tab.previous()
+        } else {
+            view.tab.next()
+        };
+        view.detail_scroll = 0;
+    }
+
+    fn move_plugins_selection(&mut self, direction: isize) {
+        let marketplace_count = self.marketplace_selection_count();
+        let installed_count = self.config.extensions.installed_plugins.len();
+        let Some(view) = self.plugins_view.as_mut() else {
+            return;
+        };
+        match view.tab {
+            PluginsTab::Installed => {
+                view.selected_installed =
+                    move_index(view.selected_installed, direction, installed_count);
+            }
+            PluginsTab::Marketplaces => {
+                view.selected_marketplace =
+                    move_index(view.selected_marketplace, direction, marketplace_count);
+            }
+        }
+        view.detail_scroll = 0;
+    }
+
+    fn open_selected_plugin_item(&mut self) {
+        let Some(view) = self.plugins_view.as_ref() else {
+            return;
+        };
+        match view.tab {
+            PluginsTab::Installed => {
+                if view.selected_installed < self.config.extensions.installed_plugins.len()
+                    && let Some(view) = self.plugins_view.as_mut()
+                {
+                    view.screen = PluginsScreen::InstalledDetail(view.selected_installed);
+                    view.detail_scroll = 0;
+                }
+            }
+            PluginsTab::Marketplaces => {
+                match self.marketplace_selection_at(view.selected_marketplace) {
+                    Some(MarketplaceSelection::Add) => {
+                        if let Some(view) = self.plugins_view.as_mut() {
+                            view.screen = PluginsScreen::AddMarketplace(InputState::default());
+                            view.detail_scroll = 0;
+                        }
+                    }
+                    Some(MarketplaceSelection::Plugin(index)) => {
+                        if let Some(view) = self.plugins_view.as_mut() {
+                            view.screen = PluginsScreen::MarketplacePluginDetail(index);
+                            view.detail_scroll = 0;
+                        }
+                    }
+                    Some(MarketplaceSelection::Marketplace(_)) | None => {}
+                }
+            }
+        }
+    }
+
+    fn toggle_selected_plugin(&mut self) {
+        let Some(view) = self.plugins_view.as_ref() else {
+            return;
+        };
+        match view.tab {
+            PluginsTab::Installed => {
+                let Some(plugin) = self
+                    .config
+                    .extensions
+                    .installed_plugins
+                    .get(view.selected_installed)
+                else {
+                    return;
+                };
+                if plugin.config_managed {
+                    self.show_plugin_ui_error(
+                        "Config-managed plugins must be enabled or disabled in config.yaml.",
+                    );
+                    return;
+                }
+                let spec = plugin.spec();
+                let enabled = !plugin.enabled;
+                self.set_plugin_enabled(spec, enabled);
+            }
+            PluginsTab::Marketplaces => {
+                let Some(MarketplaceSelection::Plugin(index)) =
+                    self.marketplace_selection_at(view.selected_marketplace)
+                else {
+                    return;
+                };
+                let Some(plugin) = self.config.extensions.marketplace_plugins.get(index) else {
+                    return;
+                };
+                let spec = format!("{}@{}", plugin.name, plugin.marketplace);
+                let (title, mutation) = if plugin.installed {
+                    (
+                        "Uninstalling plugin".to_owned(),
+                        PluginUiMutation::Uninstall(spec.clone()),
+                    )
+                } else {
+                    (
+                        "Installing plugin".to_owned(),
+                        PluginUiMutation::Install(spec.clone()),
+                    )
+                };
+                self.start_plugin_ui_operation(title, spec, mutation);
+            }
+        }
+    }
+
+    fn marketplace_selection_count(&self) -> usize {
+        1 + self.config.extensions.marketplaces.len()
+            + self.config.extensions.marketplace_plugins.len()
+    }
+
+    fn marketplace_selection_at(&self, selected: usize) -> Option<MarketplaceSelection> {
+        if selected == 0 {
+            return Some(MarketplaceSelection::Add);
+        }
+        let mut row = 1;
+        for (marketplace_index, marketplace) in
+            self.config.extensions.marketplaces.iter().enumerate()
+        {
+            if selected == row {
+                return Some(MarketplaceSelection::Marketplace(marketplace_index));
+            }
+            row += 1;
+            for (plugin_index, _plugin) in self
+                .config
+                .extensions
+                .marketplace_plugins
+                .iter()
+                .enumerate()
+                .filter(|(_, plugin)| plugin.marketplace == marketplace.name)
+            {
+                if selected == row {
+                    return Some(MarketplaceSelection::Plugin(plugin_index));
+                }
+                row += 1;
+            }
+        }
+        None
+    }
+
+    fn show_plugin_ui_error(&mut self, message: &str) {
+        if let Some(view) = self.plugins_view.as_mut() {
+            view.screen = PluginsScreen::Operation(PluginOperationView {
+                title: "Plugin operation".to_owned(),
+                subject: String::new(),
+                log: vec![message.to_owned()],
+                uses_git: false,
+                finished: true,
+                failed: true,
+            });
+        }
+    }
+
+    fn set_plugin_enabled(&mut self, spec: String, enabled: bool) {
+        let cwd = plugin_command_cwd();
+        match PluginManager::set_enabled(
+            &self.config.plugins,
+            self.config.base_mcp.clone(),
+            self.config.base_lsp.clone(),
+            &cwd,
+            &spec,
+            enabled,
+        ) {
+            Ok(result) => self.activate_plugin_mutation(result),
+            Err(error) => self.show_plugin_ui_error(&format!("{error:#}")),
+        }
+    }
+
+    fn activate_plugin_mutation(&mut self, result: PluginMutationResult) {
+        self.runtime.reload_extensions(
+            result.load.lsp.clone(),
+            result.load.mcp.clone(),
+            result.load.catalog.hooks.clone(),
+        );
+        self.config.apply_plugin_load(result.load);
+        self.clamp_plugins_view_selection();
+    }
+
+    fn start_plugin_ui_operation(
+        &mut self,
+        title: String,
+        subject: String,
+        mutation: PluginUiMutation,
+    ) {
+        if self.pending_plugin_operation.is_some() {
+            return;
+        }
+        let (sender, events) = std::sync::mpsc::sync_channel(512);
+        let plugins = self.config.plugins.clone();
+        let mcp = self.config.base_mcp.clone();
+        let lsp = self.config.base_lsp.clone();
+        let cwd = plugin_command_cwd();
+        if let Some(view) = self.plugins_view.as_mut() {
+            view.screen = PluginsScreen::Operation(PluginOperationView {
+                title,
+                subject,
+                log: vec!["Preparing plugin operation...".to_owned()],
+                uses_git: true,
+                finished: false,
+                failed: false,
+            });
+        }
+        std::thread::spawn(move || {
+            let progress_sender = sender.clone();
+            let reporter = std::sync::Arc::new(move |message: String| {
+                progress_sender
+                    .send(PluginOperationEvent::Progress(message))
+                    .ok();
+            });
+            let result = PluginManager::with_progress(reporter, || match mutation {
+                PluginUiMutation::AddMarketplace(source) => {
+                    sender
+                        .send(PluginOperationEvent::Progress(
+                            "Resolving marketplace source and downloading Git data...".to_owned(),
+                        ))
+                        .ok();
+                    PluginManager::add_marketplace(&plugins, mcp, lsp, &cwd, &source)
+                }
+                PluginUiMutation::Install(spec) => {
+                    sender
+                        .send(PluginOperationEvent::Progress(
+                            "Resolving plugin source and downloading Git data...".to_owned(),
+                        ))
+                        .ok();
+                    PluginManager::install(&plugins, mcp, lsp, &cwd, &spec)
+                }
+                PluginUiMutation::Uninstall(spec) => {
+                    sender
+                        .send(PluginOperationEvent::Progress(
+                            "Removing plugin registration...".to_owned(),
+                        ))
+                        .ok();
+                    PluginManager::uninstall(&plugins, mcp, lsp, &cwd, &spec)
+                }
+            });
+            sender
+                .send(PluginOperationEvent::Finished(Box::new(
+                    result.map_err(|error| format!("{error:#}")),
+                )))
+                .ok();
+        });
+        self.pending_plugin_operation = Some(PendingPluginOperation { events });
+    }
+
+    fn drain_plugin_operation(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(operation) = self.pending_plugin_operation.as_ref() {
+            loop {
+                match operation.events.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        let finished = events
+            .iter()
+            .any(|event| matches!(event, PluginOperationEvent::Finished(_)));
+        for event in events {
+            self.handle_plugin_operation_event(event);
+        }
+        if disconnected && !finished && self.pending_plugin_operation.is_some() {
+            self.handle_plugin_operation_event(PluginOperationEvent::Finished(Box::new(Err(
+                "plugin operation channel closed before completion".to_owned(),
+            ))));
+        }
+        if finished || disconnected {
+            self.pending_plugin_operation = None;
+        }
+    }
+
+    fn handle_plugin_operation_event(&mut self, event: PluginOperationEvent) {
+        match event {
+            PluginOperationEvent::Progress(message) => {
+                if let Some(PluginsScreen::Operation(operation)) =
+                    self.plugins_view.as_mut().map(|view| &mut view.screen)
+                {
+                    operation.log.push(message);
+                    if operation.log.len() > 500 {
+                        operation.log.drain(..operation.log.len() - 500);
+                    }
+                }
+            }
+            PluginOperationEvent::Finished(result) => match *result {
+                Ok(result) => {
+                    let message = result.message.clone();
+                    self.activate_plugin_mutation(result);
+                    if let Some(PluginsScreen::Operation(operation)) =
+                        self.plugins_view.as_mut().map(|view| &mut view.screen)
+                    {
+                        operation.log.push(message);
+                        operation
+                            .log
+                            .push("Changes are active in this session.".to_owned());
+                        operation.finished = true;
+                    }
+                }
+                Err(error) => {
+                    if let Some(PluginsScreen::Operation(operation)) =
+                        self.plugins_view.as_mut().map(|view| &mut view.screen)
+                    {
+                        operation.log.push(format!("Error: {error}"));
+                        operation.finished = true;
+                        operation.failed = true;
+                    }
+                }
+            },
+        }
+    }
+
+    fn clamp_plugins_view_selection(&mut self) {
+        let installed_count = self.config.extensions.installed_plugins.len();
+        let marketplace_count = self.marketplace_selection_count();
+        if let Some(view) = self.plugins_view.as_mut() {
+            view.selected_installed = view
+                .selected_installed
+                .min(installed_count.saturating_sub(1));
+            view.selected_marketplace = view
+                .selected_marketplace
+                .min(marketplace_count.saturating_sub(1));
+            view.detail_scroll = 0;
+        }
+    }
+
     fn apply_loaded_transcript(&mut self, loaded: LoadedTranscript) {
         self.messages = loaded.messages;
         self.usage = loaded.usage;
@@ -1375,11 +2627,36 @@ impl App {
         let Some(approval) = self.approval.take() else {
             return;
         };
+        let input = if approval.request.elicitation_schema().is_some()
+            && approval.selected == crate::approval::ApprovalChoice::Yes
+        {
+            let value = if approval.feedback.value.trim().is_empty() {
+                serde_json::json!({})
+            } else {
+                match serde_json::from_str(&approval.feedback.value) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.run_notice = Some(format!("Invalid MCP response JSON: {error}"));
+                        self.approval = Some(approval);
+                        return;
+                    }
+                }
+            };
+            if !value.is_object() {
+                self.run_notice = Some("MCP response JSON must be an object.".to_owned());
+                self.approval = Some(approval);
+                return;
+            }
+            Some(value)
+        } else {
+            None
+        };
         let decision = approval.decision();
         self.runtime
             .handle_command(RuntimeCommand::ApprovalDecision {
                 id: approval.request.id,
                 decision,
+                input,
             });
         self.status = AgentStatus::Responding;
     }
@@ -1387,6 +2664,105 @@ impl App {
     fn clear_conversation_edit_permission(&mut self) {
         self.runtime
             .handle_command(RuntimeCommand::ClearConversationEditPermission);
+    }
+
+    fn update_extension_mouse(&mut self, mouse: ExtensionMouseAction) {
+        match mouse {
+            ExtensionMouseAction::Mcp(action) => self.update_mcp_mouse(action),
+            ExtensionMouseAction::Plugins(action) => self.update_plugins_mouse(action),
+        }
+    }
+
+    fn update_mcp_mouse(&mut self, action: McpMouseAction) {
+        match action {
+            McpMouseAction::SelectServer(selected) => {
+                let row_count = self.runtime.mcp_statuses().len() + 1;
+                if let Some(view) = self.mcp_view.as_mut()
+                    && matches!(view.screen, McpScreen::Browse)
+                    && selected < row_count
+                {
+                    view.selected = selected;
+                    view.focus = McpFocus::Servers;
+                    view.detail_scroll = 0;
+                    view.notice = None;
+                }
+            }
+            McpMouseAction::OpenSelected => self.open_selected_mcp_item(),
+            McpMouseAction::MoveServerSelection(direction) => {
+                if let Some(view) = self.mcp_view.as_mut()
+                    && matches!(view.screen, McpScreen::Browse)
+                {
+                    view.focus = McpFocus::Servers;
+                }
+                self.move_or_scroll_mcp(direction);
+            }
+            McpMouseAction::ScrollDetails(direction) => {
+                if let Some(view) = self.mcp_view.as_mut() {
+                    if matches!(view.screen, McpScreen::Browse) {
+                        if view.selected == 0 {
+                            return;
+                        }
+                        view.focus = McpFocus::Details;
+                    }
+                    view.detail_scroll = view
+                        .detail_scroll
+                        .saturating_add_signed(direction)
+                        .min(view.detail_max_scroll);
+                }
+            }
+            McpMouseAction::None => {}
+        }
+    }
+
+    fn update_plugins_mouse(&mut self, action: PluginsMouseAction) {
+        match action {
+            PluginsMouseAction::SelectTab(tab) => {
+                if let Some(view) = self.plugins_view.as_mut()
+                    && matches!(
+                        view.screen,
+                        PluginsScreen::Browse
+                            | PluginsScreen::InstalledDetail(_)
+                            | PluginsScreen::MarketplacePluginDetail(_)
+                    )
+                {
+                    view.tab = match tab {
+                        PluginsMouseTab::Installed => PluginsTab::Installed,
+                        PluginsMouseTab::Marketplaces => PluginsTab::Marketplaces,
+                    };
+                    view.screen = PluginsScreen::Browse;
+                    view.detail_scroll = 0;
+                }
+            }
+            PluginsMouseAction::SelectItem(selected) => {
+                let installed_count = self.config.extensions.installed_plugins.len();
+                let marketplace_count = self.marketplace_selection_count();
+                if let Some(view) = self.plugins_view.as_mut()
+                    && matches!(view.screen, PluginsScreen::Browse)
+                {
+                    match view.tab {
+                        PluginsTab::Installed if selected < installed_count => {
+                            view.selected_installed = selected
+                        }
+                        PluginsTab::Marketplaces if selected < marketplace_count => {
+                            view.selected_marketplace = selected
+                        }
+                        _ => return,
+                    }
+                    view.detail_scroll = 0;
+                }
+            }
+            PluginsMouseAction::MoveSelection(direction) => self.move_plugins_selection(direction),
+            PluginsMouseAction::OpenSelected => self.open_selected_plugin_item(),
+            PluginsMouseAction::ScrollDetails(direction) => {
+                if let Some(view) = self.plugins_view.as_mut() {
+                    view.detail_scroll = view
+                        .detail_scroll
+                        .saturating_add_signed(direction)
+                        .min(view.detail_max_scroll);
+                }
+            }
+            PluginsMouseAction::None => {}
+        }
     }
 
     fn update_mouse(&mut self, mouse: MouseAction) {
@@ -1559,6 +2935,7 @@ impl App {
             && self.model_picker.is_none()
             && self.resume_picker.is_none()
             && self.status_view.is_none()
+            && self.plugins_view.is_none()
     }
 
     fn mouse_over_return_bottom(&self, column: u16, row: u16) -> bool {
@@ -1786,6 +3163,81 @@ impl App {
         if prompt.is_empty() {
             return;
         }
+        if self.run_plugin_manager_command(&prompt) {
+            return;
+        }
+        if let Some((name, arguments)) = prompt
+            .strip_prefix('/')
+            .and_then(|command| command.split_once(char::is_whitespace))
+            && let Some(command) = self
+                .config
+                .extensions
+                .commands
+                .iter()
+                .find(|command| command.name == name)
+        {
+            self.submit_prompt(command.expand(arguments.trim()), true);
+            return;
+        }
+        if let Some(server) = prompt.strip_prefix("/mcp reconnect ").map(str::trim) {
+            let response = match self.runtime.reconnect_mcp(server) {
+                Ok(()) => format!(
+                    "Reconnected MCP server `{server}`.\n\n{}",
+                    self.runtime.mcp_status_text()
+                ),
+                Err(error) => format!("Failed to reconnect MCP server `{server}`: {error:#}"),
+            };
+            self.show_local_command(&prompt, response);
+            return;
+        }
+        if let Some(server) = prompt.strip_prefix("/mcp auth ").map(str::trim) {
+            let response = if server.is_empty() {
+                "Usage: /mcp auth <server>".to_owned()
+            } else {
+                match self.runtime.begin_mcp_oauth(server) {
+                    Ok(url) => format!(
+                        "OAuth authorization started for `{server}`. Open this URL:\n\n{url}\n\nAfter authorization, copy the complete redirected URL and run:\n`/mcp auth-callback {server} <redirected-url>`"
+                    ),
+                    Err(error) => {
+                        format!("Failed to start OAuth for MCP server `{server}`: {error:#}")
+                    }
+                }
+            };
+            self.show_local_command(&prompt, response);
+            return;
+        }
+        if let Some(arguments) = prompt.strip_prefix("/mcp auth-callback ").map(str::trim) {
+            let response = match arguments.split_once(char::is_whitespace) {
+                Some((server, callback_url)) => {
+                    match self.runtime.complete_mcp_oauth(server, callback_url.trim()) {
+                        Ok(()) => format!(
+                            "Authorized MCP server `{server}`.\n\n{}",
+                            self.runtime.mcp_status_text()
+                        ),
+                        Err(error) => {
+                            format!("Failed to complete OAuth for MCP server `{server}`: {error:#}")
+                        }
+                    }
+                }
+                None => "Usage: /mcp auth-callback <server> <redirected-url>".to_owned(),
+            };
+            self.show_local_command(&prompt, response);
+            return;
+        }
+        if let Some(server) = prompt.strip_prefix("/mcp logout ").map(str::trim) {
+            let response = if server.is_empty() {
+                "Usage: /mcp logout <server>".to_owned()
+            } else {
+                match self.runtime.logout_mcp_oauth(server) {
+                    Ok(()) => format!("Cleared OAuth credentials for MCP server `{server}`."),
+                    Err(error) => {
+                        format!("Failed to clear OAuth for MCP server `{server}`: {error:#}")
+                    }
+                }
+            };
+            self.show_local_command(&prompt, response);
+            return;
+        }
         self.run_notice = None;
         let event = self.runtime.handle_command(RuntimeCommand::SubmitPrompt {
             prompt,
@@ -1793,6 +3245,133 @@ impl App {
             pre_prompt_tokens: self.usage.last_usage.map(|usage| usage.prompt_tokens),
         });
         self.apply_runtime_event(event);
+    }
+
+    fn run_plugin_manager_command(&mut self, prompt: &str) -> bool {
+        if prompt == "/reload-plugins" || prompt == "/plugins reload" {
+            let result = PluginManager::refresh(
+                &self.config.plugins,
+                self.config.base_mcp.clone(),
+                self.config.base_lsp.clone(),
+                &plugin_command_cwd(),
+            );
+            self.apply_plugin_mutation(prompt, result);
+            return true;
+        }
+        if prompt == "/plugins marketplace list" {
+            self.show_local_command(prompt, self.config.extensions.plugin_status());
+            return true;
+        }
+        if prompt == "/plugins marketplace update"
+            || prompt.starts_with("/plugins marketplace update ")
+        {
+            let result = PluginManager::refresh(
+                &self.config.plugins,
+                self.config.base_mcp.clone(),
+                self.config.base_lsp.clone(),
+                &plugin_command_cwd(),
+            );
+            self.apply_plugin_mutation(prompt, result);
+            return true;
+        }
+        let operation = [
+            "/plugins marketplace add ",
+            "/plugins marketplace remove ",
+            "/plugins install ",
+            "/plugins uninstall ",
+            "/plugins enable ",
+            "/plugins disable ",
+        ]
+        .into_iter()
+        .find_map(|prefix| {
+            prompt
+                .strip_prefix(prefix)
+                .map(|value| (prefix, value.trim()))
+        });
+        let Some((operation, argument)) = operation else {
+            if prompt.starts_with("/plugins ") {
+                self.show_local_command(
+                    prompt,
+                    "Usage: /plugins marketplace add|update|remove, /plugins install|uninstall|enable|disable, or /reload-plugins"
+                        .to_owned(),
+                );
+                return true;
+            }
+            return false;
+        };
+        if argument.is_empty() {
+            self.show_local_command(
+                prompt,
+                format!("Missing argument for `{}`", operation.trim()),
+            );
+            return true;
+        }
+        let cwd = plugin_command_cwd();
+        let result = match operation {
+            "/plugins marketplace add " => PluginManager::add_marketplace(
+                &self.config.plugins,
+                self.config.base_mcp.clone(),
+                self.config.base_lsp.clone(),
+                &cwd,
+                argument,
+            ),
+            "/plugins marketplace remove " => PluginManager::remove_marketplace(
+                &self.config.plugins,
+                self.config.base_mcp.clone(),
+                self.config.base_lsp.clone(),
+                &cwd,
+                argument,
+            ),
+            "/plugins install " => PluginManager::install(
+                &self.config.plugins,
+                self.config.base_mcp.clone(),
+                self.config.base_lsp.clone(),
+                &cwd,
+                argument,
+            ),
+            "/plugins uninstall " => PluginManager::uninstall(
+                &self.config.plugins,
+                self.config.base_mcp.clone(),
+                self.config.base_lsp.clone(),
+                &cwd,
+                argument,
+            ),
+            "/plugins enable " => PluginManager::set_enabled(
+                &self.config.plugins,
+                self.config.base_mcp.clone(),
+                self.config.base_lsp.clone(),
+                &cwd,
+                argument,
+                true,
+            ),
+            "/plugins disable " => PluginManager::set_enabled(
+                &self.config.plugins,
+                self.config.base_mcp.clone(),
+                self.config.base_lsp.clone(),
+                &cwd,
+                argument,
+                false,
+            ),
+            _ => unreachable!(),
+        };
+        self.apply_plugin_mutation(prompt, result);
+        true
+    }
+
+    fn apply_plugin_mutation(&mut self, command: &str, result: Result<PluginMutationResult>) {
+        let response = match result {
+            Ok(result) => {
+                self.runtime.reload_extensions(
+                    result.load.lsp.clone(),
+                    result.load.mcp.clone(),
+                    result.load.catalog.hooks.clone(),
+                );
+                self.config.apply_plugin_load(result.load);
+                format!("{}\n\nChanges are active in this session.", result.message)
+            }
+            Err(error) => format!("Plugin operation failed: {error:#}"),
+        };
+        self.show_local_command(command, response);
     }
 
     fn submit_prompt(&mut self, prompt: String, clear_notice: bool) {
@@ -1840,6 +3419,10 @@ impl App {
                 self.start_turn_timer();
                 self.scroll = 0;
                 self.agent_activity = None;
+            }
+            RuntimeEvent::Blocked { message } => {
+                self.run_notice = Some(message);
+                self.status = AgentStatus::Idle;
             }
             RuntimeEvent::PermissionChanged => {}
             RuntimeEvent::Cancelled { was_compacting } => {
@@ -1954,9 +3537,10 @@ impl App {
             }
             AgentEvent::ConversationPermissionChanged {
                 edit_always_allowed,
+                allowed_tool,
             } => {
                 self.runtime
-                    .sync_conversation_permission(edit_always_allowed);
+                    .sync_conversation_permission(edit_always_allowed, allowed_tool);
             }
             AgentEvent::AssistantFinished => {
                 self.runtime.complete_turn();
@@ -2121,6 +3705,126 @@ impl App {
     }
 }
 
+fn mcp_server_from_form(form: &McpAddForm) -> Result<(String, McpServerConfig)> {
+    let name = form.name.value.trim().to_owned();
+    if name.is_empty() {
+        bail!("server name is required");
+    }
+    if !name
+        .chars()
+        .all(|char| char.is_ascii_alphanumeric() || matches!(char, '-' | '_' | '.'))
+    {
+        bail!("server name may contain only letters, numbers, '-', '_', and '.'");
+    }
+
+    let transport = match form.transport {
+        McpAddTransport::Stdio => {
+            let command = form.command.value.trim().to_owned();
+            if command.is_empty() {
+                bail!("stdio command is required");
+            }
+            let arguments = form.arguments.value.trim();
+            let args = if arguments.is_empty() {
+                Vec::new()
+            } else {
+                shlex::split(arguments).context("arguments contain an unclosed quote")?
+            };
+            let env_vars = comma_list(&form.environment_variables.value);
+            if let Some(variable) = env_vars.iter().find(|variable| !valid_env_name(variable)) {
+                bail!("'{variable}' is not a valid environment variable name");
+            }
+            McpTransportConfig::Stdio {
+                command,
+                args,
+                env: Default::default(),
+                env_vars,
+                cwd: optional_text(&form.working_directory.value),
+            }
+        }
+        McpAddTransport::StreamableHttp => {
+            let url = required_text(&form.url.value, "server URL")?;
+            let bearer_token_env = optional_text(&form.bearer_token_env.value);
+            if let Some(variable) = &bearer_token_env
+                && !valid_env_name(variable)
+            {
+                bail!("'{variable}' is not a valid bearer-token environment variable name");
+            }
+            McpTransportConfig::StreamableHttp {
+                url,
+                headers: Default::default(),
+                bearer_token_env,
+                oauth: None,
+            }
+        }
+        McpAddTransport::OAuth => McpTransportConfig::StreamableHttp {
+            url: required_text(&form.url.value, "server URL")?,
+            headers: Default::default(),
+            bearer_token_env: None,
+            oauth: Some(McpOAuthConfig {
+                redirect_uri: required_text(&form.redirect_uri.value, "OAuth redirect URI")?,
+                scopes: comma_list(&form.scopes.value),
+            }),
+        },
+    };
+    let server = McpServerConfig {
+        enabled: true,
+        startup_timeout_ms: 20_000,
+        tool_timeout_ms: 60_000,
+        approval: form.approval,
+        tool_approval: Default::default(),
+        enabled_tools: None,
+        disabled_tools: Vec::new(),
+        transport,
+    };
+    let config = McpConfig {
+        servers: std::collections::BTreeMap::from([(name.clone(), server.clone())]),
+    };
+    config.validate()?;
+    Ok((name, server))
+}
+
+fn required_text(value: &str, label: &str) -> Result<String> {
+    optional_text(value).with_context(|| format!("{label} is required"))
+}
+
+fn optional_text(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn comma_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn valid_env_name(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|char| char.is_ascii_alphabetic() || char == '_')
+        && chars.all(|char| char.is_ascii_alphanumeric() || char == '_')
+}
+
+fn previous_mcp_approval(approval: McpApprovalPolicy) -> McpApprovalPolicy {
+    match approval {
+        McpApprovalPolicy::Allow => McpApprovalPolicy::Deny,
+        McpApprovalPolicy::Prompt => McpApprovalPolicy::Allow,
+        McpApprovalPolicy::Deny => McpApprovalPolicy::Prompt,
+    }
+}
+
+fn next_mcp_approval(approval: McpApprovalPolicy) -> McpApprovalPolicy {
+    match approval {
+        McpApprovalPolicy::Allow => McpApprovalPolicy::Prompt,
+        McpApprovalPolicy::Prompt => McpApprovalPolicy::Deny,
+        McpApprovalPolicy::Deny => McpApprovalPolicy::Allow,
+    }
+}
+
 fn move_index(index: usize, direction: isize, len: usize) -> usize {
     if len == 0 {
         return 0;
@@ -2191,6 +3895,10 @@ fn current_dir_label() -> String {
         .unwrap_or_else(|_| "?".to_owned())
 }
 
+fn plugin_command_cwd() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
 fn home_relative_path(path: &Path) -> String {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return path.display().to_string();
@@ -2209,12 +3917,76 @@ fn home_relative_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::{agent::should_auto_compact, commands::SLASH_COMMANDS};
+    use std::fs;
+
+    use crate::{agent::should_auto_compact, commands::SLASH_COMMANDS, plugins::PluginsConfig};
 
     use super::*;
 
     fn app() -> App {
         App::test_empty()
+    }
+
+    #[test]
+    fn plugin_install_and_view_toggle_apply_without_restart_or_log() {
+        let root =
+            std::env::temp_dir().join(format!("glint-app-plugin-install-{}", uuid::Uuid::new_v4()));
+        let plugin = root.join("marketplace/plugins/demo");
+        fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();
+        fs::create_dir_all(plugin.join("commands")).unwrap();
+        fs::create_dir_all(root.join("marketplace/.claude-plugin")).unwrap();
+        fs::write(
+            plugin.join(".claude-plugin/plugin.json"),
+            r#"{"name":"demo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin.join("commands/review.md"),
+            "---\ndescription: Review code\n---\nReview the workspace.",
+        )
+        .unwrap();
+        fs::write(
+            root.join("marketplace/.claude-plugin/marketplace.json"),
+            r#"{"name":"demo-market","plugins":[{"name":"demo","source":"./plugins/demo"}]}"#,
+        )
+        .unwrap();
+
+        let mut app = app();
+        app.config.plugins = PluginsConfig {
+            marketplaces: vec![root.join("marketplace").to_string_lossy().into_owned()],
+            cache_dir: Some(root.join("cache")),
+            ..Default::default()
+        };
+        app.input.set("/plugins install demo@demo-market");
+        app.submit();
+
+        assert_eq!(app.config.extensions.plugins[0].name, "demo");
+        assert_eq!(app.config.extensions.commands[0].name, "demo:review");
+        assert!(
+            app.messages
+                .last()
+                .unwrap()
+                .content
+                .contains("Changes are active in this session")
+        );
+
+        app.open_plugins_view();
+        app.update_plugins_view_key(KeyAction::Char(' '));
+        assert!(!app.config.extensions.installed_plugins[0].enabled);
+        assert!(matches!(
+            app.plugins_view.as_ref().map(|view| &view.screen),
+            Some(PluginsScreen::Browse)
+        ));
+        assert!(app.pending_plugin_operation.is_none());
+
+        app.update_plugins_view_key(KeyAction::Char(' '));
+        assert!(app.config.extensions.installed_plugins[0].enabled);
+        assert!(matches!(
+            app.plugins_view.as_ref().map(|view| &view.screen),
+            Some(PluginsScreen::Browse)
+        ));
+        assert!(app.pending_plugin_operation.is_none());
+        fs::remove_dir_all(root).ok();
     }
 
     fn add_test_tabs(app: &mut App, count: usize) {
@@ -2235,6 +4007,8 @@ mod tests {
         assert!(names.contains(&"/clear"));
         assert!(names.contains(&"/archive"));
         assert!(names.contains(&"/delete"));
+        assert!(names.contains(&"/plugins"));
+        assert!(!names.contains(&"/plugin"));
         assert!(names.contains(&"/status"));
         assert!(names.contains(&"/compact"));
         assert!(names.contains(&"/terminal"));
@@ -2839,6 +4613,483 @@ mod tests {
         app.update_status_view_key(KeyAction::Escape);
         assert!(app.status_view.is_none());
         assert_eq!(app.input.value, "");
+    }
+
+    #[test]
+    fn mcp_command_opens_manager_without_adding_a_message() {
+        let mut app = app();
+        app.input.set("/mcp");
+        let message_count = app.messages.len();
+
+        let command = SLASH_COMMANDS
+            .iter()
+            .find(|command| command.name == "/mcp")
+            .copied()
+            .unwrap();
+        app.run_slash_command(command);
+
+        assert!(matches!(
+            app.mcp_view.as_ref().map(|view| &view.screen),
+            Some(McpScreen::Browse)
+        ));
+        assert_eq!(app.input.value, "/mcp");
+        assert_eq!(app.messages.len(), message_count);
+    }
+
+    #[test]
+    fn mcp_manager_switches_focus_scrolls_and_opens_details() {
+        let mut app = app();
+        let config = crate::services::mcp::McpConfig {
+            servers: std::collections::BTreeMap::from([(
+                "docs".to_owned(),
+                crate::services::mcp::McpServerConfig {
+                    enabled: false,
+                    startup_timeout_ms: 20_000,
+                    tool_timeout_ms: 60_000,
+                    approval: crate::services::mcp::McpApprovalPolicy::Prompt,
+                    tool_approval: Default::default(),
+                    enabled_tools: None,
+                    disabled_tools: Vec::new(),
+                    transport: crate::services::mcp::McpTransportConfig::Stdio {
+                        command: "docs-server".to_owned(),
+                        args: Vec::new(),
+                        env: Default::default(),
+                        env_vars: Vec::new(),
+                        cwd: None,
+                    },
+                },
+            )]),
+        };
+        app.config.mcp = config.clone();
+        app.config.base_mcp = config.clone();
+        app.runtime
+            .reload_extensions(Default::default(), config, Vec::new());
+        app.open_mcp_view();
+
+        app.update_mcp_view_key(KeyAction::Right);
+        assert_eq!(
+            app.mcp_view.as_ref().map(|view| view.focus),
+            Some(McpFocus::Details)
+        );
+        app.set_mcp_detail_max_scroll(2);
+        app.update_mcp_view_key(KeyAction::Down);
+        assert_eq!(
+            app.mcp_view.as_ref().map(|view| view.detail_scroll),
+            Some(1)
+        );
+        app.update_mcp_view_key(KeyAction::Down);
+        app.update_mcp_view_key(KeyAction::Down);
+        assert_eq!(
+            app.mcp_view.as_ref().map(|view| view.detail_scroll),
+            Some(2)
+        );
+        app.update_mcp_view_key(KeyAction::Up);
+        assert_eq!(
+            app.mcp_view.as_ref().map(|view| view.detail_scroll),
+            Some(1)
+        );
+        app.set_mcp_detail_max_scroll(0);
+        assert_eq!(
+            app.mcp_view.as_ref().map(|view| view.detail_scroll),
+            Some(0)
+        );
+        app.update_mcp_view_key(KeyAction::Submit);
+        assert!(matches!(
+            app.mcp_view.as_ref().map(|view| &view.screen),
+            Some(McpScreen::Details)
+        ));
+        app.update_mcp_view_key(KeyAction::Char('R'));
+        assert!(
+            app.mcp_view
+                .as_ref()
+                .and_then(|view| view.notice.as_ref())
+                .is_some_and(|notice| notice.failed && notice.message.contains("config.yaml"))
+        );
+        app.update_mcp_view_key(KeyAction::Escape);
+        assert!(matches!(
+            app.mcp_view.as_ref().map(|view| &view.screen),
+            Some(McpScreen::Browse)
+        ));
+        app.update_mcp_view_key(KeyAction::Escape);
+        assert!(app.mcp_view.is_none());
+        assert_eq!(app.input.value, "");
+    }
+
+    #[test]
+    fn mcp_mouse_detail_scroll_stops_at_calculated_bottom() {
+        let mut app = app();
+        app.mcp_view = Some(McpView {
+            selected: 1,
+            detail_scroll: 0,
+            detail_max_scroll: 5,
+            focus: McpFocus::Details,
+            screen: McpScreen::Details,
+            notice: None,
+        });
+
+        app.update(AppEvent::ExtensionMouse(ExtensionMouseAction::Mcp(
+            McpMouseAction::ScrollDetails(3),
+        )));
+        app.update(AppEvent::ExtensionMouse(ExtensionMouseAction::Mcp(
+            McpMouseAction::ScrollDetails(3),
+        )));
+
+        assert_eq!(
+            app.mcp_view.as_ref().map(|view| view.detail_scroll),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn mcp_oauth_screen_edits_callback_and_cancels() {
+        let mut app = app();
+        app.mcp_view = Some(McpView {
+            selected: 0,
+            detail_scroll: 0,
+            detail_max_scroll: 0,
+            focus: McpFocus::Details,
+            screen: McpScreen::OAuth {
+                server: "remote".to_owned(),
+                authorization_url: "https://example.test/authorize".to_owned(),
+                callback: InputState::default(),
+            },
+            notice: None,
+        });
+
+        app.update_mcp_view_key(KeyAction::Char('a'));
+        app.update_mcp_view_key(KeyAction::Char('b'));
+        app.update_mcp_view_key(KeyAction::Left);
+        app.update_mcp_view_key(KeyAction::Char('c'));
+        assert!(matches!(
+            app.mcp_view.as_ref().map(|view| &view.screen),
+            Some(McpScreen::OAuth { callback, .. }) if callback.value == "acb"
+        ));
+
+        app.update_mcp_view_key(KeyAction::Escape);
+        assert!(matches!(
+            app.mcp_view.as_ref().map(|view| &view.screen),
+            Some(McpScreen::Browse)
+        ));
+    }
+
+    #[test]
+    fn mcp_add_form_switches_transport_and_edits_visible_fields() {
+        let mut app = app();
+        app.open_mcp_view();
+        app.update_mcp_view_key(KeyAction::Submit);
+        assert!(matches!(
+            app.mcp_view.as_ref().map(|view| &view.screen),
+            Some(McpScreen::Add(form)) if form.transport == McpAddTransport::Stdio
+        ));
+
+        app.update_mcp_view_key(KeyAction::Right);
+        app.update_mcp_view_key(KeyAction::Down);
+        for char in "remote".chars() {
+            app.update_mcp_view_key(KeyAction::Char(char));
+        }
+        app.update_mcp_view_key(KeyAction::Tab);
+        for char in "https://example.test/mcp".chars() {
+            app.update_mcp_view_key(KeyAction::Char(char));
+        }
+
+        assert!(matches!(
+            app.mcp_view.as_ref().map(|view| &view.screen),
+            Some(McpScreen::Add(form))
+                if form.transport == McpAddTransport::StreamableHttp
+                    && form.name.value == "remote"
+                    && form.url.value == "https://example.test/mcp"
+        ));
+        app.update_mcp_view_key(KeyAction::Escape);
+        assert!(matches!(
+            app.mcp_view.as_ref().map(|view| &view.screen),
+            Some(McpScreen::Browse)
+        ));
+    }
+
+    #[test]
+    fn mcp_add_form_builds_oauth_configuration() {
+        let mut form = McpAddForm {
+            transport: McpAddTransport::OAuth,
+            approval: McpApprovalPolicy::Allow,
+            ..Default::default()
+        };
+        form.name.set("remote-oauth");
+        form.url.set("https://example.test/mcp");
+        form.redirect_uri.set("http://127.0.0.1:8765/callback");
+        form.scopes.set("read, write");
+
+        let (name, server) = mcp_server_from_form(&form).unwrap();
+
+        assert_eq!(name, "remote-oauth");
+        assert_eq!(server.approval, McpApprovalPolicy::Allow);
+        let McpTransportConfig::StreamableHttp {
+            url,
+            bearer_token_env,
+            oauth,
+            ..
+        } = server.transport
+        else {
+            panic!("expected Streamable HTTP transport");
+        };
+        assert_eq!(url, "https://example.test/mcp");
+        assert!(bearer_token_env.is_none());
+        assert_eq!(oauth.unwrap().scopes, ["read", "write"]);
+    }
+
+    #[test]
+    fn mcp_add_form_persists_and_activates_server() {
+        let root = std::env::temp_dir().join(format!("glint-app-add-mcp-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.yaml");
+        fs::write(&config_path, "llm:\n  provider: demo\n").unwrap();
+        let mut app = app();
+        let mut form = McpAddForm::default();
+        form.name.set("local-docs");
+        form.command.set("glint-missing-mcp-test-command");
+        form.arguments.set("--stdio \"docs root\"");
+        form.environment_variables.set("MCP_TOKEN, OPTIONAL_KEY");
+        app.mcp_view = Some(McpView {
+            selected: 0,
+            detail_scroll: 0,
+            detail_max_scroll: 0,
+            focus: McpFocus::Servers,
+            screen: McpScreen::Add(Box::new(form)),
+            notice: None,
+        });
+
+        app.add_mcp_server_at(&config_path);
+
+        assert!(app.config.base_mcp.servers.contains_key("local-docs"));
+        assert!(app.config.mcp.servers.contains_key("local-docs"));
+        assert!(
+            app.runtime
+                .mcp_statuses()
+                .iter()
+                .any(|status| status.name == "local-docs")
+        );
+        assert!(matches!(
+            app.mcp_view.as_ref().map(|view| &view.screen),
+            Some(McpScreen::Browse)
+        ));
+        assert_eq!(app.mcp_view.as_ref().map(|view| view.selected), Some(1));
+        assert!(
+            app.mcp_view
+                .as_ref()
+                .and_then(|view| view.notice.as_ref())
+                .is_some_and(|notice| !notice.failed && notice.message.contains("config.yaml"))
+        );
+        let persisted = fs::read_to_string(&config_path).unwrap();
+        assert!(persisted.contains("    local-docs:\n"));
+        assert!(persisted.contains("      command: glint-missing-mcp-test-command\n"));
+        assert!(persisted.contains("      - docs root\n"));
+        assert!(persisted.contains("      - MCP_TOKEN\n"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn mcp_add_form_keeps_validation_errors_in_the_form() {
+        let root =
+            std::env::temp_dir().join(format!("glint-app-invalid-mcp-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.yaml");
+        fs::write(&config_path, "llm:\n  provider: demo\n").unwrap();
+        let mut app = app();
+        let mut form = McpAddForm::default();
+        form.name.set("invalid name");
+        app.mcp_view = Some(McpView {
+            selected: 0,
+            detail_scroll: 0,
+            detail_max_scroll: 0,
+            focus: McpFocus::Servers,
+            screen: McpScreen::Add(Box::new(form)),
+            notice: None,
+        });
+
+        app.add_mcp_server_at(&config_path);
+
+        assert!(matches!(
+            app.mcp_view.as_ref().map(|view| &view.screen),
+            Some(McpScreen::Add(_))
+        ));
+        assert!(
+            app.mcp_view
+                .as_ref()
+                .and_then(|view| view.notice.as_ref())
+                .is_some_and(|notice| notice.failed && notice.message.contains("server name"))
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).unwrap(),
+            "llm:\n  provider: demo\n"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn plugins_command_opens_installed_tab() {
+        let mut app = app();
+        app.input.set("/plugins");
+
+        let command = SLASH_COMMANDS
+            .iter()
+            .find(|command| command.name == "/plugins")
+            .copied()
+            .unwrap();
+        app.run_slash_command(command);
+
+        assert!(app.plugins_view.is_some());
+        assert_eq!(
+            app.plugins_view.as_ref().map(|view| view.tab),
+            Some(PluginsTab::Installed)
+        );
+        assert_eq!(app.input.value, "/plugins");
+    }
+
+    #[test]
+    fn plugins_mouse_switches_tabs_and_clamps_detail_scroll() {
+        let mut app = app();
+        app.open_plugins_view();
+        app.set_plugins_detail_max_scroll(4);
+
+        app.update(AppEvent::ExtensionMouse(ExtensionMouseAction::Plugins(
+            PluginsMouseAction::ScrollDetails(3),
+        )));
+        app.update(AppEvent::ExtensionMouse(ExtensionMouseAction::Plugins(
+            PluginsMouseAction::ScrollDetails(3),
+        )));
+        assert_eq!(
+            app.plugins_view.as_ref().map(|view| view.detail_scroll),
+            Some(4)
+        );
+
+        app.update(AppEvent::ExtensionMouse(ExtensionMouseAction::Plugins(
+            PluginsMouseAction::SelectTab(PluginsMouseTab::Marketplaces),
+        )));
+        assert_eq!(
+            app.plugins_view.as_ref().map(|view| view.tab),
+            Some(PluginsTab::Marketplaces)
+        );
+        assert_eq!(
+            app.plugins_view.as_ref().map(|view| view.detail_scroll),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn plugins_view_opens_marketplace_input_and_returns() {
+        let mut app = app();
+        app.open_plugins_view();
+
+        app.update_plugins_view_key(KeyAction::Right);
+        assert_eq!(
+            app.plugins_view.as_ref().map(|view| view.tab),
+            Some(PluginsTab::Marketplaces)
+        );
+
+        app.update_plugins_view_key(KeyAction::Submit);
+        assert!(matches!(
+            app.plugins_view.as_ref().map(|view| &view.screen),
+            Some(PluginsScreen::AddMarketplace(_))
+        ));
+        app.update_plugins_view_key(KeyAction::Char('a'));
+        app.update_plugins_view_key(KeyAction::Char('c'));
+        assert!(matches!(
+            app.plugins_view.as_ref().map(|view| &view.screen),
+            Some(PluginsScreen::AddMarketplace(input)) if input.value == "ac"
+        ));
+
+        app.update_plugins_view_key(KeyAction::Escape);
+        assert!(matches!(
+            app.plugins_view.as_ref().map(|view| &view.screen),
+            Some(PluginsScreen::Browse)
+        ));
+        app.update_plugins_view_key(KeyAction::Escape);
+        assert!(app.plugins_view.is_none());
+        assert_eq!(app.input.value, "");
+    }
+
+    #[test]
+    fn marketplace_git_activity_is_rendered_in_plugins_operation() {
+        let root = std::env::temp_dir().join(format!(
+            "glint-app-marketplace-progress-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let repository = root.join("marketplace");
+        fs::create_dir_all(repository.join(".claude-plugin")).unwrap();
+        fs::write(
+            repository.join(".claude-plugin/marketplace.json"),
+            r#"{"name":"progress-market","plugins":[]}"#,
+        )
+        .unwrap();
+        init_test_git_repository(&repository);
+
+        let mut app = app();
+        app.config.plugins = PluginsConfig {
+            cache_dir: Some(root.join("cache")),
+            ..Default::default()
+        };
+        app.open_plugins_view();
+        if let Some(view) = app.plugins_view.as_mut() {
+            view.tab = PluginsTab::Marketplaces;
+        }
+        let source = format!("file://{}", repository.display());
+        app.start_plugin_ui_operation(
+            "Adding marketplace".to_owned(),
+            source.clone(),
+            PluginUiMutation::AddMarketplace(source),
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.pending_plugin_operation.is_some() && std::time::Instant::now() < deadline {
+            app.drain_plugin_operation();
+            std::thread::yield_now();
+        }
+
+        assert!(app.pending_plugin_operation.is_none());
+        let PluginsScreen::Operation(operation) = &app.plugins_view.as_ref().unwrap().screen else {
+            panic!("expected plugin operation view");
+        };
+        assert!(operation.finished);
+        assert!(!operation.failed);
+        assert!(
+            operation
+                .log
+                .iter()
+                .any(|line| line.starts_with("git: clone plugin source"))
+        );
+        assert!(
+            operation
+                .log
+                .iter()
+                .any(|line| line.contains("Added marketplace `progress-market`"))
+        );
+        assert_eq!(
+            app.config.extensions.marketplaces[0].name,
+            "progress-market"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    fn init_test_git_repository(root: &Path) {
+        for arguments in [
+            vec!["init", "-b", "main"],
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=Glint Test",
+                "-c",
+                "user.email=glint@example.invalid",
+                "commit",
+                "-m",
+                "test marketplace",
+            ],
+        ] {
+            let output = std::process::Command::new("git")
+                .args(arguments)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        }
     }
 
     #[test]

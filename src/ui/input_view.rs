@@ -176,12 +176,12 @@ pub(super) fn slash_command_lines(app: &App, _width: u16) -> Vec<Line<'static>> 
             Line::from(vec![
                 Span::raw("  "),
                 Span::styled(if selected { "❯ " } else { "  " }, style),
-                Span::styled(command.name, style),
+                Span::styled(command.name.clone(), style),
                 Span::styled(
                     " ".repeat(name_width.saturating_sub(command.name.width()) + 2),
                     style,
                 ),
-                Span::styled(command.description, style),
+                Span::styled(command.description.clone(), style),
             ])
         })
         .collect()

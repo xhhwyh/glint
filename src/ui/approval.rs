@@ -19,10 +19,21 @@ pub(super) fn approval_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         return Vec::new();
     };
 
-    let mut lines = vec![box_top("SECURITY CHECK / APPROVAL REQUIRED", width)];
+    let mut lines = vec![box_top(
+        if approval.request.is_mcp_elicitation() {
+            "MCP INTERACTION / INPUT REQUIRED"
+        } else {
+            "SECURITY CHECK / APPROVAL REQUIRED"
+        },
+        width,
+    )];
     lines.push(box_body_styled("", width, Style::default()));
     lines.push(box_body_styled(
-        "COMMAND",
+        if approval.request.is_mcp_elicitation() {
+            "REQUEST"
+        } else {
+            "COMMAND"
+        },
         width,
         Style::default()
             .fg(ACCENT_COLOR)
@@ -33,7 +44,11 @@ pub(super) fn approval_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             .into_iter()
             .map(|row| {
                 box_body_styled(
-                    &format!("$ {row}"),
+                    &if approval.request.is_mcp_elicitation() {
+                        row
+                    } else {
+                        format!("$ {row}")
+                    },
                     width,
                     Style::default().fg(TEXT_COLOR).add_modifier(Modifier::BOLD),
                 )
@@ -54,11 +69,16 @@ pub(super) fn approval_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     );
     lines.push(box_body_styled("", width, Style::default()));
 
-    for choice in [
-        ApprovalChoice::Yes,
-        ApprovalChoice::Always,
-        ApprovalChoice::No,
-    ] {
+    let choices = if approval.request.is_mcp_elicitation() {
+        vec![ApprovalChoice::Yes, ApprovalChoice::No]
+    } else {
+        vec![
+            ApprovalChoice::Yes,
+            ApprovalChoice::Always,
+            ApprovalChoice::No,
+        ]
+    };
+    for choice in choices {
         let label = match choice {
             ApprovalChoice::Yes => "allow once",
             ApprovalChoice::Always => approval.always_label(),
@@ -77,11 +97,14 @@ pub(super) fn approval_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             width,
             style,
         ));
-        if choice == ApprovalChoice::No {
+        if (approval.request.is_mcp_elicitation() && choice == ApprovalChoice::Yes)
+            || (!approval.request.is_mcp_elicitation() && choice == ApprovalChoice::No)
+        {
+            let label = approval.feedback_label();
             let feedback = if approval.feedback.value.is_empty() {
-                "feedback: ".to_owned()
+                format!("{label}: ")
             } else {
-                format!("feedback: {}", approval.feedback.value)
+                format!("{label}: {}", approval.feedback.value)
             };
             let style = if approval.focus == ApprovalFocus::Feedback {
                 Style::default().fg(TEXT_COLOR)
@@ -101,7 +124,7 @@ pub(super) fn approval_feedback_cursor_x(app: &App, width: u16) -> u16 {
     let Some(approval) = &app.approval else {
         return 0;
     };
-    let prefix_width = "  feedback: ".width();
+    let prefix_width = format!("  {}: ", approval.feedback_label()).width();
     let value_width = approval.feedback.value[..approval.feedback.cursor].width();
     (prefix_width + value_width + 2).min(width.saturating_sub(1) as usize) as u16
 }

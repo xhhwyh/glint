@@ -166,6 +166,8 @@ fn status_general_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                         .unwrap_or_else(|| "unknown".to_owned()),
                 ),
                 ("LSP servers", app.config.lsp.servers.len().to_string()),
+                ("MCP servers", app.config.mcp.servers.len().to_string()),
+                ("Plugins", app.config.extensions.plugins.len().to_string()),
             ],
         },
         width,

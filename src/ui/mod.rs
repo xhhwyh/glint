@@ -4,7 +4,9 @@ mod format;
 mod input_view;
 mod layout;
 mod markdown;
+mod mcp;
 mod model_picker;
+mod plugins;
 mod resume;
 mod star;
 mod status;
@@ -24,6 +26,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, TextSelection};
 use crate::approval::ApprovalFocus;
+use crate::event::{ExtensionMouseAction, MouseAction};
 use crate::message::{Message, Role};
 
 use layout::box_top;
@@ -32,6 +35,33 @@ use theme::{ACCENT_COLOR, BG_COLOR};
 pub use terminal::{
     terminal_content_width, terminal_content_x_offset, terminal_height_for_app, terminal_tab_hitbox,
 };
+
+pub fn mcp_detail_max_scroll(app: &App, width: u16, height: u16) -> usize {
+    mcp::detail_max_scroll(app, width, height)
+}
+
+pub fn plugins_detail_max_scroll(app: &App, width: u16, height: u16) -> usize {
+    plugins::detail_max_scroll(app, width, height)
+}
+
+pub fn extension_mouse_action(
+    app: &App,
+    mouse: MouseAction,
+    width: u16,
+    height: u16,
+) -> Option<ExtensionMouseAction> {
+    if app.mcp_view.is_some() {
+        Some(ExtensionMouseAction::Mcp(mcp::mouse_action(
+            app, mouse, width, height,
+        )))
+    } else if app.plugins_view.is_some() {
+        Some(ExtensionMouseAction::Plugins(plugins::mouse_action(
+            app, mouse, width, height,
+        )))
+    } else {
+        None
+    }
+}
 
 struct Document {
     lines: Vec<Line<'static>>,
@@ -55,6 +85,14 @@ struct DocumentLineMeta {
 }
 
 pub fn render(frame: &mut Frame, app: &App) {
+    if let Some(view) = &app.mcp_view {
+        mcp::render_mcp_view(frame, app, view);
+        return;
+    }
+    if let Some(view) = &app.plugins_view {
+        plugins::render_plugins_view(frame, app, view);
+        return;
+    }
     if let Some(view) = &app.status_view {
         status::render_status_view(frame, app, view);
         return;

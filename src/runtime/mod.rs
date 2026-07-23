@@ -1,22 +1,33 @@
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, Sender},
+    },
 };
 
 use anyhow::Result;
+use serde_json::json;
 
 use crate::{
     agent::{
         self, AgentEvent, AgentRunInput, CompactRunInput, RuntimeContext, TokenUsage,
         provider::{FinishReason, ToolCall},
     },
-    approval::{AgentControl, ApprovalDecision, ConversationPermissions},
+    approval::{
+        AgentControl, ApprovalDecision, ApprovalKind, ApprovalRequest, ConversationPermissions,
+    },
     config::{LlmConfig, LspConfig},
     message::Message,
-    services::lsp::LspManager,
+    plugins::{HookEvent, HookRunner, PluginHook},
+    services::{
+        lsp::LspManager,
+        mcp::{McpConfig, McpElicitation, McpElicitationRequest, McpManager, McpServerStatus},
+    },
     tasks::{self, SubagentOutcome, SubagentRequest, TaskManager, TaskSnapshot},
     terminal::TerminalRequest,
-    tools::{ReadFileState, ShellToolMode},
+    tools::{DynamicTool, ReadFileState, ShellToolMode},
     transcript::{
         AssistantTranscript, CompactTrigger, TranscriptSessionSummary, TranscriptStore,
         WorkspaceUsageStats,
@@ -80,6 +91,7 @@ pub enum RuntimeCommand {
     ApprovalDecision {
         id: u64,
         decision: ApprovalDecision,
+        input: Option<serde_json::Value>,
     },
     ClearConversationEditPermission,
     CancelCurrentTurn {
@@ -93,6 +105,7 @@ pub enum RuntimeEvent {
     PromptStarted { prompt: String },
     PermissionChanged,
     Cancelled { was_compacting: bool },
+    Blocked { message: String },
 }
 
 pub struct LoadedTranscript {
@@ -130,6 +143,9 @@ pub struct SessionRuntime {
     terminal_request_tx: Sender<TerminalRequest>,
     terminal_requests: Receiver<TerminalRequest>,
     lsp_manager: LspManager,
+    mcp_manager: McpManager,
+    hook_runner: HookRunner,
+    pending_mcp_elicitations: BTreeMap<u64, McpElicitation>,
     runtime_time_label: String,
     conversation_permissions: ConversationPermissions,
     read_file_state: ReadFileState,
@@ -139,20 +155,33 @@ pub struct SessionRuntime {
 }
 
 impl SessionRuntime {
-    pub fn create_new(cwd: String, lsp_config: LspConfig) -> Result<Self> {
+    pub fn create_new(
+        cwd: String,
+        lsp_config: LspConfig,
+        mcp_config: McpConfig,
+        hooks: Vec<PluginHook>,
+    ) -> Result<Self> {
         TranscriptStore::prune_archive_older_than_in_background(30);
         let transcript = TranscriptStore::create_new(&cwd)?;
-        Ok(Self::from_transcript(transcript, cwd, lsp_config))
+        let runtime = Self::from_transcript(transcript, cwd.clone(), lsp_config, mcp_config, hooks);
+        runtime
+            .hook_runner
+            .run(HookEvent::SessionStart, json!({"cwd": cwd}))?;
+        Ok(runtime)
     }
 
     fn from_transcript(
         transcript: TranscriptStore,
         transcript_cwd: String,
         lsp_config: LspConfig,
+        mcp_config: McpConfig,
+        hooks: Vec<PluginHook>,
     ) -> Self {
         let (agent_tx, agent_events) = mpsc::channel();
         let (terminal_request_tx, terminal_requests) = mpsc::channel();
         let lsp_manager = LspManager::new(lsp_config, PathBuf::from(&transcript_cwd));
+        let mcp_manager = McpManager::new(mcp_config, PathBuf::from(&transcript_cwd));
+        let hook_runner = HookRunner::new(hooks);
         Self {
             transcript,
             transcript_cwd,
@@ -162,6 +191,9 @@ impl SessionRuntime {
             terminal_request_tx,
             terminal_requests,
             lsp_manager,
+            mcp_manager,
+            hook_runner,
+            pending_mcp_elicitations: BTreeMap::new(),
             runtime_time_label: crate::context::current_time_label(),
             conversation_permissions: ConversationPermissions::default(),
             read_file_state: ReadFileState::new(),
@@ -185,7 +217,47 @@ impl SessionRuntime {
     }
 
     pub fn conversation_permissions(&self) -> ConversationPermissions {
-        self.conversation_permissions
+        self.conversation_permissions.clone()
+    }
+
+    pub fn mcp_status_text(&self) -> String {
+        self.mcp_manager.status_text()
+    }
+
+    pub fn mcp_statuses(&self) -> Vec<McpServerStatus> {
+        self.mcp_manager.statuses()
+    }
+
+    pub fn reload_extensions(&mut self, lsp: LspConfig, mcp: McpConfig, hooks: Vec<PluginHook>) {
+        self.decline_pending_elicitations();
+        self.lsp_manager.shutdown();
+        self.mcp_manager.shutdown();
+        let root = PathBuf::from(&self.transcript_cwd);
+        self.lsp_manager = LspManager::new(lsp, root.clone());
+        self.mcp_manager = McpManager::new(mcp, root);
+        self.hook_runner = HookRunner::new(hooks);
+    }
+
+    pub fn reload_mcp(&mut self, mcp: McpConfig) {
+        self.decline_pending_elicitations();
+        self.mcp_manager.shutdown();
+        self.mcp_manager = McpManager::new_background(mcp, PathBuf::from(&self.transcript_cwd));
+    }
+
+    pub fn reconnect_mcp(&self, server: &str) -> Result<()> {
+        self.mcp_manager.reconnect(server)
+    }
+
+    pub fn begin_mcp_oauth(&self, server: &str) -> Result<String> {
+        self.mcp_manager.begin_oauth(server)
+    }
+
+    pub fn complete_mcp_oauth(&self, server: &str, callback_url: &str) -> Result<()> {
+        self.mcp_manager.complete_oauth(server, callback_url)
+    }
+
+    pub fn logout_mcp_oauth(&self, server: &str) -> Result<()> {
+        self.mcp_manager.logout_oauth(server)
     }
 
     pub fn has_pending_prompt_after_compact(&self) -> bool {
@@ -258,6 +330,38 @@ impl SessionRuntime {
         self.terminal_requests.try_recv().ok()
     }
 
+    pub fn try_recv_mcp_elicitation(&mut self) -> Option<ApprovalRequest> {
+        let elicitation = self.mcp_manager.try_recv_elicitation()?;
+        let id = elicitation.id;
+        let (command, explanation, input_schema) = match &elicitation.request {
+            McpElicitationRequest::Form { message, schema } => (
+                message.clone(),
+                format!(
+                    "An MCP server is requesting structured input matching this schema:\n{}",
+                    serde_json::to_string_pretty(schema).unwrap_or_else(|_| schema.to_string())
+                ),
+                Some(schema.clone()),
+            ),
+            McpElicitationRequest::Url {
+                message,
+                url,
+                elicitation_id,
+            } => (
+                message.clone(),
+                format!("Complete MCP interaction `{elicitation_id}` at {url}"),
+                None,
+            ),
+        };
+        self.pending_mcp_elicitations.insert(id, elicitation);
+        Some(ApprovalRequest {
+            id,
+            tool_name: "McpElicitation".to_owned(),
+            command,
+            explanation,
+            kind: ApprovalKind::McpElicitation { input_schema },
+        })
+    }
+
     pub fn task_snapshots(&self) -> Vec<TaskSnapshot> {
         self.task_manager.snapshots()
     }
@@ -268,6 +372,14 @@ impl SessionRuntime {
 
     pub fn lsp_manager(&self) -> LspManager {
         self.lsp_manager.clone()
+    }
+
+    pub fn dynamic_tools(&self) -> Vec<Arc<dyn DynamicTool>> {
+        self.mcp_manager.dynamic_tools()
+    }
+
+    pub fn hook_runner(&self) -> HookRunner {
+        self.hook_runner.clone()
     }
 
     pub fn read_file_state(&self) -> ReadFileState {
@@ -336,9 +448,11 @@ impl SessionRuntime {
                 pre_prompt_tokens,
             } => self.submit_prompt_or_auto_compact(prompt, config, pre_prompt_tokens),
             RuntimeCommand::StartPrompt { prompt, config } => self.start_prompt(prompt, config),
-            RuntimeCommand::ApprovalDecision { id, decision } => {
-                self.submit_approval_decision(id, decision)
-            }
+            RuntimeCommand::ApprovalDecision {
+                id,
+                decision,
+                input,
+            } => self.submit_approval_decision(id, decision, input),
             RuntimeCommand::ClearConversationEditPermission => {
                 self.clear_conversation_edit_permission()
             }
@@ -400,6 +514,12 @@ impl SessionRuntime {
         summary: String,
         pre_prompt_tokens: Option<u64>,
     ) -> CompactFinished {
+        self.hook_runner
+            .run(
+                HookEvent::AfterCompact,
+                json!({"summary": summary, "success": true}),
+            )
+            .ok();
         let pending_prompt = self.pending_prompt_after_compact.take();
         let automatic = pending_prompt.is_some();
         let trigger = if automatic {
@@ -422,6 +542,9 @@ impl SessionRuntime {
     }
 
     pub fn fail_compact(&mut self) -> CompactFailed {
+        self.hook_runner
+            .run(HookEvent::AfterCompact, json!({"success": false}))
+            .ok();
         let pending_prompt = self.pending_prompt_after_compact.take();
         let automatic = pending_prompt.is_some();
         self.agent_control_tx = None;
@@ -434,8 +557,15 @@ impl SessionRuntime {
         }
     }
 
-    pub fn sync_conversation_permission(&mut self, edit_always_allowed: bool) {
+    pub fn sync_conversation_permission(
+        &mut self,
+        edit_always_allowed: bool,
+        allowed_tool: Option<String>,
+    ) {
         self.conversation_permissions.edit_always_allowed = edit_always_allowed;
+        if let Some(tool) = allowed_tool {
+            self.conversation_permissions.allowed_tools.insert(tool);
+        }
     }
 
     fn start_manual_compact(
@@ -448,6 +578,14 @@ impl SessionRuntime {
         let conversation = self.transcript.model_history();
         if conversation.is_empty() {
             return RuntimeEvent::NoMessagesToCompact;
+        }
+        if let Err(error) = self
+            .hook_runner
+            .run(HookEvent::BeforeCompact, json!({"automatic": false}))
+        {
+            return RuntimeEvent::Blocked {
+                message: format!("Compaction blocked by plugin hook: {error:#}"),
+            };
         }
 
         self.agent_control_tx = None;
@@ -471,6 +609,14 @@ impl SessionRuntime {
         if agent::should_auto_compact(&config.llm, pre_prompt_tokens, self.auto_compact_failures) {
             let conversation = self.transcript.model_history();
             if !conversation.is_empty() {
+                if let Err(error) = self
+                    .hook_runner
+                    .run(HookEvent::BeforeCompact, json!({"automatic": true}))
+                {
+                    return RuntimeEvent::Blocked {
+                        message: format!("Compaction blocked by plugin hook: {error:#}"),
+                    };
+                }
                 self.reset_agent_channel();
                 self.pending_prompt_after_compact = Some(prompt);
                 self.agent_control_tx = None;
@@ -490,6 +636,25 @@ impl SessionRuntime {
     }
 
     fn start_prompt(&mut self, prompt: String, config: StartPromptConfig) -> RuntimeEvent {
+        let prompt = match self
+            .hook_runner
+            .run(HookEvent::PromptSubmit, json!({"prompt": prompt}))
+        {
+            Ok(outcome) => outcome
+                .replacement
+                .and_then(|replacement| {
+                    replacement
+                        .get("prompt")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned)
+                })
+                .unwrap_or(prompt),
+            Err(error) => {
+                return RuntimeEvent::Blocked {
+                    message: format!("Prompt blocked by plugin hook: {error:#}"),
+                };
+            }
+        };
         self.reset_agent_channel();
         let conversation = self.transcript.model_history();
         self.transcript
@@ -513,7 +678,7 @@ impl SessionRuntime {
                     config.runtime_current_dir,
                     config.shell_tool_mode,
                 ),
-                conversation_permissions: self.conversation_permissions,
+                conversation_permissions: self.conversation_permissions.clone(),
                 conversation,
                 current_user_message: prompt.clone(),
                 tool_results_dir: self.transcript.tool_results_dir(),
@@ -521,6 +686,8 @@ impl SessionRuntime {
                 shell_tool_mode: config.shell_tool_mode,
                 read_file_state: self.read_file_state.clone(),
                 lsp_manager: self.lsp_manager.clone(),
+                dynamic_tools: self.mcp_manager.dynamic_tools(),
+                hook_runner: self.hook_runner.clone(),
             },
             self.agent_tx.clone(),
             control_rx,
@@ -529,7 +696,16 @@ impl SessionRuntime {
         RuntimeEvent::PromptStarted { prompt }
     }
 
-    fn submit_approval_decision(&mut self, id: u64, decision: ApprovalDecision) -> RuntimeEvent {
+    fn submit_approval_decision(
+        &mut self,
+        id: u64,
+        decision: ApprovalDecision,
+        input: Option<serde_json::Value>,
+    ) -> RuntimeEvent {
+        if let Some(elicitation) = self.pending_mcp_elicitations.remove(&id) {
+            elicitation.respond(!matches!(decision, ApprovalDecision::Deny { .. }), input);
+            return RuntimeEvent::PermissionChanged;
+        }
         if decision == ApprovalDecision::AllowConversation {
             self.conversation_permissions.edit_always_allowed = true;
         }
@@ -558,6 +734,7 @@ impl SessionRuntime {
         }
         self.agent_control_tx = None;
         self.pending_prompt_after_compact = None;
+        self.decline_pending_elicitations();
         RuntimeEvent::Cancelled {
             was_compacting: compacting,
         }
@@ -577,6 +754,13 @@ impl SessionRuntime {
         self.read_file_state.clear();
         self.pending_prompt_after_compact = None;
         self.auto_compact_failures = 0;
+        self.decline_pending_elicitations();
+    }
+
+    fn decline_pending_elicitations(&mut self) {
+        for (_, elicitation) in std::mem::take(&mut self.pending_mcp_elicitations) {
+            elicitation.respond(false, None);
+        }
     }
 
     #[cfg(test)]
@@ -585,6 +769,8 @@ impl SessionRuntime {
             TranscriptStore::test_empty(path),
             transcript_cwd,
             LspConfig::default(),
+            McpConfig::default(),
+            Vec::new(),
         )
     }
 
@@ -607,6 +793,10 @@ impl SessionRuntime {
 impl Drop for SessionRuntime {
     fn drop(&mut self) {
         self.lsp_manager.shutdown();
+        self.mcp_manager.shutdown();
+        self.hook_runner
+            .run(HookEvent::SessionEnd, json!({"cwd": self.transcript_cwd}))
+            .ok();
     }
 }
 
@@ -639,6 +829,7 @@ mod tests {
             task_id: "a1".to_owned(),
             description: "inspect parser".to_owned(),
             prompt: "look at parser".to_owned(),
+            agent: None,
             backend: SubagentBackend::Codex,
             cwd: "/workspace".to_owned(),
         }

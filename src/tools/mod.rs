@@ -9,7 +9,7 @@ mod subagent;
 mod terminal_run;
 mod utils;
 
-use std::sync::mpsc::Sender;
+use std::{collections::BTreeMap, sync::Arc, sync::mpsc::Sender};
 
 use serde_json::{Value, json};
 
@@ -29,13 +29,48 @@ use terminal_run::TerminalRunTool;
 pub(crate) use utils::with_tool_cwd;
 use utils::{error, normalize_path_argument, requires_path_approval, truncate_summary};
 
+pub(crate) fn sanitize_tool_name(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 #[derive(Clone)]
 pub struct ToolRegistry {
     terminal_requests: Option<Sender<TerminalRequest>>,
     lsp_manager: Option<LspManager>,
     shell_tool_mode: ShellToolMode,
     read_file_state: ReadFileState,
+    dynamic_tools: Arc<BTreeMap<String, Arc<dyn DynamicTool>>>,
     subagent: bool,
+}
+
+pub trait DynamicTool: Send + Sync {
+    fn spec(&self) -> ToolSpec;
+    fn execute(&self, call: &ToolCall, is_cancelled: &mut dyn FnMut() -> bool) -> ToolResult;
+
+    fn requires_approval(&self, _call: &ToolCall) -> bool {
+        true
+    }
+
+    fn is_concurrency_safe(&self, _call: &ToolCall) -> bool {
+        false
+    }
+
+    fn input_summary(&self, call: &ToolCall) -> String {
+        call.arguments.to_string()
+    }
+
+    fn input_description(&self, _call: &ToolCall) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +86,7 @@ impl ToolRegistry {
             lsp_manager: None,
             shell_tool_mode: ShellToolMode::Bash,
             read_file_state: ReadFileState::new(),
+            dynamic_tools: Arc::new(BTreeMap::new()),
             subagent: false,
         }
     }
@@ -62,6 +98,7 @@ impl ToolRegistry {
             lsp_manager: None,
             shell_tool_mode: ShellToolMode::TerminalRun,
             read_file_state: ReadFileState::new(),
+            dynamic_tools: Arc::new(BTreeMap::new()),
             subagent: false,
         }
     }
@@ -75,6 +112,7 @@ impl ToolRegistry {
             lsp_manager: None,
             shell_tool_mode,
             read_file_state: ReadFileState::new(),
+            dynamic_tools: Arc::new(BTreeMap::new()),
             subagent: false,
         }
     }
@@ -85,6 +123,7 @@ impl ToolRegistry {
             lsp_manager: None,
             shell_tool_mode: ShellToolMode::TerminalRun,
             read_file_state: ReadFileState::new(),
+            dynamic_tools: Arc::new(BTreeMap::new()),
             subagent: true,
         }
     }
@@ -99,8 +138,26 @@ impl ToolRegistry {
         self
     }
 
+    pub fn with_dynamic_tools(mut self, tools: Vec<Arc<dyn DynamicTool>>) -> Self {
+        let mut registered = BTreeMap::new();
+        for tool in tools {
+            let name = tool.spec().name;
+            if tool_metadata_for_name(&name).is_none() {
+                registered.insert(name, tool);
+            }
+        }
+        self.dynamic_tools = Arc::new(registered);
+        self
+    }
+
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools().into_iter().map(|tool| tool.spec()).collect()
+        let mut specs = self
+            .tools()
+            .into_iter()
+            .map(|tool| tool.spec())
+            .collect::<Vec<_>>();
+        specs.extend(self.dynamic_tools.values().map(|tool| tool.spec()));
+        specs
     }
 
     #[cfg(test)]
@@ -145,6 +202,9 @@ impl ToolRegistry {
             }
             return edit::edit(call);
         }
+        if let Some(tool) = self.dynamic_tools.get(&call.name) {
+            return tool.execute(call, is_cancelled);
+        }
         self.tool_for_name(&call.name)
             .map(|tool| tool.execute(call, is_cancelled))
             .unwrap_or_else(|| error(call, format!("Tool '{}' is not registered.", call.name)))
@@ -156,8 +216,14 @@ impl ToolRegistry {
         bash_prefix_allowed: bool,
         edit_allowed: bool,
     ) -> bool {
-        self.tool_for_name(&call.name)
-            .is_some_and(|tool| tool.requires_approval(call, bash_prefix_allowed, edit_allowed))
+        self.dynamic_tools.get(&call.name).map_or_else(
+            || {
+                self.tool_for_name(&call.name).is_some_and(|tool| {
+                    tool.requires_approval(call, bash_prefix_allowed, edit_allowed)
+                })
+            },
+            |tool| tool.requires_approval(call),
+        )
     }
 
     #[cfg(test)]
@@ -202,26 +268,43 @@ impl ToolRegistry {
             }
             return edit::edit_approved(call, &self.read_file_state, self.lsp_manager.as_ref());
         }
+        if let Some(tool) = self.dynamic_tools.get(&call.name) {
+            return tool.execute(call, is_cancelled);
+        }
         self.tool_for_name(&call.name)
             .map(|tool| tool.execute_approved(call, is_cancelled))
             .unwrap_or_else(|| self.execute_with_cancel(call, is_cancelled))
     }
 
     pub fn is_concurrency_safe(&self, call: &ToolCall) -> bool {
-        self.tool_for_name(&call.name)
-            .is_some_and(|tool| tool.is_concurrency_safe(call))
+        self.dynamic_tools.get(&call.name).map_or_else(
+            || {
+                self.tool_for_name(&call.name)
+                    .is_some_and(|tool| tool.is_concurrency_safe(call))
+            },
+            |tool| tool.is_concurrency_safe(call),
+        )
     }
 
     pub fn input_summary(&self, call: &ToolCall) -> String {
-        let summary = tool_metadata_for_name(&call.name)
-            .and_then(|tool| tool.input_summary(call))
+        let summary = self
+            .dynamic_tools
+            .get(&call.name)
+            .map(|tool| tool.input_summary(call))
+            .or_else(|| {
+                tool_metadata_for_name(&call.name).and_then(|tool| tool.input_summary(call))
+            })
             .unwrap_or_else(|| call.arguments.to_string());
         truncate_summary(&summary)
     }
 
     pub fn input_description(&self, call: &ToolCall) -> Option<String> {
-        tool_metadata_for_name(&call.name)
+        self.dynamic_tools
+            .get(&call.name)
             .and_then(|tool| tool.input_description(call))
+            .or_else(|| {
+                tool_metadata_for_name(&call.name).and_then(|tool| tool.input_description(call))
+            })
             .map(|description| truncate_summary(&description))
     }
 
@@ -410,6 +493,13 @@ fn spec(name: &str, description: &str, required: &[&str]) -> ToolSpec {
             }),
         );
         properties.insert(
+            "agent".to_owned(),
+            json!({
+                "type": "string",
+                "description": "Optional namespaced plugin agent definition, such as plugin-name:reviewer."
+            }),
+        );
+        properties.insert(
             "cwd".to_owned(),
             json!({
                 "type": "string",
@@ -510,9 +600,53 @@ mod tests {
         *,
     };
     use crate::{
-        agent::provider::ToolCall,
+        agent::provider::{ToolCall, ToolResult, ToolSpec},
         terminal::{TerminalRequest, TerminalRunResult},
     };
+
+    struct RuntimeEchoTool;
+
+    impl DynamicTool for RuntimeEchoTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "mcp__demo__echo".to_owned(),
+                description: "Echo dynamic input".to_owned(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+
+        fn execute(&self, call: &ToolCall, _is_cancelled: &mut dyn FnMut() -> bool) -> ToolResult {
+            ToolResult {
+                call_id: call.id.clone(),
+                content: call.arguments.to_string(),
+                is_error: false,
+            }
+        }
+
+        fn requires_approval(&self, _call: &ToolCall) -> bool {
+            false
+        }
+
+        fn is_concurrency_safe(&self, _call: &ToolCall) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn runtime_tools_join_specs_dispatch_and_policy() {
+        let registry =
+            ToolRegistry::new().with_dynamic_tools(vec![std::sync::Arc::new(RuntimeEchoTool)]);
+        let call = ToolCall {
+            id: "dynamic".to_owned(),
+            name: "mcp__demo__echo".to_owned(),
+            arguments: json!({"message":"hello"}),
+        };
+
+        assert!(registry.specs().iter().any(|spec| spec.name == call.name));
+        assert_eq!(registry.execute(&call).content, r#"{"message":"hello"}"#);
+        assert!(!registry.requires_approval(&call, false, false));
+        assert!(registry.is_concurrency_safe(&call));
+    }
 
     #[test]
     fn exposes_glint_tool_names() {

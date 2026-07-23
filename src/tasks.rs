@@ -61,6 +61,7 @@ pub struct SubagentRequest {
     pub task_id: String,
     pub description: String,
     pub prompt: String,
+    pub agent: Option<String>,
     pub backend: SubagentBackend,
     pub cwd: String,
 }
@@ -331,6 +332,7 @@ mod tests {
             task_id: id.to_owned(),
             description: "inspect parser".to_owned(),
             prompt: "check the parser".to_owned(),
+            agent: None,
             backend: SubagentBackend::Codex,
             cwd: "/tmp".to_owned(),
         }

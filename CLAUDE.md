@@ -82,6 +82,8 @@ Provider entries own `description`, `base_url`, optional token-cost `unit`, `mod
 
 The optional `lsp.servers` block configures stdio language servers by file extension. If `lsp.servers` is omitted, Glint registers the Rust default shown above. If it is present, the configured servers replace the default set.
 
+The optional `mcp.servers` and `plugins` blocks configure stdio/Streamable HTTP MCP servers and local/Git plugins. See `EXTENSIONS.md` for the complete schemas, plugin manifest conventions, hooks, OAuth, approval policy, and commands.
+
 ## Architecture
 
 ```text
@@ -100,6 +102,8 @@ agent thread -> AgentEvent -> AppEvent::Agent -> App::update -> ui::render
 - `src/agent/`: agent event/status types, compaction entry points, model provider types, and OpenAI-compatible HTTP integration.
 - `src/query/`: model-turn orchestration, tool-call batching, approval flow, and `spawn_agent_loop`.
 - `src/services/`: cross-cutting agent services such as tool-result budgeting.
+- `src/services/mcp/`: persistent MCP client runtime, transports, OAuth, elicitation, dynamic tools, resources, and prompts.
+- `src/plugins/`: local/Git plugin discovery, manifests, commands, skills, agents, hooks, settings, MCP, and LSP contributions.
 - `src/terminal.rs`: persistent agent PTY, visible non-interactive terminal command execution, sentinel parsing, and terminal output truncation.
 - `src/tools/`: Glint tool registry, `utils.rs` helpers, and per-tool directories with local descriptions.
 - `src/transcript.rs`: session persistence, resume summaries, model history, and UI-message reconstruction.
@@ -112,7 +116,9 @@ agent thread -> AgentEvent -> AppEvent::Agent -> App::update -> ui::render
 - Assistant responses stream into the transcript as provider deltas arrive.
 - Conversation history is persisted and model requests include prior model history plus the current user request.
 - Tool execution supports Read, Glob, Grep, LSP, TerminalRun, Bash, and Edit with approval, cancellation, read-only batching, visible agent-terminal command execution, and large-result budgeting.
-- No async runtime, MCP, retries, or multi-session tabs yet.
+- Plugins contribute namespaced commands, skills, specialized subagents, hooks, MCP servers, LSP servers, and settings.
+- MCP supports stdio and Streamable HTTP, bearer and OAuth authentication, tools, resources, prompts, notifications, cancellation, timeouts, approvals, and elicitation on an isolated Tokio runtime; the TUI remains synchronous.
+- No general model-request retries or multi-session tabs yet.
 
 ## Style
 

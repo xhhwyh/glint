@@ -7,6 +7,7 @@ mod context;
 mod event;
 mod input;
 mod message;
+mod plugins;
 mod query;
 mod runtime;
 mod services;
@@ -101,6 +102,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
             size.width,
             terminal_height,
         ));
+        app.set_mcp_detail_max_scroll(ui::mcp_detail_max_scroll(&app, size.width, size.height));
+        app.set_plugins_detail_max_scroll(ui::plugins_detail_max_scroll(
+            &app,
+            size.width,
+            size.height,
+        ));
         terminal.draw(|frame| ui::render(frame, &app))?;
 
         if term_event::poll(Duration::from_millis(40))? {
@@ -135,7 +142,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
                         app.update(AppEvent::Key(input));
                     }
                 }
-                Event::Mouse(mouse) => app.update(AppEvent::Mouse(MouseAction::from(mouse))),
+                Event::Mouse(mouse) => {
+                    let mouse = MouseAction::from(mouse);
+                    if let Some(action) =
+                        ui::extension_mouse_action(&app, mouse, size.width, size.height)
+                    {
+                        app.update(AppEvent::ExtensionMouse(action));
+                    } else {
+                        app.update(AppEvent::Mouse(mouse));
+                    }
+                }
                 _ => {}
             }
         }

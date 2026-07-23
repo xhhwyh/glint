@@ -83,6 +83,7 @@ pub(super) fn subagent(
         task_id: task_id.clone(),
         description: description.to_owned(),
         prompt: prompt.to_owned(),
+        agent: string_arg(call, "agent").map(str::to_owned),
         backend,
         cwd,
     };
