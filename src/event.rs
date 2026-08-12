@@ -11,8 +11,16 @@ pub enum AppEvent {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExtensionMouseAction {
+    Resume(ResumeMouseAction),
     Mcp(McpMouseAction),
     Plugins(PluginsMouseAction),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResumeMouseAction {
+    SelectSession(usize),
+    MoveSelection(isize),
+    None,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

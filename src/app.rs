@@ -17,7 +17,7 @@ use crate::{
     config::Config,
     event::{
         AppEvent, ExtensionMouseAction, KeyAction, KeyInput, McpMouseAction, MouseAction,
-        PluginsMouseAction, PluginsMouseTab,
+        PluginsMouseAction, PluginsMouseTab, ResumeMouseAction,
     },
     input::InputState,
     message::{Message, Role},
@@ -2675,8 +2675,23 @@ impl App {
 
     fn update_extension_mouse(&mut self, mouse: ExtensionMouseAction) {
         match mouse {
+            ExtensionMouseAction::Resume(action) => self.update_resume_mouse(action),
             ExtensionMouseAction::Mcp(action) => self.update_mcp_mouse(action),
             ExtensionMouseAction::Plugins(action) => self.update_plugins_mouse(action),
+        }
+    }
+
+    fn update_resume_mouse(&mut self, action: ResumeMouseAction) {
+        match action {
+            ResumeMouseAction::SelectSession(selected) => {
+                if let Some(picker) = self.resume_picker.as_mut()
+                    && selected < picker.sessions.len()
+                {
+                    picker.selected = selected;
+                }
+            }
+            ResumeMouseAction::MoveSelection(direction) => self.move_resume_picker(direction),
+            ResumeMouseAction::None => {}
         }
     }
 

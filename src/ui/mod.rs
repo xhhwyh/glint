@@ -53,7 +53,11 @@ pub fn extension_mouse_action(
     width: u16,
     height: u16,
 ) -> Option<ExtensionMouseAction> {
-    if app.mcp_view.is_some() {
+    if let Some(picker) = &app.resume_picker {
+        Some(ExtensionMouseAction::Resume(resume::mouse_action(
+            picker, mouse, width, height,
+        )))
+    } else if app.mcp_view.is_some() {
         Some(ExtensionMouseAction::Mcp(mcp::mouse_action(
             app, mouse, width, height,
         )))
@@ -88,6 +92,10 @@ struct DocumentLineMeta {
 }
 
 pub fn render(frame: &mut Frame, app: &App) {
+    if let Some(picker) = &app.resume_picker {
+        resume::render_resume_picker(frame, app, picker);
+        return;
+    }
     if let Some(view) = &app.mcp_view {
         mcp::render_mcp_view(frame, app, view);
         return;
@@ -360,9 +368,7 @@ fn composer(app: &App, width: u16) -> Composer {
 }
 
 fn composer_overlay_lines(app: &App, width: u16) -> Vec<Line<'static>> {
-    let mut lines = if let Some(picker) = &app.resume_picker {
-        resume::resume_picker_lines(picker, width, 8)
-    } else if app.model_picker.is_some() {
+    let mut lines = if app.model_picker.is_some() {
         model_picker::model_picker_lines(app, width)
     } else if app.slash_menu_visible() {
         input_view::slash_command_lines(app, width)
@@ -665,7 +671,7 @@ mod tests {
     use crate::{
         agent::AgentEvent,
         app::App,
-        app::{ModelPicker, ModelPickerStage, ResumePicker, TerminalTabSwitcher, TextPosition},
+        app::{ModelPicker, ModelPickerStage, TerminalTabSwitcher, TextPosition},
         event::AppEvent,
         progress::{TodoItem, TodoStatus, TodoUpdate},
         terminal::TerminalTab,
@@ -909,43 +915,6 @@ mod tests {
         assert!(picker_row < composer_row);
         assert!(help_row < separator_row);
         assert!(separator_row < provider_row);
-        assert!(composer_row < status_row);
-    }
-
-    #[test]
-    fn resume_picker_renders_above_bottom_input_box() {
-        let mut app = crate::app::App::test_empty();
-        app.resume_picker = Some(ResumePicker {
-            sessions: Vec::new(),
-            selected: 0,
-        });
-        let lines = composer(&app, 80).lines;
-        let texts = lines.iter().map(line_text).collect::<Vec<_>>();
-        let picker_row = texts
-            .iter()
-            .position(|line| line.contains("Resume a session"))
-            .expect("resume picker row");
-        let separator_row = texts[picker_row + 1..]
-            .iter()
-            .position(|line| line.starts_with("─"))
-            .map(|offset| picker_row + 1 + offset)
-            .expect("resume picker separator row");
-        let empty_row = texts
-            .iter()
-            .position(|line| line.contains("No saved sessions"))
-            .expect("empty resume row");
-        let composer_row = texts
-            .iter()
-            .position(|line| line.contains(" COMPOSER "))
-            .expect("composer row");
-        let status_row = texts
-            .iter()
-            .position(|line| line.contains("Context "))
-            .expect("status row");
-
-        assert!(picker_row < composer_row);
-        assert!(picker_row < separator_row);
-        assert!(separator_row < empty_row);
         assert!(composer_row < status_row);
     }
 
