@@ -326,6 +326,14 @@ fn status_task_lines(
         lines.push(status_kv_line("Description", &task.description, width));
         lines.push(status_kv_line("Status", task.status.label(), width));
         lines.push(status_kv_line("Backend", task.backend.label(), width));
+        lines.push(status_kv_line(
+            "Tools",
+            &task.tool_use_count.to_string(),
+            width,
+        ));
+        if let Some(activity) = task.activity.as_deref() {
+            lines.push(status_kv_line("Activity", activity, width));
+        }
         lines.push(status_kv_line("Cwd", &task.cwd, width));
         lines.push(status_kv_line(
             "Terminal",

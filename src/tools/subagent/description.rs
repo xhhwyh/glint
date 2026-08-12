@@ -1,6 +1,6 @@
-pub const DESCRIPTION: &str = r#"Launch a Codex subagent in a visible terminal tab for delegated work.
+pub const DESCRIPTION: &str = r#"Launch a read-only Codex subagent in a visible terminal tab for substantial, self-contained work that can run independently.
 
-Use this when a task is useful to hand off to a separate Codex agent while continuing the main conversation. The subagent runs in the requested working directory and its live transcript appears in a bottom terminal tab. The tool returns after the subagent starts. Do not poll or predict the result; when it completes, its final answer is added to the model context automatically.
+Prefer delegation for parallel investigation, review, verification, and focused repository research. Do not use it for trivial work, tightly coupled steps, duplicate work, or tasks requiring edits, approvals, or nested delegation. The subagent runs in the requested working directory and its live transcript appears in a bottom terminal tab. The tool returns after the subagent starts. Use TaskList for occasional status checks, TaskWait when the result is needed, TaskSend to refine the task, and TaskCancel to stop obsolete work.
 "#;
 
 pub const REQUIRED_ARGS: &[&str] = &["description", "prompt"];

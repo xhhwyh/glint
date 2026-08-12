@@ -12,9 +12,12 @@ mod resume;
 mod star;
 mod status;
 mod status_bar;
+mod subagent_tasks;
 mod terminal;
 mod theme;
 mod transcript_view;
+
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ratatui::{
     Frame,
@@ -368,7 +371,7 @@ fn composer(app: &App, width: u16) -> Composer {
 }
 
 fn composer_overlay_lines(app: &App, width: u16) -> Vec<Line<'static>> {
-    let mut lines = if app.model_picker.is_some() {
+    let interactive_lines = if app.model_picker.is_some() {
         model_picker::model_picker_lines(app, width)
     } else if app.slash_menu_visible() {
         input_view::slash_command_lines(app, width)
@@ -376,30 +379,45 @@ fn composer_overlay_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         Vec::new()
     };
 
+    let mut lines = Vec::new();
+
     if let Some(update) = app.pinned_progress() {
-        let progress_lines = progress::pinned_lines(update, width, progress_animation_frame(app));
-        if app.resume_picker.is_none() && app.model_picker.is_none() && app.slash_menu_visible() {
-            let overlay_lines = lines;
-            lines = progress_lines;
-            if !overlay_lines.is_empty() {
-                lines.push(Line::from(""));
-            }
-            lines.extend(overlay_lines);
-        } else {
-            if !lines.is_empty() {
-                lines.push(Line::from(""));
-            }
-            lines.extend(progress_lines);
-        }
+        append_composer_section(
+            &mut lines,
+            progress::pinned_lines(update, width, progress_animation_frame(app)),
+        );
     }
 
+    append_composer_section(
+        &mut lines,
+        subagent_tasks::running_lines(&app.task_snapshots(), width, subagent_animation_frame()),
+    );
+    append_composer_section(&mut lines, interactive_lines);
+
     lines
+}
+
+fn append_composer_section(lines: &mut Vec<Line<'static>>, section: Vec<Line<'static>>) {
+    if section.is_empty() {
+        return;
+    }
+    if !lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines.extend(section);
 }
 
 fn progress_animation_frame(app: &App) -> usize {
     app.processing_elapsed()
         .map(|elapsed| (elapsed.as_millis() / PROGRESS_ANIMATION_FRAME_MS) as usize)
         .unwrap_or(0)
+}
+
+fn subagent_animation_frame() -> usize {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| (duration.as_millis() / PROGRESS_ANIMATION_FRAME_MS) as usize)
+        .unwrap_or_default()
 }
 
 fn composer_status_lines(app: &App, width: u16) -> Vec<Line<'static>> {
@@ -674,6 +692,7 @@ mod tests {
         app::{ModelPicker, ModelPickerStage, TerminalTabSwitcher, TextPosition},
         event::AppEvent,
         progress::{TodoItem, TodoStatus, TodoUpdate},
+        tasks::{SubagentBackend, SubagentRequest},
         terminal::TerminalTab,
     };
     use ratatui::style::{Color, Modifier};
@@ -874,6 +893,36 @@ mod tests {
 
         assert!(progress_row < slash_row);
         assert!(slash_row < composer_row);
+    }
+
+    #[test]
+    fn running_subagents_render_above_the_composer() {
+        let mut app = crate::app::App::test_empty();
+        app.test_start_subagent_task(&SubagentRequest {
+            task_id: "a1".to_owned(),
+            description: "Inspect parser".to_owned(),
+            prompt: "Inspect the parser".to_owned(),
+            agent: None,
+            backend: SubagentBackend::Codex,
+            cwd: "/workspace".to_owned(),
+        });
+
+        let texts = composer(&app, 80)
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>();
+        let tasks_row = texts
+            .iter()
+            .position(|line| line.contains("Subagents · 1 running"))
+            .expect("subagent task row");
+        let composer_row = texts
+            .iter()
+            .position(|line| line.contains(" COMPOSER "))
+            .expect("composer row");
+
+        assert!(tasks_row < composer_row);
+        assert!(texts.iter().any(|line| line.contains("a1  Inspect parser")));
     }
 
     #[test]

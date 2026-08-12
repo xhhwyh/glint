@@ -5,6 +5,7 @@ use std::{
         Arc,
         mpsc::{self, Receiver, Sender},
     },
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -26,7 +27,10 @@ use crate::{
         lsp::LspManager,
         mcp::{McpConfig, McpElicitation, McpElicitationRequest, McpManager, McpServerStatus},
     },
-    tasks::{self, SubagentOutcome, SubagentRequest, TaskManager, TaskSnapshot},
+    tasks::{
+        self, SubagentOutcome, SubagentRequest, SubagentSteering, TaskManager, TaskSnapshot,
+        TaskWaitResponse,
+    },
     terminal::TerminalRequest,
     tools::{DynamicTool, ReadFileState, ShellToolMode},
     transcript::{
@@ -144,6 +148,32 @@ pub struct AssistantRecord {
     pub error: Option<String>,
 }
 
+pub enum SubagentRuntimeEvent {
+    Agent {
+        terminal_tab: usize,
+        event: AgentEvent,
+    },
+    Finished {
+        terminal_tab: usize,
+        task: TaskSnapshot,
+    },
+}
+
+struct RunningSubagent {
+    task_id: String,
+    terminal_tab: usize,
+    events: Receiver<AgentEvent>,
+    outcome: Receiver<SubagentOutcome>,
+    control: Sender<AgentControl>,
+    steering: Arc<SubagentSteering>,
+}
+
+struct PendingTaskWait {
+    task_ids: Vec<String>,
+    deadline: Instant,
+    response: Sender<Result<TaskWaitResponse, String>>,
+}
+
 pub struct SessionRuntime {
     transcript: TranscriptStore,
     transcript_cwd: String,
@@ -160,6 +190,8 @@ pub struct SessionRuntime {
     conversation_permissions: ConversationPermissions,
     read_file_state: ReadFileState,
     task_manager: TaskManager,
+    running_subagents: Vec<RunningSubagent>,
+    pending_task_waits: Vec<PendingTaskWait>,
     progress_state: ProgressState,
     pending_prompt_after_compact: Option<String>,
     auto_compact_failures: u8,
@@ -210,6 +242,8 @@ impl SessionRuntime {
             conversation_permissions: ConversationPermissions::default(),
             read_file_state: ReadFileState::new(),
             task_manager: TaskManager::default(),
+            running_subagents: Vec::new(),
+            pending_task_waits: Vec::new(),
             progress_state,
             pending_prompt_after_compact: None,
             auto_compact_failures: 0,
@@ -424,6 +458,170 @@ impl SessionRuntime {
         Ok(task)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn attach_subagent_run(
+        &mut self,
+        task_id: String,
+        terminal_tab: usize,
+        events: Receiver<AgentEvent>,
+        outcome: Receiver<SubagentOutcome>,
+        control: Sender<AgentControl>,
+        steering: Arc<SubagentSteering>,
+    ) {
+        self.running_subagents.push(RunningSubagent {
+            task_id,
+            terminal_tab,
+            events,
+            outcome,
+            control,
+            steering,
+        });
+    }
+
+    pub fn poll_subagent_events(&mut self) -> Vec<SubagentRuntimeEvent> {
+        let mut runtime_events = Vec::new();
+        let mut finished = Vec::new();
+
+        for (index, run) in self.running_subagents.iter().enumerate() {
+            while let Ok(event) = run.events.try_recv() {
+                if let Some((activity, tool_started)) = subagent_activity(&event) {
+                    self.task_manager.update_subagent_activity(
+                        &run.task_id,
+                        activity,
+                        tool_started,
+                    );
+                }
+                runtime_events.push(SubagentRuntimeEvent::Agent {
+                    terminal_tab: run.terminal_tab,
+                    event,
+                });
+            }
+            match run.outcome.try_recv() {
+                Ok(outcome) => finished.push((index, outcome)),
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => finished.push((
+                    index,
+                    SubagentOutcome::failed("subagent result channel closed", ""),
+                )),
+            }
+        }
+
+        for (index, outcome) in finished.into_iter().rev() {
+            let run = self.running_subagents.remove(index);
+            if let Some(task) = self.finish_subagent_task(&run.task_id, outcome) {
+                runtime_events.push(SubagentRuntimeEvent::Finished {
+                    terminal_tab: run.terminal_tab,
+                    task,
+                });
+            }
+        }
+        self.flush_task_waits();
+        runtime_events
+    }
+
+    pub fn register_task_wait(
+        &mut self,
+        task_ids: Vec<String>,
+        timeout: Duration,
+        response: Sender<Result<TaskWaitResponse, String>>,
+    ) {
+        if task_ids.is_empty() {
+            response
+                .send(Err("task_ids must contain at least one task".to_owned()))
+                .ok();
+            return;
+        }
+        let tasks = match self.task_manager.snapshots_for(&task_ids) {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                response.send(Err(error)).ok();
+                return;
+            }
+        };
+        if tasks.iter().all(|task| task.status.is_terminal()) {
+            response
+                .send(Ok(TaskWaitResponse {
+                    tasks,
+                    timed_out: false,
+                }))
+                .ok();
+            return;
+        }
+        self.pending_task_waits.push(PendingTaskWait {
+            task_ids,
+            deadline: Instant::now() + timeout,
+            response,
+        });
+    }
+
+    pub fn send_task_message(
+        &mut self,
+        task_id: &str,
+        message: String,
+    ) -> Result<TaskSnapshot, String> {
+        if message.trim().is_empty() {
+            return Err("message must not be empty".to_owned());
+        }
+        let task = self
+            .task_manager
+            .snapshot(task_id)
+            .ok_or_else(|| format!("unknown task: {task_id}"))?;
+        if !task.status.is_running() {
+            return Err(format!(
+                "task {task_id} is {}; messages can only be sent to running tasks",
+                task.status.label()
+            ));
+        }
+        let run = self
+            .running_subagents
+            .iter()
+            .find(|run| run.task_id == task_id)
+            .ok_or_else(|| format!("task {task_id} has no active runtime"))?;
+        run.steering
+            .send(message)
+            .map_err(|error| format!("task {task_id}: {error}"))?;
+        Ok(task)
+    }
+
+    pub fn cancel_task(&mut self, task_id: &str) -> Result<TaskSnapshot, String> {
+        let task = self
+            .task_manager
+            .snapshot(task_id)
+            .ok_or_else(|| format!("unknown task: {task_id}"))?;
+        if !task.status.is_running() {
+            return Err(format!("task {task_id} is already {}", task.status.label()));
+        }
+        let run = self
+            .running_subagents
+            .iter()
+            .find(|run| run.task_id == task_id)
+            .ok_or_else(|| format!("task {task_id} has no active runtime"))?;
+        run.control
+            .send(AgentControl::Cancel)
+            .map_err(|_| format!("task {task_id} is no longer running"))?;
+        Ok(task)
+    }
+
+    fn flush_task_waits(&mut self) {
+        let now = Instant::now();
+        let mut index = 0;
+        while index < self.pending_task_waits.len() {
+            let waiter = &self.pending_task_waits[index];
+            let tasks = self.task_manager.snapshots_for(&waiter.task_ids);
+            let ready = tasks
+                .as_ref()
+                .is_ok_and(|tasks| tasks.iter().all(|task| task.status.is_terminal()));
+            let timed_out = now >= waiter.deadline;
+            if !ready && !timed_out {
+                index += 1;
+                continue;
+            }
+            let waiter = self.pending_task_waits.remove(index);
+            let result = tasks.map(|tasks| TaskWaitResponse { tasks, timed_out });
+            waiter.response.send(result).ok();
+        }
+    }
+
     pub fn finish_subagent_task(
         &mut self,
         task_id: &str,
@@ -451,6 +649,11 @@ impl SessionRuntime {
 
     pub fn handle_terminal_tab_closed(&mut self, closed_index: usize) {
         self.task_manager.handle_terminal_tab_closed(closed_index);
+        for run in &mut self.running_subagents {
+            if run.terminal_tab > closed_index {
+                run.terminal_tab -= 1;
+            }
+        }
     }
 
     pub fn handle_command(&mut self, command: RuntimeCommand) -> RuntimeEvent {
@@ -827,8 +1030,38 @@ impl SessionRuntime {
     }
 }
 
+fn subagent_activity(event: &AgentEvent) -> Option<(String, bool)> {
+    match event {
+        AgentEvent::Started => Some(("Thinking".to_owned(), false)),
+        AgentEvent::AssistantDelta(_) => Some(("Responding".to_owned(), false)),
+        AgentEvent::ToolStarted {
+            name,
+            input_summary,
+            ..
+        } => Some((format!("{name} · {input_summary}"), true)),
+        AgentEvent::ToolFinished {
+            name,
+            output_summary,
+            ..
+        } => Some((format!("Finished {name} · {output_summary}"), false)),
+        AgentEvent::AssistantFinished => Some(("Finishing".to_owned(), false)),
+        AgentEvent::Failed(error) => Some((format!("Failed · {error}"), false)),
+        AgentEvent::AssistantTurn { .. }
+        | AgentEvent::TodoUpdated(_)
+        | AgentEvent::ToolApprovalRequested(_)
+        | AgentEvent::ConversationPermissionChanged { .. }
+        | AgentEvent::CompactStarted
+        | AgentEvent::CompactFinished { .. }
+        | AgentEvent::CompactFailed(_) => None,
+    }
+}
+
 impl Drop for SessionRuntime {
     fn drop(&mut self) {
+        for run in &self.running_subagents {
+            run.control.send(AgentControl::Cancel).ok();
+            run.steering.close();
+        }
         self.lsp_manager.shutdown();
         self.mcp_manager.shutdown();
         self.hook_runner
@@ -888,6 +1121,84 @@ mod tests {
         let content = history[0].content.as_deref().unwrap_or_default();
         assert!(content.contains("<subagent-outcome>"));
         assert!(content.contains("<result>done</result>"));
+    }
+
+    #[test]
+    fn runtime_controls_and_completes_a_running_subagent() {
+        let mut runtime = runtime();
+        let request = subagent_request();
+        runtime.start_subagent_task(&request, 0).unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        let (control_tx, control_rx) = mpsc::channel();
+        let steering = Arc::new(SubagentSteering::default());
+        runtime.attach_subagent_run(
+            request.task_id.clone(),
+            0,
+            event_rx,
+            outcome_rx,
+            control_tx,
+            Arc::clone(&steering),
+        );
+
+        runtime
+            .send_task_message("a1", "also inspect tests".to_owned())
+            .unwrap();
+        assert_eq!(steering.drain(), vec!["also inspect tests"]);
+        event_tx
+            .send(AgentEvent::ToolStarted {
+                id: "tool-1".to_owned(),
+                name: "Grep".to_owned(),
+                input_summary: "parser".to_owned(),
+                input_description: None,
+            })
+            .unwrap();
+        runtime.poll_subagent_events();
+        let snapshot = runtime.task_snapshots().remove(0);
+        assert_eq!(snapshot.activity.as_deref(), Some("Grep · parser"));
+        assert_eq!(snapshot.tool_use_count, 1);
+        runtime.cancel_task("a1").unwrap();
+        assert!(matches!(control_rx.recv().unwrap(), AgentControl::Cancel));
+
+        outcome_tx
+            .send(SubagentOutcome::cancelled("partial"))
+            .unwrap();
+        let events = runtime.poll_subagent_events();
+        assert!(matches!(
+            events.as_slice(),
+            [SubagentRuntimeEvent::Finished { task, .. }]
+                if task.status == tasks::TaskStatus::Cancelled
+        ));
+    }
+
+    #[test]
+    fn task_waiter_receives_completed_result_after_runtime_poll() {
+        let mut runtime = runtime();
+        let request = subagent_request();
+        runtime.start_subagent_task(&request, 0).unwrap();
+        let (_event_tx, event_rx) = mpsc::channel();
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        let (control_tx, _control_rx) = mpsc::channel();
+        runtime.attach_subagent_run(
+            request.task_id.clone(),
+            0,
+            event_rx,
+            outcome_rx,
+            control_tx,
+            Arc::new(SubagentSteering::default()),
+        );
+        let (wait_tx, wait_rx) = mpsc::channel();
+        runtime.register_task_wait(vec!["a1".to_owned()], Duration::from_secs(1), wait_tx);
+        assert!(wait_rx.try_recv().is_err());
+
+        outcome_tx
+            .send(SubagentOutcome::completed("final result"))
+            .unwrap();
+        runtime.poll_subagent_events();
+
+        let waited = wait_rx.recv().unwrap().unwrap();
+        assert!(!waited.timed_out);
+        assert_eq!(waited.tasks[0].result.as_deref(), Some("final result"));
     }
 
     #[test]

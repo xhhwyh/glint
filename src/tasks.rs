@@ -1,6 +1,9 @@
 use std::{
     cmp::Reverse,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -33,6 +36,10 @@ impl TaskStatus {
 
     pub fn is_running(self) -> bool {
         matches!(self, Self::Queued | Self::Running)
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
 }
 
@@ -103,6 +110,8 @@ pub struct TaskSnapshot {
     pub started_at_ms: u64,
     pub ended_at_ms: Option<u64>,
     pub summary: Option<String>,
+    pub activity: Option<String>,
+    pub tool_use_count: u32,
     pub result: Option<String>,
     pub error: Option<String>,
 }
@@ -130,6 +139,68 @@ impl SubagentOutcome {
             cancelled: false,
         }
     }
+
+    pub fn cancelled(final_message: impl Into<String>) -> Self {
+        Self {
+            final_message: final_message.into(),
+            error: Some("cancelled".to_owned()),
+            cancelled: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskWaitResponse {
+    pub tasks: Vec<TaskSnapshot>,
+    pub timed_out: bool,
+}
+
+#[derive(Default)]
+pub struct SubagentSteering {
+    state: Mutex<SubagentSteeringState>,
+}
+
+#[derive(Default)]
+struct SubagentSteeringState {
+    closed: bool,
+    messages: Vec<String>,
+}
+
+impl SubagentSteering {
+    pub fn send(&self, message: String) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "subagent steering state is unavailable".to_owned())?;
+        if state.closed {
+            return Err("subagent is no longer accepting messages".to_owned());
+        }
+        state.messages.push(message);
+        Ok(())
+    }
+
+    pub fn drain(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .map(|mut state| std::mem::take(&mut state.messages))
+            .unwrap_or_default()
+    }
+
+    pub fn finish_or_drain(&self) -> Option<Vec<String>> {
+        let mut state = self.state.lock().ok()?;
+        if state.messages.is_empty() {
+            state.closed = true;
+            None
+        } else {
+            Some(std::mem::take(&mut state.messages))
+        }
+    }
+
+    pub fn close(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closed = true;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -149,6 +220,20 @@ impl TaskManager {
             .iter()
             .filter(|task| task.kind == TaskKind::Subagent && task.status.is_running())
             .count()
+    }
+
+    pub fn snapshot(&self, task_id: &str) -> Option<TaskSnapshot> {
+        self.tasks.iter().find(|task| task.id == task_id).cloned()
+    }
+
+    pub fn snapshots_for(&self, task_ids: &[String]) -> Result<Vec<TaskSnapshot>, String> {
+        task_ids
+            .iter()
+            .map(|task_id| {
+                self.snapshot(task_id)
+                    .ok_or_else(|| format!("unknown task: {task_id}"))
+            })
+            .collect()
     }
 
     pub fn start_subagent(
@@ -176,6 +261,8 @@ impl TaskManager {
             started_at_ms: now_ms(),
             ended_at_ms: None,
             summary: None,
+            activity: Some("Starting".to_owned()),
+            tool_use_count: 0,
             result: None,
             error: None,
         };
@@ -194,9 +281,31 @@ impl TaskManager {
         task.ended_at_ms = Some(now_ms());
         task.error = outcome.error;
         task.summary = Some(task_status_summary(task));
+        task.activity = task.summary.clone();
         task.result = (!outcome.final_message.trim().is_empty())
             .then(|| outcome.final_message.trim().to_owned());
         Some(task.clone())
+    }
+
+    pub fn update_subagent_activity(
+        &mut self,
+        task_id: &str,
+        activity: impl Into<String>,
+        tool_started: bool,
+    ) {
+        let Some(task) = self.tasks.iter_mut().find(|task| task.id == task_id) else {
+            return;
+        };
+        if !task.status.is_running() {
+            return;
+        }
+        let activity = activity.into();
+        if !activity.trim().is_empty() {
+            task.activity = Some(activity);
+        }
+        if tool_started {
+            task.tool_use_count = task.tool_use_count.saturating_add(1);
+        }
     }
 
     pub fn terminal_tab_has_running_task(&self, terminal_tab: usize) -> bool {
@@ -426,5 +535,31 @@ mod tests {
 
         assert_eq!(finished.result.as_deref(), Some(final_message));
         assert!(task_model_context_message(&finished).contains(final_message));
+    }
+
+    #[test]
+    fn steering_closes_atomically_after_the_final_drain() {
+        let steering = SubagentSteering::default();
+        steering.send("check the edge case".to_owned()).unwrap();
+
+        assert_eq!(
+            steering.finish_or_drain(),
+            Some(vec!["check the edge case".to_owned()])
+        );
+        assert_eq!(steering.finish_or_drain(), None);
+        assert!(steering.send("too late".to_owned()).is_err());
+    }
+
+    #[test]
+    fn cancelled_subagent_has_cancelled_status() {
+        let mut manager = TaskManager::default();
+        manager.start_subagent(&request("a1"), 0).unwrap();
+
+        let finished = manager
+            .finish_subagent("a1", SubagentOutcome::cancelled("partial"))
+            .unwrap();
+
+        assert_eq!(finished.status, TaskStatus::Cancelled);
+        assert_eq!(finished.result.as_deref(), Some("partial"));
     }
 }

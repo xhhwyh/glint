@@ -71,10 +71,10 @@ fn subagent_tool_mode_context() -> String {
 fn tool_mode_context(shell_tool_mode: ShellToolMode) -> String {
     match shell_tool_mode {
         ShellToolMode::Bash => format!(
-            "available tools: Read, Glob, Grep, LSP, Bash, Edit, TodoWrite. {COMMON_TOOL_CONTEXT} Use Bash for non-interactive shell-only commands such as git, build/test, package manager, environment, and process commands. TerminalRun is unavailable until the user enables the visible terminal with /terminal."
+            "available tools: Read, Glob, Grep, LSP, Bash, Subagent, TaskList, TaskWait, TaskSend, TaskCancel, Edit, TodoWrite. {COMMON_TOOL_CONTEXT} Use Bash for non-interactive shell-only commands such as git, build/test, package manager, environment, and process commands. TerminalRun is unavailable until the user enables the visible terminal with /terminal."
         ),
         ShellToolMode::TerminalRun => format!(
-            "available tools: Read, Glob, Grep, LSP, TerminalRun, Edit, TodoWrite. {COMMON_TOOL_CONTEXT} Use TerminalRun for non-interactive shell-only commands such as git, build/test, package manager, environment, and process commands so the command and output are visible in the terminal. Bash is unavailable while terminal mode is enabled."
+            "available tools: Read, Glob, Grep, LSP, TerminalRun, Subagent, TaskList, TaskWait, TaskSend, TaskCancel, Edit, TodoWrite. {COMMON_TOOL_CONTEXT} Use TerminalRun for non-interactive shell-only commands such as git, build/test, package manager, environment, and process commands so the command and output are visible in the terminal. Bash is unavailable while terminal mode is enabled."
         ),
     }
 }
@@ -147,13 +147,13 @@ mod tests {
 
         assert!(
             bash.tool_mode
-                .contains("available tools: Read, Glob, Grep, LSP, Bash, Edit, TodoWrite")
+                .contains("Bash, Subagent, TaskList, TaskWait, TaskSend, TaskCancel, Edit")
         );
         assert!(bash.tool_mode.contains("TerminalRun is unavailable"));
         assert!(
             terminal
                 .tool_mode
-                .contains("available tools: Read, Glob, Grep, LSP, TerminalRun, Edit, TodoWrite")
+                .contains("TerminalRun, Subagent, TaskList, TaskWait, TaskSend, TaskCancel, Edit")
         );
         assert!(terminal.tool_mode.contains("Bash is unavailable"));
     }

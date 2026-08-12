@@ -31,6 +31,7 @@ use crate::{
     services::lsp::LspManager,
     services::tool_results::ToolResultBudget,
     settings::ProjectSettings,
+    tasks::SubagentSteering,
     terminal::TerminalRequest,
     tools::{DynamicTool, ReadFileState, ShellToolMode, ToolRegistry},
 };
@@ -90,7 +91,15 @@ pub fn spawn_agent_loop(
         .with_read_file_state(input.read_file_state.clone())
         .with_dynamic_tools(input.dynamic_tools.clone());
 
-        match run_agent_loop(input, &mut provider, &registry, &tx, &control_rx, true) {
+        match run_agent_loop(
+            input,
+            &mut provider,
+            &registry,
+            &tx,
+            &control_rx,
+            None,
+            true,
+        ) {
             Ok(_) => {
                 tx.send(AgentEvent::AssistantFinished).ok();
             }
@@ -106,6 +115,8 @@ pub fn spawn_subagent_loop(
     input: AgentRunInput,
     tx: Sender<AgentEvent>,
     result_tx: Sender<crate::tasks::SubagentOutcome>,
+    control_rx: Receiver<AgentControl>,
+    steering: Arc<SubagentSteering>,
 ) {
     thread::spawn(move || {
         let mut provider = OpenAiProvider::new(input.llm.clone());
@@ -113,12 +124,19 @@ pub fn spawn_subagent_loop(
             .with_lsp_manager(input.lsp_manager.clone())
             .with_read_file_state(input.read_file_state.clone())
             .with_dynamic_tools(input.dynamic_tools.clone());
-        let (_control_tx, control_rx) = mpsc::channel();
-
         let cwd = PathBuf::from(input.runtime_context.current_dir.clone());
         let result = crate::tools::with_tool_cwd(cwd, || {
-            run_agent_loop(input, &mut provider, &registry, &tx, &control_rx, false)
+            run_agent_loop(
+                input,
+                &mut provider,
+                &registry,
+                &tx,
+                &control_rx,
+                Some(steering.as_ref()),
+                false,
+            )
         });
+        steering.close();
 
         match result {
             Ok(outcome) => {
@@ -130,6 +148,13 @@ pub fn spawn_subagent_loop(
                     .ok();
             }
             Err(error) => {
+                if error.to_string() == "cancelled" {
+                    tx.send(AgentEvent::AssistantFinished).ok();
+                    result_tx
+                        .send(crate::tasks::SubagentOutcome::cancelled(""))
+                        .ok();
+                    return;
+                }
                 let message = format!("LLM error: {error:#}");
                 tx.send(AgentEvent::Failed(message.clone())).ok();
                 result_tx
@@ -146,6 +171,7 @@ fn run_agent_loop(
     registry: &ToolRegistry,
     tx: &Sender<AgentEvent>,
     control_rx: &Receiver<AgentControl>,
+    steering: Option<&SubagentSteering>,
     approvals_enabled: bool,
 ) -> Result<AgentRunOutcome> {
     input.hook_runner.run(
@@ -169,6 +195,7 @@ fn run_agent_loop(
         registry,
         tx,
         control_rx,
+        steering,
         &tool_result_budget,
         RunModelTurnsConfig {
             initial_permissions: input.conversation_permissions,
@@ -189,6 +216,7 @@ fn run_model_turns(
     registry: &ToolRegistry,
     tx: &Sender<AgentEvent>,
     control_rx: &Receiver<AgentControl>,
+    steering: Option<&SubagentSteering>,
     tool_result_budget: &ToolResultBudget,
     config: RunModelTurnsConfig,
     hook_runner: &HookRunner,
@@ -198,6 +226,7 @@ fn run_model_turns(
     let mut conversation_permissions = config.initial_permissions;
 
     loop {
+        append_steering_messages(messages, drain_steering_messages(steering));
         if drain_control_messages(control_rx, tx, &mut conversation_permissions) {
             bail!("cancelled");
         }
@@ -245,6 +274,7 @@ fn run_model_turns(
         .ok();
 
         if !response.tool_calls.is_empty() {
+            let steering_messages = drain_steering_messages(steering);
             tool_iterations += 1;
             if tool_iterations > MAX_TOOL_ITERATIONS {
                 bail!("maximum tool iterations exceeded");
@@ -265,11 +295,41 @@ fn run_model_turns(
                 control_rx,
                 &mut tool_state,
             )?;
+            append_steering_messages(messages, steering_messages);
+            continue;
+        }
+
+        if let Some(steering_messages) = finish_or_drain_steering(steering) {
+            if response.finish_reason != FinishReason::Stop {
+                return finish_without_tools(response);
+            }
+            messages.push(ModelMessage::assistant(
+                response.assistant_text.filter(|text| !text.is_empty()),
+                Vec::new(),
+            ));
+            append_steering_messages(messages, steering_messages);
             continue;
         }
 
         return finish_without_tools(response);
     }
+}
+
+fn drain_steering_messages(steering: Option<&SubagentSteering>) -> Vec<String> {
+    steering.map(SubagentSteering::drain).unwrap_or_default()
+}
+
+fn finish_or_drain_steering(steering: Option<&SubagentSteering>) -> Option<Vec<String>> {
+    steering.and_then(SubagentSteering::finish_or_drain)
+}
+
+fn append_steering_messages(messages: &mut Vec<ModelMessage>, steering: Vec<String>) {
+    messages.extend(steering.into_iter().map(|message| {
+        ModelMessage::user(format!(
+            "<subagent-steering>\n{}\n</subagent-steering>",
+            message.trim()
+        ))
+    }));
 }
 
 fn append_tool_turn(
@@ -782,7 +842,10 @@ fn summarize_tool_output(output: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, sync::mpsc};
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, mpsc},
+    };
 
     use anyhow::Result;
     use serde_json::json;
@@ -814,6 +877,25 @@ mod tests {
             self.responses
                 .pop_front()
                 .ok_or_else(|| anyhow::anyhow!("no fake response queued"))
+        }
+    }
+
+    struct SteeringProvider {
+        steering: Arc<SubagentSteering>,
+        requests: Vec<ModelRequest>,
+    }
+
+    impl ModelProvider for SteeringProvider {
+        fn complete(&mut self, request: ModelRequest) -> Result<ModelResponse> {
+            self.requests.push(request);
+            if self.requests.len() == 1 {
+                self.steering
+                    .send("focus on the parser tests".to_owned())
+                    .unwrap();
+                Ok(final_response("initial answer"))
+            } else {
+                Ok(final_response("revised answer"))
+            }
         }
     }
 
@@ -947,8 +1029,16 @@ mod tests {
         let mut provider = FakeProvider::new(vec![final_response("done")]);
 
         let control_rx = control_rx();
-        let outcome =
-            run_agent_loop(input(), &mut provider, &registry, &tx, &control_rx, true).unwrap();
+        let outcome = run_agent_loop(
+            input(),
+            &mut provider,
+            &registry,
+            &tx,
+            &control_rx,
+            None,
+            true,
+        )
+        .unwrap();
 
         let events: Vec<_> = rx.try_iter().collect();
         assert_eq!(provider.requests.len(), 1);
@@ -962,13 +1052,60 @@ mod tests {
     }
 
     #[test]
+    fn steering_message_continues_a_finishing_subagent_turn() {
+        let (tx, _rx) = mpsc::channel();
+        let registry = ToolRegistry::new();
+        let steering = Arc::new(SubagentSteering::default());
+        let mut provider = SteeringProvider {
+            steering: Arc::clone(&steering),
+            requests: Vec::new(),
+        };
+        let control_rx = control_rx();
+
+        let outcome = run_agent_loop(
+            input(),
+            &mut provider,
+            &registry,
+            &tx,
+            &control_rx,
+            Some(steering.as_ref()),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.final_message, "revised answer");
+        assert_eq!(provider.requests.len(), 2);
+        let second_request = &provider.requests[1];
+        assert!(second_request.messages.iter().any(|message| {
+            message.role == ModelRole::Assistant
+                && message.content.as_deref() == Some("initial answer")
+        }));
+        assert!(second_request.messages.iter().any(|message| {
+            message.role == ModelRole::User
+                && message
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("focus on the parser tests"))
+        }));
+    }
+
+    #[test]
     fn tool_call_causes_second_model_request_with_tool_result() {
         let (tx, _rx) = mpsc::channel();
         let registry = ToolRegistry::new();
         let mut provider = FakeProvider::new(vec![tool_response("one"), final_response("done")]);
 
         let control_rx = control_rx();
-        run_agent_loop(input(), &mut provider, &registry, &tx, &control_rx, true).unwrap();
+        run_agent_loop(
+            input(),
+            &mut provider,
+            &registry,
+            &tx,
+            &control_rx,
+            None,
+            true,
+        )
+        .unwrap();
 
         assert_eq!(provider.requests.len(), 2);
         let second_request = &provider.requests[1];
@@ -989,7 +1126,16 @@ mod tests {
         let mut provider = FakeProvider::new(vec![todo_response(), final_response("done")]);
 
         let control_rx = control_rx();
-        run_agent_loop(input(), &mut provider, &registry, &tx, &control_rx, true).unwrap();
+        run_agent_loop(
+            input(),
+            &mut provider,
+            &registry,
+            &tx,
+            &control_rx,
+            None,
+            true,
+        )
+        .unwrap();
 
         let events = rx.try_iter().collect::<Vec<_>>();
         assert!(events.iter().any(|event| {
@@ -1159,8 +1305,16 @@ mod tests {
         };
 
         let control_rx = control_rx();
-        let error =
-            run_agent_loop(input(), &mut provider, &registry, &tx, &control_rx, true).unwrap_err();
+        let error = run_agent_loop(
+            input(),
+            &mut provider,
+            &registry,
+            &tx,
+            &control_rx,
+            None,
+            true,
+        )
+        .unwrap_err();
 
         assert_eq!(provider.requests.len(), MAX_TOOL_ITERATIONS + 1);
         assert!(format!("{error:#}").contains("maximum tool iterations exceeded"));
