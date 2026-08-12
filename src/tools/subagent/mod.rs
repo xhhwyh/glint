@@ -107,7 +107,7 @@ pub(super) fn subagent(
             ok(
                 call,
                 format!(
-                    "Started Codex subagent {} in terminal tab {}. Its final result will be added to the model context when it completes.",
+                    "Started Codex subagent {} in terminal tab {}. Use TaskWait for its result, TaskSend to refine it, or TaskCancel to stop it.",
                     response.task_id,
                     response.terminal_tab.map(|tab| tab + 1).unwrap_or_default()
                 ),

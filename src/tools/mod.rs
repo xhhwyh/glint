@@ -6,6 +6,7 @@ mod lsp;
 mod read;
 mod read_state;
 mod subagent;
+mod task_control;
 mod terminal_run;
 mod todo_write;
 mod utils;
@@ -26,6 +27,7 @@ use lsp::LspTool;
 use read::ReadTool;
 pub use read_state::ReadFileState;
 use subagent::SubagentTool;
+use task_control::{TaskCancelTool, TaskListTool, TaskSendTool, TaskWaitTool};
 use terminal_run::TerminalRunTool;
 use todo_write::TodoWriteTool;
 pub(crate) use utils::with_tool_cwd;
@@ -192,6 +194,18 @@ impl ToolRegistry {
             }
             return subagent::subagent(call, self.terminal_requests.as_ref());
         }
+        if matches!(
+            call.name.as_str(),
+            "TaskList" | "TaskWait" | "TaskSend" | "TaskCancel"
+        ) {
+            if self.subagent {
+                return error(
+                    call,
+                    "Task control is not registered inside subagents.".to_owned(),
+                );
+            }
+            return task_control::execute(call, self.terminal_requests.as_ref(), is_cancelled);
+        }
         if call.name == "Read" {
             return read::read(call, &self.read_file_state);
         }
@@ -260,6 +274,18 @@ impl ToolRegistry {
                 return error(call, "Nested Subagent is not registered.".to_owned());
             }
             return subagent::subagent(call, self.terminal_requests.as_ref());
+        }
+        if matches!(
+            call.name.as_str(),
+            "TaskList" | "TaskWait" | "TaskSend" | "TaskCancel"
+        ) {
+            if self.subagent {
+                return error(
+                    call,
+                    "Task control is not registered inside subagents.".to_owned(),
+                );
+            }
+            return task_control::execute(call, self.terminal_requests.as_ref(), is_cancelled);
         }
         if call.name == "Read" {
             return read::read(call, &self.read_file_state);
@@ -354,6 +380,10 @@ impl ToolRegistry {
             &LSP_TOOL,
             shell_tool,
             &SUBAGENT_TOOL,
+            &TASK_LIST_TOOL,
+            &TASK_WAIT_TOOL,
+            &TASK_SEND_TOOL,
+            &TASK_CANCEL_TOOL,
             &EDIT_TOOL,
             &TODO_WRITE_TOOL,
         ]
@@ -412,9 +442,13 @@ static BASH_TOOL: BashTool = BashTool;
 static EDIT_TOOL: EditTool = EditTool;
 static TERMINAL_RUN_TOOL: TerminalRunTool = TerminalRunTool;
 static SUBAGENT_TOOL: SubagentTool = SubagentTool;
+static TASK_LIST_TOOL: TaskListTool = TaskListTool;
+static TASK_WAIT_TOOL: TaskWaitTool = TaskWaitTool;
+static TASK_SEND_TOOL: TaskSendTool = TaskSendTool;
+static TASK_CANCEL_TOOL: TaskCancelTool = TaskCancelTool;
 static TODO_WRITE_TOOL: TodoWriteTool = TodoWriteTool;
 
-static ALL_TOOLS: [&dyn ToolBehavior; 9] = [
+static ALL_TOOLS: [&dyn ToolBehavior; 13] = [
     &READ_TOOL,
     &GLOB_TOOL,
     &GREP_TOOL,
@@ -422,6 +456,10 @@ static ALL_TOOLS: [&dyn ToolBehavior; 9] = [
     &TERMINAL_RUN_TOOL,
     &BASH_TOOL,
     &SUBAGENT_TOOL,
+    &TASK_LIST_TOOL,
+    &TASK_WAIT_TOOL,
+    &TASK_SEND_TOOL,
+    &TASK_CANCEL_TOOL,
     &EDIT_TOOL,
     &TODO_WRITE_TOOL,
 ];
@@ -515,6 +553,56 @@ fn spec(name: &str, description: &str, required: &[&str]) -> ToolSpec {
             json!({
                 "type": "string",
                 "description": "Optional working directory. Use a path relative to current_directory or an absolute path. Do not use ~."
+            }),
+        );
+    }
+    if matches!(name, "TaskList" | "TaskWait" | "TaskSend" | "TaskCancel")
+        && let Value::Object(properties) = &mut properties
+    {
+        properties.clear();
+    }
+    if matches!(name, "TaskWait" | "TaskSend" | "TaskCancel")
+        && let Value::Object(properties) = &mut properties
+    {
+        properties.insert(
+            "task_id".to_owned(),
+            json!({
+                "type": "string",
+                "description": "Delegated task ID returned by Subagent or TaskList."
+            }),
+        );
+    }
+    if name == "TaskWait"
+        && let Value::Object(properties) = &mut properties
+    {
+        properties.remove("task_id");
+        properties.insert(
+            "task_ids".to_owned(),
+            json!({
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "string" },
+                "description": "One or more delegated task IDs to wait for."
+            }),
+        );
+        properties.insert(
+            "timeout_ms".to_owned(),
+            json!({
+                "type": "integer",
+                "minimum": 1,
+                "maximum": task_control::MAX_WAIT_TIMEOUT_MS,
+                "description": "Optional wait timeout in milliseconds. Defaults to 30000."
+            }),
+        );
+    }
+    if name == "TaskSend"
+        && let Value::Object(properties) = &mut properties
+    {
+        properties.insert(
+            "message".to_owned(),
+            json!({
+                "type": "string",
+                "description": "Additional instructions for the running task."
             }),
         );
     }
@@ -715,6 +803,10 @@ mod tests {
                 "LSP",
                 "Bash",
                 "Subagent",
+                "TaskList",
+                "TaskWait",
+                "TaskSend",
+                "TaskCancel",
                 "Edit",
                 "TodoWrite"
             ]
@@ -739,10 +831,36 @@ mod tests {
                 "LSP",
                 "TerminalRun",
                 "Subagent",
+                "TaskList",
+                "TaskWait",
+                "TaskSend",
+                "TaskCancel",
                 "Edit",
                 "TodoWrite"
             ]
         );
+    }
+
+    #[test]
+    fn task_control_tools_have_narrow_schemas_and_need_no_approval() {
+        let registry = ToolRegistry::new();
+        let wait = registry
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == "TaskWait")
+            .unwrap();
+        let properties = wait.parameters["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), 2);
+        assert!(properties.contains_key("task_ids"));
+        assert!(properties.contains_key("timeout_ms"));
+
+        let call = ToolCall {
+            id: "wait".to_owned(),
+            name: "TaskWait".to_owned(),
+            arguments: json!({"task_ids": ["a1"]}),
+        };
+        assert!(!registry.requires_approval(&call, false, false));
+        assert!(registry.is_concurrency_safe(&call));
     }
 
     #[test]

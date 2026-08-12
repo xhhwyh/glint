@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::message::{Message, Role};
-use crate::tasks::{SubagentRequest, SubagentStartResponse};
+use crate::tasks::{SubagentRequest, SubagentStartResponse, TaskSnapshot, TaskWaitResponse};
 
 const TERMINAL_ROWS: u16 = 12;
 const TERMINAL_COLS: u16 = 120;
@@ -41,6 +41,23 @@ pub enum TerminalRequest {
     StartSubagent {
         request: SubagentRequest,
         response: Sender<SubagentStartResponse>,
+    },
+    ListTasks {
+        response: Sender<Vec<TaskSnapshot>>,
+    },
+    WaitTasks {
+        task_ids: Vec<String>,
+        timeout: Duration,
+        response: Sender<Result<TaskWaitResponse, String>>,
+    },
+    SendTaskMessage {
+        task_id: String,
+        message: String,
+        response: Sender<Result<TaskSnapshot, String>>,
+    },
+    CancelTask {
+        task_id: String,
+        response: Sender<Result<TaskSnapshot, String>>,
     },
     CancelActive,
 }

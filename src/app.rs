@@ -1,6 +1,6 @@
 use std::{
     path::{Path, PathBuf},
-    sync::mpsc::Receiver,
+    sync::{Arc, mpsc::Receiver},
     time::{Duration, Instant},
 };
 
@@ -12,7 +12,7 @@ use crate::{
         provider::{FinishReason, ToolCall},
         spawn_subagent_loop,
     },
-    approval::{ApprovalFocus, ApprovalPrompt},
+    approval::{AgentControl, ApprovalFocus, ApprovalPrompt},
     commands::{SlashCommand, SlashCommandKind, matching_slash_commands},
     config::Config,
     event::{
@@ -25,13 +25,13 @@ use crate::{
     progress::TodoUpdate,
     runtime::{
         AssistantRecord, ConversationUsage, LoadedTranscript, RuntimeCommand, RuntimeEvent,
-        SessionRuntime, StartPromptConfig,
+        SessionRuntime, StartPromptConfig, SubagentRuntimeEvent,
     },
     services::mcp::{
         McpApprovalPolicy, McpConfig, McpOAuthConfig, McpServerConfig, McpTransportConfig,
         persist_mcp_server,
     },
-    tasks::{self, SubagentOutcome, SubagentRequest, SubagentStartResponse, TaskSnapshot},
+    tasks::{self, SubagentRequest, SubagentStartResponse, SubagentSteering, TaskSnapshot},
     terminal::{
         TerminalMouseScroll, TerminalRequest, TerminalRunResult, TerminalStatus, TerminalTab,
     },
@@ -79,7 +79,6 @@ pub struct App {
     input_content_width: u16,
     return_bottom_button: Option<ReturnBottomButton>,
     terminal_tab_hitbox: Option<TerminalTabHitbox>,
-    pending_subagent_results: Vec<PendingSubagentRun>,
     pending_plugin_operation: Option<PendingPluginOperation>,
     turn_started_at: Option<Instant>,
     last_turn_duration: Option<Duration>,
@@ -346,13 +345,6 @@ enum MarketplaceSelection {
     Plugin(usize),
 }
 
-struct PendingSubagentRun {
-    task_id: String,
-    terminal_tab: usize,
-    events: Receiver<AgentEvent>,
-    outcome: Receiver<SubagentOutcome>,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TextPosition {
     pub row: u16,
@@ -522,7 +514,6 @@ impl App {
             input_content_width: 1,
             return_bottom_button: None,
             terminal_tab_hitbox: None,
-            pending_subagent_results: Vec::new(),
             pending_plugin_operation: None,
             turn_started_at: None,
             last_turn_duration: None,
@@ -598,7 +589,6 @@ impl App {
             input_content_width: 1,
             return_bottom_button: None,
             terminal_tab_hitbox: None,
-            pending_subagent_results: Vec::new(),
             pending_plugin_operation: None,
             turn_started_at: None,
             last_turn_duration: None,
@@ -648,6 +638,11 @@ impl App {
         self.runtime.task_snapshots()
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_start_subagent_task(&mut self, request: &SubagentRequest) {
+        self.runtime.start_subagent_task(request, 0).unwrap();
+    }
+
     pub fn pinned_progress(&self) -> Option<&TodoUpdate> {
         self.runtime.pinned_progress()
     }
@@ -683,6 +678,40 @@ impl App {
                 TerminalRequest::StartSubagent { request, response } => {
                     self.start_subagent_terminal(request, response);
                 }
+                TerminalRequest::ListTasks { response } => {
+                    response.send(self.runtime.task_snapshots()).ok();
+                }
+                TerminalRequest::WaitTasks {
+                    task_ids,
+                    timeout,
+                    response,
+                } => {
+                    self.runtime.register_task_wait(task_ids, timeout, response);
+                }
+                TerminalRequest::SendTaskMessage {
+                    task_id,
+                    message,
+                    response,
+                } => {
+                    let result = self.runtime.send_task_message(&task_id, message.clone());
+                    if let Ok(task) = &result {
+                        if let Some(tab) = task
+                            .terminal_tab
+                            .and_then(|terminal_tab| self.terminal_tabs.get_mut(terminal_tab))
+                        {
+                            tab.append_subagent_message(Message::user(message));
+                        }
+                        self.run_notice = Some(format!("Sent a message to task {}.", task.id));
+                    }
+                    response.send(result).ok();
+                }
+                TerminalRequest::CancelTask { task_id, response } => {
+                    let result = self.runtime.cancel_task(&task_id);
+                    if result.is_ok() {
+                        self.run_notice = Some(format!("Cancelling task {task_id}."));
+                    }
+                    response.send(result).ok();
+                }
                 TerminalRequest::CancelActive => {
                     for tab in &mut self.terminal_tabs {
                         tab.cancel_active();
@@ -694,7 +723,7 @@ impl App {
         for tab in &mut self.terminal_tabs {
             tab.tick();
         }
-        self.drain_subagent_results();
+        self.drain_subagent_events();
     }
 
     fn terminal_run_tab_index(&mut self) -> Option<usize> {
@@ -763,6 +792,8 @@ impl App {
 
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+        let (control_tx, control_rx) = std::sync::mpsc::channel::<AgentControl>();
+        let steering = Arc::new(SubagentSteering::default());
         let config = self.start_prompt_config();
         spawn_subagent_loop(
             AgentRunInput {
@@ -786,41 +817,31 @@ impl App {
             },
             event_tx,
             outcome_tx,
+            control_rx,
+            Arc::clone(&steering),
         );
-        self.pending_subagent_results.push(PendingSubagentRun {
-            task_id: task.id.clone(),
+        self.runtime.attach_subagent_run(
+            task.id.clone(),
             terminal_tab,
-            events: event_rx,
-            outcome: outcome_rx,
-        });
+            event_rx,
+            outcome_rx,
+            control_tx,
+            steering,
+        );
         response
             .send(SubagentStartResponse::started(task.id, terminal_tab))
             .ok();
     }
 
-    fn drain_subagent_results(&mut self) {
-        let mut index = 0;
-        while index < self.pending_subagent_results.len() {
-            let terminal_tab = self.pending_subagent_results[index].terminal_tab;
-            while let Ok(event) = self.pending_subagent_results[index].events.try_recv() {
-                self.update_subagent_tab_event(terminal_tab, event);
-            }
-
-            match self.pending_subagent_results[index].outcome.try_recv() {
-                Ok(outcome) => {
-                    let pending = self.pending_subagent_results.remove(index);
-                    self.finish_subagent_result(pending.task_id, pending.terminal_tab, outcome);
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    index += 1;
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    let pending = self.pending_subagent_results.remove(index);
-                    self.finish_subagent_result(
-                        pending.task_id,
-                        pending.terminal_tab,
-                        SubagentOutcome::failed("subagent result channel closed", ""),
-                    );
+    fn drain_subagent_events(&mut self) {
+        for event in self.runtime.poll_subagent_events() {
+            match event {
+                SubagentRuntimeEvent::Agent {
+                    terminal_tab,
+                    event,
+                } => self.update_subagent_tab_event(terminal_tab, event),
+                SubagentRuntimeEvent::Finished { terminal_tab, task } => {
+                    self.finish_subagent_result(terminal_tab, task);
                 }
             }
         }
@@ -897,15 +918,7 @@ impl App {
         }
     }
 
-    fn finish_subagent_result(
-        &mut self,
-        task_id: String,
-        terminal_tab: usize,
-        outcome: SubagentOutcome,
-    ) {
-        let Some(task) = self.runtime.finish_subagent_task(&task_id, outcome) else {
-            return;
-        };
+    fn finish_subagent_result(&mut self, terminal_tab: usize, task: TaskSnapshot) {
         if let Some(tab) = self.terminal_tabs.get_mut(terminal_tab) {
             let status = match task.status {
                 tasks::TaskStatus::Completed => TerminalStatus::Idle,
