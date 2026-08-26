@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, mpsc::Receiver},
     time::{Duration, Instant},
@@ -19,6 +19,9 @@ use crate::{
     event::{
         AppEvent, ExtensionMouseAction, KeyAction, KeyInput, McpMouseAction, MouseAction,
         PluginsMouseAction, PluginsMouseTab, ResumeMouseAction,
+    },
+    execution::{
+        ExecutionHitbox, ExecutionId, ExecutionOutputSource, replace_persisted_output_marker,
     },
     input::InputState,
     message::{Message, Role},
@@ -53,6 +56,22 @@ pub struct App {
     pub input: InputState,
     pub status: AgentStatus,
     pub scroll: u16,
+    #[allow(dead_code)] // Consumed by the Task 4 execution-card renderer and mouse routing.
+    expanded_executions: HashSet<ExecutionId>,
+    #[allow(dead_code)]
+    execution_scrolls: HashMap<ExecutionId, u16>,
+    #[allow(dead_code)]
+    execution_outputs: HashMap<ExecutionId, String>,
+    #[allow(dead_code)]
+    persisted_execution_outputs: HashMap<PathBuf, String>,
+    #[allow(dead_code)]
+    execution_hitboxes: Vec<ExecutionHitbox>,
+    #[allow(dead_code)]
+    hovered_execution: Option<ExecutionId>,
+    #[allow(dead_code)]
+    previous_hovered_execution: Option<ExecutionId>,
+    #[allow(dead_code)]
+    hover_changed_at: Option<Instant>,
     pub usage: ConversationUsage,
     pub slash_command_selection: usize,
     pub model_picker: Option<ModelPicker>,
@@ -491,6 +510,14 @@ impl App {
             input: InputState::default(),
             status: AgentStatus::Idle,
             scroll: 0,
+            expanded_executions: HashSet::new(),
+            execution_scrolls: HashMap::new(),
+            execution_outputs: HashMap::new(),
+            persisted_execution_outputs: HashMap::new(),
+            execution_hitboxes: Vec::new(),
+            hovered_execution: None,
+            previous_hovered_execution: None,
+            hover_changed_at: None,
             usage,
             slash_command_selection: 0,
             model_picker: None,
@@ -538,6 +565,14 @@ impl App {
             input: InputState::default(),
             status: AgentStatus::Idle,
             scroll: 0,
+            expanded_executions: HashSet::new(),
+            execution_scrolls: HashMap::new(),
+            execution_outputs: HashMap::new(),
+            persisted_execution_outputs: HashMap::new(),
+            execution_hitboxes: Vec::new(),
+            hovered_execution: None,
+            previous_hovered_execution: None,
+            hover_changed_at: None,
             usage: ConversationUsage::default(),
             slash_command_selection: 0,
             model_picker: None,
@@ -637,6 +672,155 @@ impl App {
 
     pub fn last_turn_duration(&self) -> Option<Duration> {
         self.last_turn_duration
+    }
+
+    #[allow(dead_code)] // Consumed by the Task 4 execution-card renderer and mouse routing.
+    pub fn toggle_execution(&mut self, id: ExecutionId, expansion_rows: u16) {
+        if self.expanded_executions.remove(&id) {
+            if self.scroll != 0 {
+                self.scroll = self.scroll.saturating_sub(expansion_rows);
+            }
+            return;
+        }
+
+        self.resolve_execution_output(&id);
+        self.expanded_executions.insert(id);
+        if self.scroll != 0 {
+            self.scroll = self.scroll.saturating_add(expansion_rows);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn is_execution_expanded(&self, id: &ExecutionId) -> bool {
+        self.expanded_executions.contains(id)
+    }
+
+    #[allow(dead_code)]
+    pub fn scroll_execution(&mut self, id: &ExecutionId, delta: i16) {
+        let Some(max_output_scroll) = self
+            .execution_hitboxes
+            .iter()
+            .filter(|hitbox| &hitbox.id == id)
+            .map(|hitbox| hitbox.max_output_scroll)
+            .max()
+        else {
+            return;
+        };
+
+        let scroll = self.execution_scrolls.entry(id.clone()).or_default();
+        *scroll = if delta.is_negative() {
+            scroll.saturating_sub(delta.unsigned_abs())
+        } else {
+            scroll.saturating_add(delta as u16).min(max_output_scroll)
+        };
+    }
+
+    #[allow(dead_code)]
+    pub fn set_execution_hitboxes(&mut self, hitboxes: Vec<ExecutionHitbox>) {
+        for hitbox in &hitboxes {
+            if let Some(scroll) = self.execution_scrolls.get_mut(&hitbox.id) {
+                *scroll = (*scroll).min(hitbox.max_output_scroll);
+            }
+        }
+        self.execution_hitboxes = hitboxes;
+    }
+
+    #[allow(dead_code)]
+    pub fn execution_output(&mut self, id: &ExecutionId) -> Option<String> {
+        match id {
+            ExecutionId::Tool(_) => self.execution_outputs.get(id).cloned(),
+            ExecutionId::Task(task_id) => self.subagent_execution_output(task_id),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn set_hovered_execution(&mut self, id: Option<ExecutionId>) {
+        if self.hovered_execution != id {
+            self.previous_hovered_execution = std::mem::replace(&mut self.hovered_execution, id);
+            self.hover_changed_at = Some(Instant::now());
+        }
+    }
+
+    #[allow(dead_code)]
+    fn resolve_execution_output(&mut self, id: &ExecutionId) {
+        if self.execution_outputs.contains_key(id) {
+            return;
+        }
+
+        let ExecutionId::Tool(tool_call_id) = id else {
+            return;
+        };
+        let Some(output) = self
+            .messages
+            .iter()
+            .rev()
+            .find(|message| {
+                message.role == Role::Tool
+                    && message.tool_name.as_deref() == Some("Bash")
+                    && message.tool_call_id.as_deref() == Some(tool_call_id)
+            })
+            .map(|message| message.content.clone())
+        else {
+            return;
+        };
+
+        let display_output = match ExecutionOutputSource::from_tool_output(&output) {
+            ExecutionOutputSource::Inline(output) => output,
+            ExecutionOutputSource::Persisted(path) => self.replace_persisted_output(&output, &path),
+        };
+        self.execution_outputs.insert(id.clone(), display_output);
+    }
+
+    #[allow(dead_code)]
+    fn subagent_execution_output(&mut self, task_id: &str) -> Option<String> {
+        let messages = self.subagent_transcripts.get(task_id)?.messages().to_vec();
+        let mut entries = Vec::new();
+
+        for message in messages {
+            let output = match message.role {
+                Role::Tool => match ExecutionOutputSource::from_tool_output(&message.content) {
+                    ExecutionOutputSource::Inline(output) => output,
+                    ExecutionOutputSource::Persisted(path) => {
+                        self.replace_persisted_output(&message.content, &path)
+                    }
+                },
+                _ => message.content,
+            };
+            if output.is_empty() {
+                continue;
+            }
+
+            let label = match message.role {
+                Role::User => "User",
+                Role::Assistant => "Assistant",
+                Role::Tool => message.tool_name.as_deref().unwrap_or("Tool"),
+                Role::Progress => "Progress",
+            };
+            entries.push(format!("{label}: {output}"));
+        }
+
+        Some(entries.join("\n\n"))
+    }
+
+    #[allow(dead_code)]
+    fn replace_persisted_output(&mut self, output: &str, path: &Path) -> String {
+        let persisted_output = self.persisted_output(path);
+        replace_persisted_output_marker(output, &persisted_output)
+    }
+
+    #[allow(dead_code)]
+    fn persisted_output(&mut self, path: &Path) -> String {
+        self.persisted_execution_outputs
+            .entry(path.to_path_buf())
+            .or_insert_with(|| {
+                std::fs::read_to_string(path).unwrap_or_else(|error| {
+                    format!(
+                        "Could not read full output from {}: {error}",
+                        path.display()
+                    )
+                })
+            })
+            .clone()
     }
 
     pub fn edit_always_allowed(&self) -> bool {
@@ -4028,6 +4212,7 @@ mod tests {
     use crate::{
         agent::should_auto_compact,
         commands::SLASH_COMMANDS,
+        execution::ExecutionRegion,
         plugins::PluginsConfig,
         tasks::{SubagentBackend, TaskStatus},
     };
@@ -4036,6 +4221,173 @@ mod tests {
 
     fn app() -> App {
         App::test_empty()
+    }
+
+    fn finished_bash_message(id: &str, output: &str) -> Message {
+        let mut message = Message::tool_with_description(id, "Bash", "", None);
+        message.content = output.to_owned();
+        message.tool_finished = true;
+        message
+    }
+
+    #[test]
+    fn expanding_persisted_output_reads_once_and_keeps_failure_local() {
+        let mut app = App::test_empty();
+        let id = ExecutionId::Tool("call-1".to_owned());
+        app.messages.push(finished_bash_message(
+            "call-1",
+            "preview\n\n<persisted-output>\nFull Bash output was 60000 characters, exceeding the 50000 character tool-result budget. The full output was written to:\n/missing/output.txt\nUse a narrower tool call if you need more focused output.\n</persisted-output>",
+        ));
+
+        app.toggle_execution(id.clone(), 6);
+
+        assert!(app.is_execution_expanded(&id));
+        assert!(
+            app.execution_output(&id)
+                .expect("expanded output")
+                .contains("Could not read full output")
+        );
+    }
+
+    #[test]
+    fn execution_expansion_anchors_document_scroll_and_clamps_output_scroll() {
+        let mut app = App::test_empty();
+        let id = ExecutionId::Tool("call-1".to_owned());
+        app.scroll = 4;
+
+        app.toggle_execution(id.clone(), 6);
+        assert_eq!(app.scroll, 10);
+
+        app.execution_scrolls.insert(id.clone(), 12);
+        app.set_execution_hitboxes(vec![ExecutionHitbox {
+            id: id.clone(),
+            region: ExecutionRegion::Output,
+            start_row: 0,
+            end_row: 6,
+            start_column: 0,
+            end_column: 80,
+            expansion_rows: 6,
+            max_output_scroll: 3,
+        }]);
+        assert_eq!(app.execution_scrolls[&id], 3);
+
+        app.scroll_execution(&id, -2);
+        assert_eq!(app.execution_scrolls[&id], 1);
+
+        app.toggle_execution(id, 6);
+        assert_eq!(app.scroll, 4);
+    }
+
+    fn finished_tool_message(id: &str, name: &str, output: &str) -> Message {
+        let mut message = Message::tool_with_description(id, name, "", None);
+        message.content = output.to_owned();
+        message.tool_finished = true;
+        message
+    }
+
+    fn task_transcript(messages: Vec<Message>) -> SubagentTranscript {
+        SubagentTranscript::from_snapshot(SubagentTranscriptSnapshot {
+            task_id: "a1".to_owned(),
+            tool_call_id: "call-subagent".to_owned(),
+            description: "inspect parser".to_owned(),
+            prompt: "check parser".to_owned(),
+            messages,
+            activity: None,
+            status: TaskStatus::Running,
+            tool_use_count: 0,
+        })
+    }
+
+    fn persisted_output_marker(path: &std::path::Path) -> String {
+        format!(
+            "preview\n\n<persisted-output>\nFull Grep output was 60000 characters, exceeding the 50000 character tool-result budget. The full output was written to:\n{}\nUse a narrower tool call if you need more focused output.\n</persisted-output>",
+            path.display()
+        )
+    }
+
+    #[test]
+    fn expanded_task_output_reflects_later_live_transcript_events() {
+        let mut app = App::test_empty();
+        let id = ExecutionId::Task("a1".to_owned());
+        app.subagent_transcripts.insert(
+            "a1".to_owned(),
+            task_transcript(vec![Message::assistant("before")]),
+        );
+
+        app.toggle_execution(id.clone(), 6);
+        assert!(
+            app.execution_output(&id)
+                .expect("initial output")
+                .contains("before")
+        );
+
+        app.subagent_transcripts
+            .get_mut("a1")
+            .expect("transcript")
+            .apply(&AgentEvent::AssistantDelta(" after".to_owned()));
+
+        assert!(
+            app.execution_output(&id)
+                .expect("live output")
+                .contains("after")
+        );
+    }
+
+    #[test]
+    fn task_output_keeps_other_entries_when_nested_persisted_read_fails() {
+        let mut app = App::test_empty();
+        let path =
+            std::env::temp_dir().join(format!("glint-task-output-{}.txt", uuid::Uuid::new_v4()));
+        fs::write(&path, "available nested output").expect("write nested output");
+        let missing = path.with_extension("missing");
+        app.subagent_transcripts.insert(
+            "a1".to_owned(),
+            task_transcript(vec![
+                finished_tool_message("tool-ok", "Grep", &persisted_output_marker(&path)),
+                finished_tool_message("tool-missing", "Grep", &persisted_output_marker(&missing)),
+                Message::assistant("tail remains visible"),
+            ]),
+        );
+        let id = ExecutionId::Task("a1".to_owned());
+
+        app.toggle_execution(id.clone(), 6);
+        let output = app.execution_output(&id).expect("task output");
+
+        assert!(output.contains("available nested output"));
+        assert!(output.contains("Could not read full output"));
+        assert!(output.contains("tail remains visible"));
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn task_persisted_output_is_cached_by_path_without_caching_live_transcript() {
+        let mut app = App::test_empty();
+        let path =
+            std::env::temp_dir().join(format!("glint-task-cache-{}.txt", uuid::Uuid::new_v4()));
+        fs::write(&path, "first file contents").expect("write first output");
+        app.subagent_transcripts.insert(
+            "a1".to_owned(),
+            task_transcript(vec![finished_tool_message(
+                "tool-1",
+                "Grep",
+                &persisted_output_marker(&path),
+            )]),
+        );
+        let id = ExecutionId::Task("a1".to_owned());
+
+        app.toggle_execution(id.clone(), 6);
+        assert!(
+            app.execution_output(&id)
+                .expect("first task output")
+                .contains("first file contents")
+        );
+
+        fs::write(&path, "changed file contents").expect("replace cached output");
+        let output = app.execution_output(&id).expect("cached task output");
+
+        assert!(output.contains("first file contents"));
+        assert!(!output.contains("changed file contents"));
+        fs::remove_file(path).ok();
     }
 
     fn subagent_request() -> SubagentRequest {

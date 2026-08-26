@@ -1414,6 +1414,35 @@ mod tests {
     }
 
     #[test]
+    fn tool_error_state_survives_function_call_output_reconstruction() {
+        let mut transcript = store();
+        transcript
+            .append_assistant(AssistantTranscript {
+                content: String::new(),
+                provider: "provider".to_owned(),
+                model: "model".to_owned(),
+                tool_calls: vec![ToolCall {
+                    id: "call-failed".to_owned(),
+                    name: "Grep".to_owned(),
+                    arguments: serde_json::json!({ "pattern": "missing" }),
+                }],
+                usage: None,
+                finish_reason: FinishReason::ToolCalls,
+                error: None,
+            })
+            .expect("append function call");
+        transcript
+            .append_tool("call-failed".to_owned(), "grep failed".to_owned(), true)
+            .expect("append failed output");
+
+        let messages = transcript.ui_messages();
+
+        assert!(messages[0].tool_finished);
+        assert!(messages[0].tool_is_error);
+        assert_eq!(messages[0].content, "grep failed");
+    }
+
+    #[test]
     fn archive_current_moves_transcript_and_artifacts() {
         let project_dir =
             std::env::temp_dir().join(format!("glint-archive-session-test-{}", new_id()));

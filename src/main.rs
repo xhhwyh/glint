@@ -5,6 +5,7 @@ mod commands;
 mod config;
 mod context;
 mod event;
+mod execution;
 mod input;
 mod message;
 mod plugins;
