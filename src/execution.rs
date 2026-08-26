@@ -1,5 +1,3 @@
-#![allow(dead_code)] // Task 4 renders and routes the execution-card presentation types.
-
 use std::{path::PathBuf, time::Duration};
 
 pub const MAX_EXPANDED_OUTPUT_ROWS: u16 = 8;

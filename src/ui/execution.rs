@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use ratatui::{
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
 };
 use unicode_width::UnicodeWidthStr;
@@ -15,7 +15,10 @@ use crate::{
 
 use super::{
     layout::{truncate_end_to_width, wrap_text},
-    theme::{BORDER_BRIGHT_COLOR, EXECUTION_OUTPUT_COLOR, MUTED_TEXT_COLOR, TEXT_COLOR},
+    theme::{
+        ACCENT_COLOR, BG_COLOR, BORDER_BRIGHT_COLOR, EXECUTION_OUTPUT_COLOR, MUTED_TEXT_COLOR,
+        TEXT_COLOR,
+    },
 };
 
 pub(super) struct ExecutionCardView<'a> {
@@ -91,11 +94,11 @@ pub(super) fn execution_card_lines(
     width: u16,
     expanded: bool,
     output_scroll: u16,
-    _hover_fraction: f32,
+    hover_fraction: f32,
 ) -> ExecutionCardLines {
     let width = width.max(1) as usize;
     let output_lines = wrap_text(&card.output, (width.saturating_sub(4)) as u16);
-    let summary = card_summary(card, width, expanded, output_lines.len());
+    let summary = card_summary(card, width, expanded, output_lines.len(), hover_fraction);
     let mut lines = vec![Line::from(""), Line::from(summary)];
     let mut regions = vec![None, Some(ExecutionRegion::Summary)];
 
@@ -152,6 +155,7 @@ fn card_summary(
     width: usize,
     expanded: bool,
     output_row_count: usize,
+    hover_fraction: f32,
 ) -> Vec<Span<'static>> {
     let details = if card.summary.trim().is_empty() {
         card.description.unwrap_or("")
@@ -172,28 +176,69 @@ fn card_summary(
     let suffix = format!(" · {status} · {output_row_count} lines · {hint}");
     let available = width.saturating_sub(prefix.width() + suffix.width());
     let details = truncate_end_to_width(details, available);
+    let background = interpolate_color(BG_COLOR, Color::Rgb(8, 47, 73), hover_fraction);
+    let marker_style = execution_style(
+        BORDER_BRIGHT_COLOR,
+        ACCENT_COLOR,
+        background,
+        hover_fraction,
+    )
+    .add_modifier(Modifier::BOLD);
+    let detail_style = execution_style(
+        TEXT_COLOR,
+        Color::Rgb(186, 230, 253),
+        background,
+        hover_fraction,
+    );
+    let muted_style = execution_style(
+        MUTED_TEXT_COLOR,
+        Color::Rgb(125, 211, 252),
+        background,
+        hover_fraction,
+    );
     let status_style = if card.is_error {
-        Style::default()
-            .fg(BORDER_BRIGHT_COLOR)
-            .add_modifier(Modifier::BOLD)
+        execution_style(
+            BORDER_BRIGHT_COLOR,
+            ACCENT_COLOR,
+            background,
+            hover_fraction,
+        )
+        .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(MUTED_TEXT_COLOR)
+        muted_style
     };
 
     vec![
-        Span::styled(
-            prefix,
-            Style::default()
-                .fg(BORDER_BRIGHT_COLOR)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(details, Style::default().fg(TEXT_COLOR)),
+        Span::styled(prefix, marker_style),
+        Span::styled(details, detail_style),
         Span::styled(format!(" · {status}"), status_style),
-        Span::styled(
-            format!(" · {output_row_count} lines · {hint}"),
-            Style::default().fg(MUTED_TEXT_COLOR),
-        ),
+        Span::styled(format!(" · {output_row_count} lines · {hint}"), muted_style),
     ]
+}
+
+fn execution_style(resting: Color, hovered: Color, background: Color, fraction: f32) -> Style {
+    Style::default()
+        .fg(interpolate_color(resting, hovered, fraction))
+        .bg(background)
+}
+
+fn interpolate_color(resting: Color, hovered: Color, fraction: f32) -> Color {
+    let fraction = fraction.clamp(0.0, 1.0);
+    let (
+        Color::Rgb(resting_red, resting_green, resting_blue),
+        Color::Rgb(hovered_red, hovered_green, hovered_blue),
+    ) = (resting, hovered)
+    else {
+        return hovered;
+    };
+    let interpolate_channel = |resting: u8, hovered: u8| {
+        (resting as f32 + (hovered as f32 - resting as f32) * fraction).round() as u8
+    };
+    Color::Rgb(
+        interpolate_channel(resting_red, hovered_red),
+        interpolate_channel(resting_green, hovered_green),
+        interpolate_channel(resting_blue, hovered_blue),
+    )
 }
 
 #[cfg(test)]
@@ -378,5 +423,20 @@ mod tests {
 
         assert_eq!(rendered.first().map(String::as_str), Some("    line 10"));
         assert_eq!(rendered.last().map(String::as_str), Some("    line 17"));
+    }
+
+    #[test]
+    fn hover_transition_brightens_the_summary_marker_without_changing_text_width() {
+        let card = bash_card_with_output("output".to_owned());
+        let resting = execution_card_lines(&card, 80, false, 0, 0.0);
+        let hovered = execution_card_lines(&card, 80, false, 0, 1.0);
+
+        let resting_marker = &resting.lines[1].spans[0];
+        let hovered_marker = &hovered.lines[1].spans[0];
+        assert_eq!(
+            resting_marker.content.width(),
+            hovered_marker.content.width()
+        );
+        assert_ne!(resting_marker.style, hovered_marker.style);
     }
 }

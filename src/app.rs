@@ -22,7 +22,8 @@ use crate::{
         PluginsMouseAction, PluginsMouseTab, ResumeMouseAction,
     },
     execution::{
-        ExecutionHitbox, ExecutionId, ExecutionOutputSource, replace_persisted_output_marker,
+        ExecutionHitbox, ExecutionId, ExecutionOutputSource, ExecutionRegion, HOVER_TRANSITION,
+        replace_persisted_output_marker,
     },
     input::InputState,
     message::{Message, Role},
@@ -671,7 +672,6 @@ impl App {
         self.last_turn_duration
     }
 
-    #[allow(dead_code)] // Consumed by the Task 4 execution-card renderer and mouse routing.
     pub fn toggle_execution(&mut self, id: ExecutionId, expansion_rows: u16) {
         if self.expanded_executions.remove(&id) {
             if self.scroll != 0 {
@@ -687,7 +687,6 @@ impl App {
         }
     }
 
-    #[allow(dead_code)]
     pub fn is_execution_expanded(&self, id: &ExecutionId) -> bool {
         self.expanded_executions.contains(id)
     }
@@ -721,7 +720,6 @@ impl App {
         }
     }
 
-    #[allow(dead_code)]
     pub fn scroll_execution(&mut self, id: &ExecutionId, delta: i16) {
         let Some(max_output_scroll) = self
             .execution_hitboxes
@@ -741,10 +739,9 @@ impl App {
         };
     }
 
-    #[allow(dead_code)]
     pub fn set_execution_hitboxes(&mut self, hitboxes: Vec<ExecutionHitbox>) {
         for hitbox in &hitboxes {
-            if hitbox.region == crate::execution::ExecutionRegion::Output
+            if hitbox.region == ExecutionRegion::Output
                 && let Some(scroll) = self.execution_scrolls.get_mut(&hitbox.id)
             {
                 *scroll = (*scroll).min(hitbox.max_output_scroll);
@@ -766,11 +763,29 @@ impl App {
         }
     }
 
-    #[allow(dead_code)]
     pub fn set_hovered_execution(&mut self, id: Option<ExecutionId>) {
         if self.hovered_execution != id {
             self.previous_hovered_execution = std::mem::replace(&mut self.hovered_execution, id);
             self.hover_changed_at = Some(Instant::now());
+        }
+    }
+
+    pub fn execution_hover_progress(&self, id: &ExecutionId) -> f32 {
+        self.execution_hover_progress_at(id, Instant::now())
+    }
+
+    pub fn execution_hover_progress_at(&self, id: &ExecutionId, now: Instant) -> f32 {
+        let elapsed = self
+            .hover_changed_at
+            .map(|started| now.saturating_duration_since(started))
+            .unwrap_or(HOVER_TRANSITION);
+        let progress = (elapsed.as_secs_f32() / HOVER_TRANSITION.as_secs_f32()).clamp(0.0, 1.0);
+        if self.hovered_execution.as_ref() == Some(id) {
+            progress
+        } else if self.previous_hovered_execution.as_ref() == Some(id) {
+            1.0 - progress
+        } else {
+            0.0
         }
     }
 
@@ -3106,6 +3121,27 @@ impl App {
 
     fn update_mouse(&mut self, mouse: MouseAction) {
         match mouse {
+            MouseAction::Move { column, row } => {
+                self.set_hovered_execution(
+                    self.execution_hitbox_at(column, row, ExecutionRegion::Summary)
+                        .map(|hitbox| hitbox.id.clone()),
+                );
+            }
+            MouseAction::LeftDown { column, row }
+                if self
+                    .execution_hitbox_at(column, row, ExecutionRegion::Summary)
+                    .is_some() =>
+            {
+                let hitbox = self
+                    .execution_hitbox_at(column, row, ExecutionRegion::Summary)
+                    .expect("summary hitbox was checked");
+                let id = hitbox.id.clone();
+                let expansion_rows = hitbox.expansion_rows;
+                self.text_selection = None;
+                self.input_selection = None;
+                self.terminal_focused = false;
+                self.toggle_execution(id, expansion_rows);
+            }
             MouseAction::LeftDown { column, row } if self.mouse_over_return_bottom(column, row) => {
                 self.scroll = 0;
                 self.text_selection = None;
@@ -3184,6 +3220,30 @@ impl App {
             {
                 self.move_terminal_tab_switcher(1);
             }
+            MouseAction::ScrollUp { column, row }
+                if self
+                    .execution_hitbox_at(column, row, ExecutionRegion::Output)
+                    .is_some() =>
+            {
+                let id = self
+                    .execution_hitbox_at(column, row, ExecutionRegion::Output)
+                    .expect("output hitbox was checked")
+                    .id
+                    .clone();
+                self.scroll_execution(&id, 3);
+            }
+            MouseAction::ScrollDown { column, row }
+                if self
+                    .execution_hitbox_at(column, row, ExecutionRegion::Output)
+                    .is_some() =>
+            {
+                let id = self
+                    .execution_hitbox_at(column, row, ExecutionRegion::Output)
+                    .expect("output hitbox was checked")
+                    .id
+                    .clone();
+                self.scroll_execution(&id, -3);
+            }
             MouseAction::ScrollUp { column, row } if self.mouse_over_terminal(row) => {
                 if self.write_terminal_mouse_scroll(column, row, TerminalMouseScroll::Up) {
                     return;
@@ -3204,6 +3264,21 @@ impl App {
             MouseAction::ScrollDown { .. } => self.scroll = self.scroll.saturating_sub(3),
             MouseAction::None => {}
         }
+    }
+
+    fn execution_hitbox_at(
+        &self,
+        column: u16,
+        row: u16,
+        region: ExecutionRegion,
+    ) -> Option<&ExecutionHitbox> {
+        self.execution_hitboxes.iter().find(|hitbox| {
+            hitbox.region == region
+                && row >= hitbox.start_row
+                && row < hitbox.end_row
+                && column >= hitbox.start_column
+                && column < hitbox.end_column
+        })
     }
 
     fn document_position(&self, column: u16, row: u16) -> Option<TextPosition> {
@@ -4290,7 +4365,7 @@ fn home_relative_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, time::Duration};
 
     use crate::{
         agent::should_auto_compact,
@@ -4311,6 +4386,98 @@ mod tests {
         message.content = output.to_owned();
         message.tool_finished = true;
         message
+    }
+
+    fn app_with_execution_hitboxes() -> (App, ExecutionId) {
+        let mut app = App::test_empty();
+        let id = ExecutionId::Tool("call-1".to_owned());
+        app.set_document_viewport(20, 0);
+        app.set_execution_hitboxes(vec![
+            ExecutionHitbox {
+                id: id.clone(),
+                region: ExecutionRegion::Summary,
+                start_row: 4,
+                end_row: 5,
+                start_column: 0,
+                end_column: 80,
+                expansion_rows: 3,
+                max_output_scroll: 0,
+            },
+            ExecutionHitbox {
+                id: id.clone(),
+                region: ExecutionRegion::Output,
+                start_row: 7,
+                end_row: 10,
+                start_column: 0,
+                end_column: 80,
+                expansion_rows: 3,
+                max_output_scroll: 12,
+            },
+        ]);
+        (app, id)
+    }
+
+    #[test]
+    fn summary_click_toggles_but_output_click_starts_selection() {
+        let (mut app, id) = app_with_execution_hitboxes();
+
+        app.update(AppEvent::Mouse(MouseAction::LeftDown { column: 5, row: 4 }));
+        assert!(app.is_execution_expanded(&id));
+        assert!(app.text_selection.is_none());
+
+        app.update(AppEvent::Mouse(MouseAction::LeftDown { column: 5, row: 7 }));
+        assert_eq!(
+            app.text_selection,
+            Some(TextSelection {
+                anchor: TextPosition { row: 7, column: 5 },
+                focus: TextPosition { row: 7, column: 5 },
+                dragging: true,
+            })
+        );
+        assert!(app.is_execution_expanded(&id));
+    }
+
+    #[test]
+    fn wheel_over_output_scrolls_only_the_card() {
+        let (mut app, id) = app_with_execution_hitboxes();
+        app.toggle_execution(id.clone(), 3);
+        app.scroll = 5;
+
+        app.update(AppEvent::Mouse(MouseAction::ScrollUp { column: 8, row: 7 }));
+
+        assert_eq!(app.execution_scroll(&id), 3);
+        assert_eq!(app.scroll, 5);
+    }
+
+    #[test]
+    fn hover_progress_interpolates_and_fades_out_after_leaving_cards() {
+        let (mut app, id) = app_with_execution_hitboxes();
+        let started = Instant::now();
+
+        app.set_hovered_execution(Some(id.clone()));
+        app.hover_changed_at = Some(started);
+        assert_eq!(app.execution_hover_progress_at(&id, started), 0.0);
+        assert_eq!(
+            app.execution_hover_progress_at(&id, started + Duration::from_millis(80)),
+            0.5
+        );
+        assert_eq!(
+            app.execution_hover_progress_at(&id, started + Duration::from_millis(160)),
+            1.0
+        );
+
+        let left = started + Duration::from_millis(200);
+        app.set_hovered_execution(None);
+        app.hover_changed_at = Some(left);
+        assert_eq!(app.execution_hover_progress_at(&id, left), 1.0);
+        assert_eq!(
+            app.execution_hover_progress_at(&id, left + Duration::from_millis(80)),
+            0.5
+        );
+        assert_eq!(
+            app.execution_hover_progress_at(&id, left + Duration::from_millis(160)),
+            0.0
+        );
     }
 
     #[test]

@@ -354,8 +354,14 @@ fn document(app: &App, width: u16) -> Document {
             let id = card.id.clone();
             let expanded = app.is_execution_expanded(&id);
             let output_scroll = app.execution_scroll(&id);
-            let card_lines =
-                execution::execution_card_lines(&card, width, expanded, output_scroll, 0.0);
+            let hover_progress = app.execution_hover_progress(&id);
+            let card_lines = execution::execution_card_lines(
+                &card,
+                width,
+                expanded,
+                output_scroll,
+                hover_progress,
+            );
             let expansion_metrics = if expanded {
                 (card_lines.output_rows, card_lines.max_output_scroll)
             } else if app.execution_has_unloaded_persisted_output(&id) {

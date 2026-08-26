@@ -50,6 +50,7 @@ pub enum PluginsMouseTab {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MouseAction {
+    Move { column: u16, row: u16 },
     LeftDown { column: u16, row: u16 },
     LeftDrag { column: u16, row: u16 },
     LeftUp { column: u16, row: u16 },
@@ -198,6 +199,10 @@ fn control_char(char: char) -> Option<Vec<u8>> {
 impl From<MouseEvent> for MouseAction {
     fn from(event: MouseEvent) -> Self {
         match event.kind {
+            MouseEventKind::Moved => Self::Move {
+                column: event.column,
+                row: event.row,
+            },
             MouseEventKind::Down(MouseButton::Left) => Self::LeftDown {
                 column: event.column,
                 row: event.row,
@@ -328,5 +333,17 @@ mod tests {
         });
 
         assert_eq!(action, MouseAction::ScrollUp { column: 8, row: 3 });
+    }
+
+    #[test]
+    fn mouse_move_keeps_pointer_coordinates() {
+        let action = MouseAction::from(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 17,
+            row: 9,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert_eq!(action, MouseAction::Move { column: 17, row: 9 });
     }
 }
