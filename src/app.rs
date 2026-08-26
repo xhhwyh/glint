@@ -725,6 +725,8 @@ impl App {
         self.execution_expansion_rows
             .retain(|id, _| self.expanded_executions.contains(id));
 
+        let anchored = self.scroll != 0;
+        let mut expansion_delta = 0_i64;
         for (id, metrics) in metrics {
             if let Some(scroll) = self.execution_scrolls.get_mut(&id) {
                 *scroll = (*scroll).min(metrics.max_output_scroll);
@@ -736,18 +738,16 @@ impl App {
                 .execution_expansion_rows
                 .entry(id)
                 .or_insert(metrics.expansion_rows);
-            if self.scroll != 0 {
-                if metrics.expansion_rows >= *stored_rows {
-                    self.scroll = self
-                        .scroll
-                        .saturating_add(metrics.expansion_rows - *stored_rows);
-                } else {
-                    self.scroll = self
-                        .scroll
-                        .saturating_sub(*stored_rows - metrics.expansion_rows);
-                }
-            }
+            expansion_delta += i64::from(metrics.expansion_rows) - i64::from(*stored_rows);
             *stored_rows = metrics.expansion_rows;
+        }
+        if anchored {
+            let delta = expansion_delta.unsigned_abs().min(u64::from(u16::MAX)) as u16;
+            if expansion_delta >= 0 {
+                self.scroll = self.scroll.saturating_add(delta);
+            } else {
+                self.scroll = self.scroll.saturating_sub(delta);
+            }
         }
     }
 
@@ -4318,6 +4318,56 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_execution_metrics_applies_net_delta_independent_of_hashmap_order() {
+        fn metrics_with_iteration_order(
+            shrink_first: bool,
+            grow_rows: u16,
+        ) -> (
+            ExecutionId,
+            ExecutionId,
+            HashMap<ExecutionId, ExecutionExpansionMetrics>,
+        ) {
+            for attempt in 0..512 {
+                let shrink = ExecutionId::Tool(format!("call-shrink-{grow_rows}-{attempt}"));
+                let grow = ExecutionId::Tool(format!("call-grow-{grow_rows}-{attempt}"));
+                for insert_shrink_first in [false, true] {
+                    let mut metrics = HashMap::new();
+                    if insert_shrink_first {
+                        metrics.insert(shrink.clone(), expansion_metrics(1, 0));
+                        metrics.insert(grow.clone(), expansion_metrics(grow_rows, 0));
+                    } else {
+                        metrics.insert(grow.clone(), expansion_metrics(grow_rows, 0));
+                        metrics.insert(shrink.clone(), expansion_metrics(1, 0));
+                    }
+                    let actual_shrink_first = metrics.keys().next() == Some(&shrink);
+                    if actual_shrink_first == shrink_first {
+                        return (shrink, grow, metrics);
+                    }
+                }
+            }
+            panic!("could not build requested HashMap iteration order");
+        }
+
+        for (grow_rows, expected_scroll) in [(10, 4), (12, 6)] {
+            for shrink_first in [true, false] {
+                let (shrink, grow, metrics) = metrics_with_iteration_order(shrink_first, grow_rows);
+                let mut app = App::test_empty();
+                app.expanded_executions.insert(shrink.clone());
+                app.expanded_executions.insert(grow.clone());
+                app.execution_expansion_rows.insert(shrink.clone(), 10);
+                app.execution_expansion_rows.insert(grow.clone(), 1);
+                app.scroll = 4;
+
+                app.reconcile_execution_expansion_metrics(metrics);
+
+                assert_eq!(app.scroll, expected_scroll);
+                assert_eq!(app.execution_expansion_rows[&shrink], 1);
+                assert_eq!(app.execution_expansion_rows[&grow], grow_rows);
+            }
+        }
+    }
+
+    #[test]
     fn reconcile_execution_metrics_updates_offscreen_expanded_cards_without_visible_hitboxes() {
         let mut app = App::test_empty();
         let id = ExecutionId::Tool("call-offscreen".to_owned());
@@ -4436,6 +4486,7 @@ mod tests {
         tool_result_artifact_path(&app.runtime.tool_results_dir(), call_id, tool_name)
     }
 
+    #[cfg(unix)]
     #[test]
     fn execution_reads_a_marker_written_to_its_expected_artifact_path() {
         let mut app = App::test_empty();
@@ -4460,6 +4511,33 @@ mod tests {
                 .expect("trusted output")
                 .contains(&content)
         );
+        fs::remove_file(expected_artifact(&app, call_id, "Bash")).ok();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn expected_artifact_marker_on_non_unix_returns_safe_reader_error_without_leaking_full_content()
+    {
+        let mut app = App::test_empty();
+        let call_id = "call-non-unix";
+        let content = "non unix trusted result\n".repeat(4_000);
+        let result = ToolResultBudget::new(app.runtime.tool_results_dir()).apply(
+            "Bash",
+            ToolResult {
+                call_id: call_id.to_owned(),
+                content: content.clone(),
+                is_error: false,
+            },
+        );
+        let id = ExecutionId::Tool(call_id.to_owned());
+        app.messages
+            .push(finished_bash_message(call_id, &result.content));
+
+        app.toggle_execution(id.clone(), 8);
+
+        let output = app.execution_output(&id).expect("safe output");
+        assert!(output.contains("safe artifact reading is unavailable on this platform"));
+        assert!(!output.contains(&content));
         fs::remove_file(expected_artifact(&app, call_id, "Bash")).ok();
     }
 
