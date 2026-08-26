@@ -64,6 +64,32 @@ fn main() -> Result<()> {
     result
 }
 
+fn draw_synchronized<W, F, E>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
+    render: F,
+) -> io::Result<()>
+where
+    W: Write,
+    F: FnOnce(&mut ratatui::Frame) -> Result<(), E>,
+    E: Into<io::Error>,
+{
+    use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+    use crossterm::{ExecutableCommand, QueueableCommand};
+
+    terminal.backend_mut().queue(BeginSynchronizedUpdate)?;
+    let draw_result = terminal.try_draw(render).map(|_| ());
+    let end_result = terminal
+        .backend_mut()
+        .execute(EndSynchronizedUpdate)
+        .map(|_| ());
+
+    match (draw_result, end_result) {
+        (Err(draw_error), _) => Err(draw_error),
+        (Ok(_), Err(end_error)) => Err(end_error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) -> Result<()> {
     let mut app = App::new(config)?;
 
@@ -109,7 +135,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
             size.width,
             size.height,
         ));
-        terminal.draw(|frame| ui::render(frame, &app))?;
+        draw_synchronized(terminal, |frame| {
+            ui::render(frame, &app);
+            io::Result::Ok(())
+        })?;
 
         if term_event::poll(Duration::from_millis(40))? {
             match term_event::read()? {
@@ -209,6 +238,27 @@ fn base64_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Default)]
+    struct RecordingWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl RecordingWriter {
+        fn output(&self) -> String {
+            let bytes = self.0.lock().unwrap().clone();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn base64_encodes_clipboard_payloads() {
         assert_eq!(base64_encode(b""), "");
@@ -219,5 +269,47 @@ mod tests {
     #[test]
     fn osc52_sequence_wraps_base64_payload() {
         assert_eq!(osc52_sequence("hi"), "\x1b]52;c;aGk=\x07");
+    }
+
+    #[test]
+    fn synchronized_draw_emits_begin_and_end_markers() {
+        let writer = RecordingWriter::default();
+        let backend = CrosstermBackend::new(writer.clone());
+        let mut terminal = Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 20, 4)),
+            },
+        )
+        .unwrap();
+
+        draw_synchronized(&mut terminal, |_frame| io::Result::Ok(())).unwrap();
+
+        let output = writer.output();
+        assert!(output.contains("\x1b[?2026h"));
+        assert!(output.contains("\x1b[?2026l"));
+    }
+
+    #[test]
+    fn synchronized_draw_emits_end_marker_when_render_fails() {
+        let writer = RecordingWriter::default();
+        let backend = CrosstermBackend::new(writer.clone());
+        let mut terminal = Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 20, 4)),
+            },
+        )
+        .unwrap();
+
+        let error = draw_synchronized(&mut terminal, |_frame| {
+            io::Result::<()>::Err(io::Error::other("render failed"))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "render failed");
+        let output = writer.output();
+        assert!(output.contains("\x1b[?2026h"));
+        assert!(output.contains("\x1b[?2026l"));
     }
 }
