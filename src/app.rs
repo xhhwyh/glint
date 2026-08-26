@@ -3732,10 +3732,12 @@ mod tests {
     use std::{fs, time::Duration};
 
     use crate::{
+        agent::provider::{FinishReason, ToolCall},
         agent::should_auto_compact,
         commands::SLASH_COMMANDS,
         execution::ExecutionRegion,
         plugins::PluginsConfig,
+        runtime::AssistantRecord,
         tasks::{SubagentBackend, TaskStatus},
     };
 
@@ -4489,6 +4491,147 @@ mod tests {
             TaskStatus::Completed
         );
         assert_eq!(app.runtime.ui_subagent_transcripts().len(), 1);
+    }
+
+    #[test]
+    fn resumed_subagent_card_preserves_hidden_outcome_and_resumed_bash_is_expandable() {
+        let mut app = app();
+        let path = std::env::temp_dir().join(format!(
+            "glint-resumed-subagent-card-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        app.runtime = SessionRuntime::test_empty(path.clone(), "/workspace".to_owned());
+        let request = subagent_request();
+        app.runtime.record_assistant(AssistantRecord {
+            content: "Delegating parser inspection.".to_owned(),
+            provider: "test".to_owned(),
+            model: "test-model".to_owned(),
+            tool_calls: vec![ToolCall {
+                id: request.tool_call_id.clone(),
+                name: "Subagent".to_owned(),
+                arguments: serde_json::json!({"description": "inspect parser"}),
+            }],
+            usage: None,
+            finish_reason: FinishReason::ToolCalls,
+            error: None,
+        });
+        app.runtime.record_tool(
+            request.tool_call_id.clone(),
+            "Subagent started.".to_owned(),
+            false,
+        );
+        app.runtime.record_assistant(AssistantRecord {
+            content: String::new(),
+            provider: "test".to_owned(),
+            model: "test-model".to_owned(),
+            tool_calls: vec![ToolCall {
+                id: "call-git-remote".to_owned(),
+                name: "Bash".to_owned(),
+                arguments: serde_json::json!({"command": "git remote -v"}),
+            }],
+            usage: None,
+            finish_reason: FinishReason::ToolCalls,
+            error: None,
+        });
+        app.runtime.record_tool(
+            "call-git-remote".to_owned(),
+            "origin\thttps://github.com/xhhwyh/glint.git (fetch)\norigin\thttps://github.com/xhhwyh/glint.git (push)".to_owned(),
+            false,
+        );
+        app.test_start_subagent_task(&request);
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+        let (control_tx, _control_rx) = std::sync::mpsc::channel();
+        app.runtime.attach_subagent_run(
+            request.task_id.clone(),
+            event_rx,
+            outcome_rx,
+            control_tx,
+            Arc::new(SubagentSteering::default()),
+        );
+        event_tx.send(AgentEvent::Started).unwrap();
+        event_tx
+            .send(AgentEvent::AssistantDelta(
+                "Parser is inspected.".to_owned(),
+            ))
+            .unwrap();
+        event_tx
+            .send(AgentEvent::ToolStarted {
+                id: "nested-grep".to_owned(),
+                name: "Grep".to_owned(),
+                input_summary: "parser".to_owned(),
+                input_description: None,
+            })
+            .unwrap();
+        event_tx
+            .send(AgentEvent::ToolFinished {
+                id: "nested-grep".to_owned(),
+                name: "Grep".to_owned(),
+                output: "src/parser.rs".to_owned(),
+                is_error: false,
+                output_summary: "found parser".to_owned(),
+            })
+            .unwrap();
+        outcome_tx
+            .send(tasks::SubagentOutcome::completed(
+                "parser inspection complete",
+            ))
+            .unwrap();
+        app.drain_subagent_events();
+
+        let history = app.runtime.model_history();
+        let subagent_outcomes = history
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .filter(|content| content.contains("<subagent-outcome>"))
+            .collect::<Vec<_>>();
+        assert_eq!(subagent_outcomes.len(), 1);
+        assert!(subagent_outcomes[0].contains("parser inspection complete"));
+        assert!(
+            history
+                .iter()
+                .filter_map(|message| message.content.as_deref())
+                .all(|content| !content.contains("SubagentPresentation")),
+            "presentation snapshots must not enter model history"
+        );
+
+        app.resume_picker = Some(ResumePicker {
+            sessions: vec![TranscriptSessionSummary {
+                path: path.clone(),
+                session_id: "session-1".to_owned(),
+                title: "Resume inline execution".to_owned(),
+                last_timestamp: 1,
+            }],
+            selected: 0,
+        });
+        app.confirm_resume_picker();
+
+        let subagent_id = ExecutionId::Task(request.task_id.clone());
+        let bash_id = ExecutionId::Tool("call-git-remote".to_owned());
+        assert_eq!(
+            app.subagent_transcripts[&request.task_id].tool_call_id(),
+            request.tool_call_id
+        );
+        assert!(app.messages.iter().any(|message| {
+            message.tool_name.as_deref() == Some("Subagent")
+                && message.tool_call_id.as_deref() == Some("call-subagent")
+        }));
+        assert!(!app.is_execution_expanded(&subagent_id));
+        assert!(!app.is_execution_expanded(&bash_id));
+
+        app.toggle_execution(bash_id.clone(), 8);
+        assert!(
+            app.execution_output(&bash_id)
+                .expect("resumed Bash output")
+                .contains("(fetch)")
+        );
+        app.toggle_execution(subagent_id.clone(), 8);
+        assert!(
+            app.execution_output(&subagent_id)
+                .expect("resumed subagent output")
+                .contains("src/parser.rs")
+        );
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

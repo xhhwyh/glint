@@ -785,7 +785,11 @@ mod tests {
         subagent_transcript::{SubagentTranscript, SubagentTranscriptSnapshot},
         tasks::{SubagentBackend, SubagentRequest, TaskStatus},
     };
-    use ratatui::style::{Color, Modifier};
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+        style::{Color, Modifier},
+    };
 
     fn finished_bash_message(id: &str, input: &str, output: &str) -> Message {
         let mut message = Message::tool_with_description(id, "Bash", input, None);
@@ -798,6 +802,82 @@ mod tests {
         format!(
             "preview\n\n<persisted-output>\nFull Bash output was 60000 characters, exceeding the 50000 character tool-result budget. The full output was written to:\n{path}\nUse a narrower tool call if you need more focused output.\n</persisted-output>"
         )
+    }
+
+    fn buffer_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content()
+            .chunks(buffer.area.width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect()
+    }
+
+    fn render_execution_frame(terminal: &mut Terminal<TestBackend>, app: &App) -> Vec<String> {
+        terminal
+            .draw(|frame| render(frame, app))
+            .expect("render execution fixture");
+        buffer_rows(terminal)
+    }
+
+    #[test]
+    fn git_remote_output_survives_main_and_internal_scroll_without_stale_collapsed_rows() {
+        let mut app = App::test_empty();
+        let id = ExecutionId::Tool("call-git-remote".to_owned());
+        app.messages.push(Message::assistant(
+            (1..=34)
+                .map(|line| format!("context line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        app.messages.push(finished_bash_message(
+            "call-git-remote",
+            "git remote -v && git log -1 --format='%h %ci %s'",
+            "origin\thttps://github.com/xhhwyh/glint.git (fetch)\norigin\thttps://github.com/xhhwyh/glint.git (push)\n186bba1 2026-08-12 11:44:19 +0800 merge: integrate subagent task control",
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(100, 28)).expect("test terminal");
+
+        app.toggle_execution(id.clone(), 8);
+        for scroll in [0, 1, 0] {
+            app.scroll = scroll;
+            let rows = render_execution_frame(&mut terminal, &app);
+            assert_eq!(
+                rows.iter().filter(|row| row.contains("(fetch)")).count(),
+                1,
+                "fetch row at document scroll {scroll}"
+            );
+            assert_eq!(
+                rows.iter().filter(|row| row.contains("(push)")).count(),
+                1,
+                "push row at document scroll {scroll}"
+            );
+        }
+
+        let mut narrow_terminal = Terminal::new(TestBackend::new(15, 28)).expect("test terminal");
+        let narrow_before = render_execution_frame(&mut narrow_terminal, &app);
+        let hitboxes = execution_hitboxes(&app, 15, 28);
+        assert!(
+            hitboxes
+                .iter()
+                .any(|hitbox| hitbox.id == id && hitbox.max_output_scroll > 0),
+            "narrow TestBackend fixture must expose internal output scrolling"
+        );
+        app.set_execution_hitboxes(hitboxes);
+        app.scroll_execution(&id, 1);
+        let narrow_scrolled = render_execution_frame(&mut narrow_terminal, &app);
+        assert_ne!(
+            narrow_scrolled, narrow_before,
+            "internal output scrolling must redraw the narrow buffer"
+        );
+
+        app.toggle_execution(id, 8);
+        let collapsed_rows = render_execution_frame(&mut terminal, &app);
+        assert!(
+            collapsed_rows
+                .iter()
+                .all(|row| !row.contains("(fetch)") && !row.contains("(push)")),
+            "collapsed render must clear rows emitted by the expanded frame"
+        );
     }
 
     #[test]
