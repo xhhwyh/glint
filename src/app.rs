@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
+    ffi::OsString,
     path::{Path, PathBuf},
     sync::{Arc, mpsc::Receiver},
     time::{Duration, Instant},
@@ -93,6 +94,18 @@ pub struct App {
     turn_started_at: Option<Instant>,
     last_turn_duration: Option<Duration>,
     runtime: SessionRuntime,
+}
+
+struct TrustedPersistedOutput {
+    path: PathBuf,
+    root: PathBuf,
+    filename: OsString,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExecutionExpansionMetrics {
+    pub expansion_rows: u16,
+    pub max_output_scroll: u16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -705,32 +718,40 @@ impl App {
         };
     }
 
-    pub fn set_execution_hitboxes(&mut self, hitboxes: Vec<ExecutionHitbox>) {
-        for hitbox in &hitboxes {
-            if hitbox.region == ExecutionRegion::Output {
-                if let Some(scroll) = self.execution_scrolls.get_mut(&hitbox.id) {
-                    *scroll = (*scroll).min(hitbox.max_output_scroll);
-                }
-                if self.expanded_executions.contains(&hitbox.id) {
-                    let stored_rows = self
-                        .execution_expansion_rows
-                        .entry(hitbox.id.clone())
-                        .or_insert(hitbox.expansion_rows);
-                    if self.scroll != 0 {
-                        if hitbox.expansion_rows >= *stored_rows {
-                            self.scroll = self
-                                .scroll
-                                .saturating_add(hitbox.expansion_rows - *stored_rows);
-                        } else {
-                            self.scroll = self
-                                .scroll
-                                .saturating_sub(*stored_rows - hitbox.expansion_rows);
-                        }
-                    }
-                    *stored_rows = hitbox.expansion_rows;
+    pub fn reconcile_execution_expansion_metrics(
+        &mut self,
+        metrics: HashMap<ExecutionId, ExecutionExpansionMetrics>,
+    ) {
+        self.execution_expansion_rows
+            .retain(|id, _| self.expanded_executions.contains(id));
+
+        for (id, metrics) in metrics {
+            if let Some(scroll) = self.execution_scrolls.get_mut(&id) {
+                *scroll = (*scroll).min(metrics.max_output_scroll);
+            }
+            if !self.expanded_executions.contains(&id) {
+                continue;
+            }
+            let stored_rows = self
+                .execution_expansion_rows
+                .entry(id)
+                .or_insert(metrics.expansion_rows);
+            if self.scroll != 0 {
+                if metrics.expansion_rows >= *stored_rows {
+                    self.scroll = self
+                        .scroll
+                        .saturating_add(metrics.expansion_rows - *stored_rows);
+                } else {
+                    self.scroll = self
+                        .scroll
+                        .saturating_sub(*stored_rows - metrics.expansion_rows);
                 }
             }
+            *stored_rows = metrics.expansion_rows;
         }
+    }
+
+    pub fn set_execution_hitboxes(&mut self, hitboxes: Vec<ExecutionHitbox>) {
         self.execution_hitboxes = hitboxes;
         self.cleanup_execution_hover_transitions_at(Instant::now());
     }
@@ -840,9 +861,9 @@ impl App {
         let output = message.content.as_str();
         match self.trusted_persisted_output_path(message) {
             None => Cow::Borrowed(output),
-            Some(Ok(path)) => self
+            Some(Ok(artifact)) => self
                 .persisted_execution_outputs
-                .get(&path)
+                .get(&artifact.path)
                 .map(|persisted| Cow::Owned(replace_persisted_output_marker(output, persisted)))
                 .unwrap_or(Cow::Borrowed(output)),
             Some(Err(reason)) => Cow::Owned(replace_persisted_output_marker(output, &reason)),
@@ -851,7 +872,9 @@ impl App {
 
     fn has_unloaded_persisted_output(&self, message: &Message) -> bool {
         match self.trusted_persisted_output_path(message) {
-            Some(Ok(path)) => !self.persisted_execution_outputs.contains_key(&path),
+            Some(Ok(artifact)) => !self
+                .persisted_execution_outputs
+                .contains_key(&artifact.path),
             Some(Err(_)) => true,
             None => false,
         }
@@ -891,13 +914,16 @@ impl App {
         };
 
         for message in outputs {
-            if let Some(Ok(path)) = self.trusted_persisted_output_path(&message) {
-                self.persisted_output(&path);
+            if let Some(Ok(artifact)) = self.trusted_persisted_output_path(&message) {
+                self.persisted_output(&artifact);
             }
         }
     }
 
-    fn trusted_persisted_output_path(&self, message: &Message) -> Option<Result<PathBuf, String>> {
+    fn trusted_persisted_output_path(
+        &self,
+        message: &Message,
+    ) -> Option<Result<TrustedPersistedOutput, String>> {
         let ExecutionOutputSource::Persisted(marker_path) =
             ExecutionOutputSource::from_tool_output(&message.content)
         else {
@@ -911,10 +937,20 @@ impl App {
                 "Persisted output marker rejected: missing tool identity.".to_owned(),
             ));
         };
-        let expected =
-            tool_result_artifact_path(&self.runtime.tool_results_dir(), call_id, tool_name);
+        let root = self.runtime.tool_results_dir();
+        let expected = tool_result_artifact_path(&root, call_id, tool_name);
         if marker_path == expected {
-            Some(Ok(expected))
+            let Some(filename) = expected.file_name().map(|filename| filename.to_os_string())
+            else {
+                return Some(Err(
+                    "Persisted output marker rejected: missing artifact file name.".to_owned(),
+                ));
+            };
+            Some(Ok(TrustedPersistedOutput {
+                path: expected,
+                root,
+                filename,
+            }))
         } else {
             Some(Err(
                 "Persisted output marker rejected: path does not match the trusted artifact."
@@ -923,13 +959,13 @@ impl App {
         }
     }
 
-    fn persisted_output(&mut self, path: &Path) -> String {
+    fn persisted_output(&mut self, artifact: &TrustedPersistedOutput) -> String {
         self.persisted_execution_outputs
-            .entry(path.to_path_buf())
+            .entry(artifact.path.clone())
             .or_insert_with(|| {
-                read_trusted_persisted_output(path).unwrap_or_else(|error| {
-                    format!("Could not read trusted persisted output: {error}")
-                })
+                read_trusted_persisted_output(&artifact.root, &artifact.filename).unwrap_or_else(
+                    |error| format!("Could not read trusted persisted output: {error}"),
+                )
             })
             .clone()
     }
@@ -3773,10 +3809,13 @@ fn home_relative_path(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-fn read_trusted_persisted_output(path: &Path) -> std::io::Result<String> {
+fn read_trusted_persisted_output(
+    root: &Path,
+    filename: &std::ffi::OsStr,
+) -> std::io::Result<String> {
     #[cfg(not(unix))]
     {
-        let _ = path;
+        let _ = (root, filename);
         return Err(std::io::Error::other(
             "safe artifact reading is unavailable on this platform",
         ));
@@ -3784,15 +3823,121 @@ fn read_trusted_persisted_output(path: &Path) -> std::io::Result<String> {
 
     #[cfg(unix)]
     {
-        use std::{fs::File, io::Read, os::unix::fs::OpenOptionsExt};
+        use std::{
+            ffi::CString,
+            fs::File,
+            io::{Error, ErrorKind, Read},
+            mem::MaybeUninit,
+            os::{
+                fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
+                unix::ffi::OsStrExt,
+            },
+            path::Component,
+        };
 
-        let mut file = File::options()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)?;
-        if !file.metadata()?.file_type().is_file() {
-            return Err(std::io::Error::other("artifact is not a regular file"));
+        fn path_component(name: &std::ffi::OsStr) -> std::io::Result<CString> {
+            CString::new(name.as_bytes())
+                .map_err(|_| Error::new(ErrorKind::InvalidInput, "artifact path contains nul"))
         }
+
+        fn open_dir_at(dir: &OwnedFd, name: &std::ffi::OsStr) -> std::io::Result<OwnedFd> {
+            let name = path_component(name)?;
+            let fd = unsafe {
+                libc::openat(
+                    dir.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(Error::last_os_error());
+            }
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
+
+        fn is_regular_mode(mode: libc::mode_t) -> bool {
+            (mode & libc::S_IFMT) == libc::S_IFREG
+        }
+
+        fn fstat_regular(fd: std::os::fd::RawFd) -> std::io::Result<bool> {
+            let mut stat = MaybeUninit::<libc::stat>::uninit();
+            if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+                return Err(Error::last_os_error());
+            }
+            Ok(is_regular_mode(unsafe { stat.assume_init() }.st_mode))
+        }
+
+        fn fstatat_regular(dir: &OwnedFd, name: &CString) -> std::io::Result<bool> {
+            let mut stat = MaybeUninit::<libc::stat>::uninit();
+            if unsafe {
+                libc::fstatat(
+                    dir.as_raw_fd(),
+                    name.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(Error::last_os_error());
+            }
+            Ok(is_regular_mode(unsafe { stat.assume_init() }.st_mode))
+        }
+
+        let root_raw_fd = unsafe {
+            libc::open(
+                c"/".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if root_raw_fd < 0 {
+            return Err(Error::last_os_error());
+        }
+        let root_fd = unsafe { OwnedFd::from_raw_fd(root_raw_fd) };
+
+        let mut current = root_fd;
+        let mut saw_root = false;
+        for component in root.components() {
+            match component {
+                Component::RootDir if !saw_root => {
+                    saw_root = true;
+                }
+                Component::Normal(name) if saw_root => {
+                    current = open_dir_at(&current, name)?;
+                }
+                _ => {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        "artifact root contains unsafe path components",
+                    ));
+                }
+            }
+        }
+        if !saw_root {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "artifact root must be absolute",
+            ));
+        }
+
+        let filename = path_component(filename)?;
+        if !fstatat_regular(&current, &filename)? {
+            return Err(Error::other("artifact is not a regular file"));
+        }
+        let fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                filename.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(Error::last_os_error());
+        }
+        let file_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        if !fstat_regular(file_fd.as_raw_fd())? {
+            return Err(Error::other("artifact is not a regular file"));
+        }
+        let mut file = unsafe { File::from_raw_fd(file_fd.into_raw_fd()) };
         let mut output = String::new();
         file.read_to_string(&mut output)?;
         Ok(output)
@@ -3801,7 +3946,7 @@ fn read_trusted_persisted_output(path: &Path) -> std::io::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf, time::Duration};
+    use std::{collections::HashMap, fs, path::PathBuf, time::Duration};
 
     use crate::{
         agent::provider::{FinishReason, ToolCall, ToolResult},
@@ -3863,6 +4008,13 @@ mod tests {
             },
         ]);
         (app, id)
+    }
+
+    fn expansion_metrics(expansion_rows: u16, max_output_scroll: u16) -> ExecutionExpansionMetrics {
+        ExecutionExpansionMetrics {
+            expansion_rows,
+            max_output_scroll,
+        }
     }
 
     #[test]
@@ -4075,6 +4227,12 @@ mod tests {
         assert_eq!(app.scroll, 10);
 
         app.execution_scrolls.insert(id.clone(), 12);
+        app.reconcile_execution_expansion_metrics(HashMap::from([(
+            id.clone(),
+            expansion_metrics(6, 3),
+        )]));
+        assert_eq!(app.execution_scrolls[&id], 3);
+
         app.set_execution_hitboxes(vec![ExecutionHitbox {
             id: id.clone(),
             region: ExecutionRegion::Output,
@@ -4085,7 +4243,6 @@ mod tests {
             expansion_rows: 6,
             max_output_scroll: 3,
         }]);
-        assert_eq!(app.execution_scrolls[&id], 3);
 
         app.scroll_execution(&id, -2);
         assert_eq!(app.execution_scrolls[&id], 1);
@@ -4112,6 +4269,140 @@ mod tests {
         }]);
 
         assert_eq!(app.execution_scroll(&id), 5);
+    }
+
+    #[test]
+    fn set_execution_hitboxes_does_not_anchor_or_clamp_execution_state() {
+        let mut app = App::test_empty();
+        let id = ExecutionId::Tool("call-hitbox-only".to_owned());
+        app.expanded_executions.insert(id.clone());
+        app.execution_expansion_rows.insert(id.clone(), 8);
+        app.execution_scrolls.insert(id.clone(), 12);
+        app.scroll = 10;
+
+        app.set_execution_hitboxes(vec![ExecutionHitbox {
+            id: id.clone(),
+            region: ExecutionRegion::Output,
+            start_row: 0,
+            end_row: 2,
+            start_column: 0,
+            end_column: 80,
+            expansion_rows: 2,
+            max_output_scroll: 3,
+        }]);
+
+        assert_eq!(app.scroll, 10);
+        assert_eq!(app.execution_expansion_rows[&id], 8);
+        assert_eq!(app.execution_scroll(&id), 12);
+    }
+
+    #[test]
+    fn reconcile_execution_metrics_applies_signed_deltas_for_multiple_expanded_cards() {
+        let mut app = App::test_empty();
+        let first = ExecutionId::Tool("call-first".to_owned());
+        let second = ExecutionId::Tool("call-second".to_owned());
+        app.expanded_executions.insert(first.clone());
+        app.expanded_executions.insert(second.clone());
+        app.execution_expansion_rows.insert(first.clone(), 2);
+        app.execution_expansion_rows.insert(second.clone(), 6);
+        app.scroll = 10;
+
+        app.reconcile_execution_expansion_metrics(HashMap::from([
+            (first.clone(), expansion_metrics(5, 0)),
+            (second.clone(), expansion_metrics(4, 0)),
+        ]));
+
+        assert_eq!(app.scroll, 11);
+        assert_eq!(app.execution_expansion_rows[&first], 5);
+        assert_eq!(app.execution_expansion_rows[&second], 4);
+    }
+
+    #[test]
+    fn reconcile_execution_metrics_updates_offscreen_expanded_cards_without_visible_hitboxes() {
+        let mut app = App::test_empty();
+        let id = ExecutionId::Tool("call-offscreen".to_owned());
+        app.expanded_executions.insert(id.clone());
+        app.execution_expansion_rows.insert(id.clone(), 1);
+        app.set_execution_hitboxes(Vec::new());
+        app.scroll = 7;
+
+        app.reconcile_execution_expansion_metrics(HashMap::from([(
+            id.clone(),
+            expansion_metrics(4, 0),
+        )]));
+
+        assert_eq!(app.scroll, 10);
+        assert_eq!(app.execution_expansion_rows[&id], 4);
+    }
+
+    #[test]
+    fn reconcile_execution_metrics_anchors_resize_shrink_and_clamps_output_scroll() {
+        let mut app = App::test_empty();
+        let id = ExecutionId::Tool("call-resize".to_owned());
+        app.expanded_executions.insert(id.clone());
+        app.execution_expansion_rows.insert(id.clone(), 8);
+        app.execution_scrolls.insert(id.clone(), 6);
+        app.scroll = 12;
+
+        app.reconcile_execution_expansion_metrics(HashMap::from([(
+            id.clone(),
+            expansion_metrics(3, 2),
+        )]));
+
+        assert_eq!(app.scroll, 7);
+        assert_eq!(app.execution_expansion_rows[&id], 3);
+        assert_eq!(app.execution_scroll(&id), 2);
+    }
+
+    #[test]
+    fn reconcile_execution_metrics_anchors_live_growth() {
+        let mut app = App::test_empty();
+        let id = ExecutionId::Tool("call-growth".to_owned());
+        app.expanded_executions.insert(id.clone());
+        app.execution_expansion_rows.insert(id.clone(), 1);
+        app.scroll = 4;
+
+        app.reconcile_execution_expansion_metrics(HashMap::from([(
+            id.clone(),
+            expansion_metrics(8, 0),
+        )]));
+
+        assert_eq!(app.scroll, 11);
+        assert_eq!(app.execution_expansion_rows[&id], 8);
+    }
+
+    #[test]
+    fn reconcile_execution_metrics_updates_rows_without_anchoring_at_scroll_zero() {
+        let mut app = App::test_empty();
+        let id = ExecutionId::Tool("call-bottom".to_owned());
+        app.expanded_executions.insert(id.clone());
+        app.execution_expansion_rows.insert(id.clone(), 1);
+        app.scroll = 0;
+
+        app.reconcile_execution_expansion_metrics(HashMap::from([(
+            id.clone(),
+            expansion_metrics(8, 0),
+        )]));
+
+        assert_eq!(app.scroll, 0);
+        assert_eq!(app.execution_expansion_rows[&id], 8);
+    }
+
+    #[test]
+    fn collapsing_execution_subtracts_the_reconciled_actual_expansion_rows() {
+        let mut app = App::test_empty();
+        let id = ExecutionId::Tool("call-collapse".to_owned());
+        app.scroll = 4;
+        app.toggle_execution(id.clone(), 2);
+        app.reconcile_execution_expansion_metrics(HashMap::from([(
+            id.clone(),
+            expansion_metrics(8, 0),
+        )]));
+
+        app.toggle_execution(id.clone(), 2);
+
+        assert_eq!(app.scroll, 4);
+        assert!(!app.is_execution_expanded(&id));
     }
 
     fn finished_tool_message(id: &str, name: &str, output: &str) -> Message {
@@ -4284,6 +4575,75 @@ mod tests {
         fs::remove_file(target).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_tool_results_parent_is_rejected_without_escaping_root() {
+        let mut app = App::test_empty();
+        let call_id = "call-parent-symlink";
+        let expected = expected_artifact(&app, call_id, "Bash");
+        let tool_results_dir = expected.parent().expect("tool results dir").to_path_buf();
+        let session_dir = tool_results_dir
+            .parent()
+            .expect("session dir")
+            .to_path_buf();
+        let escape_dir = std::env::temp_dir().join(format!(
+            "glint-parent-symlink-secret-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&session_dir).expect("create session dir");
+        fs::create_dir_all(&escape_dir).expect("create escape dir");
+        std::os::unix::fs::symlink(&escape_dir, &tool_results_dir)
+            .expect("create symlinked tool results dir");
+        fs::write(
+            escape_dir.join(expected.file_name().expect("artifact file name")),
+            "parent symlink secret",
+        )
+        .expect("write escaped artifact");
+        let id = ExecutionId::Tool(call_id.to_owned());
+        app.messages.push(finished_bash_message(
+            call_id,
+            &persisted_output_marker(&expected),
+        ));
+
+        app.toggle_execution(id.clone(), 8);
+
+        let output = app.execution_output(&id).expect("rejected output");
+        assert!(output.contains("Could not read trusted persisted output"));
+        assert!(!output.contains("parent symlink secret"));
+        fs::remove_file(tool_results_dir).ok();
+        fs::remove_dir_all(session_dir).ok();
+        fs::remove_dir_all(escape_dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expected_fifo_artifact_is_rejected_without_blocking_for_a_writer() {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let mut app = App::test_empty();
+        let call_id = "call-fifo";
+        let expected = expected_artifact(&app, call_id, "Bash");
+        fs::create_dir_all(expected.parent().expect("artifact parent")).expect("create parent");
+        let fifo_path =
+            CString::new(expected.as_os_str().as_bytes()).expect("fifo path without nul");
+        let mkfifo_result = unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) };
+        assert_eq!(mkfifo_result, 0, "mkfifo failed");
+        let id = ExecutionId::Tool(call_id.to_owned());
+        app.messages.push(finished_bash_message(
+            call_id,
+            &persisted_output_marker(&expected),
+        ));
+
+        app.toggle_execution(id.clone(), 8);
+
+        assert!(
+            app.execution_output(&id)
+                .expect("rejected output")
+                .contains("Could not read trusted persisted output")
+        );
+        fs::remove_file(expected).ok();
+    }
+
     #[test]
     fn missing_artifact_reanchors_scroll_to_actual_rows_and_collapses_stably() {
         let mut app = App::test_empty();
@@ -4298,16 +4658,10 @@ mod tests {
 
         app.toggle_execution(id.clone(), 8);
         assert_eq!(app.scroll, 13);
-        app.set_execution_hitboxes(vec![ExecutionHitbox {
-            id: id.clone(),
-            region: ExecutionRegion::Output,
-            start_row: 0,
-            end_row: 1,
-            start_column: 0,
-            end_column: 100,
-            expansion_rows: 1,
-            max_output_scroll: 0,
-        }]);
+        app.reconcile_execution_expansion_metrics(HashMap::from([(
+            id.clone(),
+            expansion_metrics(1, 0),
+        )]));
         assert_eq!(app.scroll, 6);
 
         app.toggle_execution(id, 8);

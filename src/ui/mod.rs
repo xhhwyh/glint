@@ -31,7 +31,7 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, TextSelection};
+use crate::app::{App, ExecutionExpansionMetrics, TextSelection};
 use crate::approval::ApprovalFocus;
 use crate::event::{ExtensionMouseAction, MouseAction};
 use crate::execution::{ExecutionHitbox, ExecutionId, ExecutionRegion, MAX_EXPANDED_OUTPUT_ROWS};
@@ -76,7 +76,7 @@ pub fn extension_mouse_action(
 struct Document {
     lines: Vec<Line<'static>>,
     line_meta: Vec<DocumentLineMeta>,
-    execution_metrics: HashMap<ExecutionId, (u16, u16)>,
+    execution_metrics: HashMap<ExecutionId, ExecutionExpansionMetrics>,
     cursor: Option<(u16, u16)>,
 }
 
@@ -203,6 +203,17 @@ pub fn document_viewport_height(app: &App, width: u16, height: u16) -> u16 {
     height.saturating_sub(composer_visible_height(&composer, height))
 }
 
+pub fn execution_expansion_metrics(
+    app: &App,
+    width: u16,
+) -> HashMap<ExecutionId, ExecutionExpansionMetrics> {
+    document(app, width.max(1))
+        .execution_metrics
+        .into_iter()
+        .filter(|(id, _)| app.is_execution_expanded(id))
+        .collect()
+}
+
 pub fn execution_hitboxes(app: &App, width: u16, height: u16) -> Vec<ExecutionHitbox> {
     let width = width.max(1);
     let document = document(app, width);
@@ -231,7 +242,7 @@ pub fn execution_hitboxes(app: &App, width: u16, height: u16) -> Vec<ExecutionHi
         {
             row += 1;
         }
-        let (expansion_rows, max_output_scroll) = document
+        let metrics = document
             .execution_metrics
             .get(&id)
             .copied()
@@ -243,9 +254,9 @@ pub fn execution_hitboxes(app: &App, width: u16, height: u16) -> Vec<ExecutionHi
             end_row: (row - scroll as usize) as u16,
             start_column: 0,
             end_column: width,
-            expansion_rows,
+            expansion_rows: metrics.expansion_rows,
             max_output_scroll: if region == ExecutionRegion::Output {
-                max_output_scroll
+                metrics.max_output_scroll
             } else {
                 0
             },
@@ -349,13 +360,22 @@ fn document(app: &App, width: u16) -> Document {
                 hover_progress,
             );
             let expansion_metrics = if expanded {
-                (card_lines.output_rows, card_lines.max_output_scroll)
+                ExecutionExpansionMetrics {
+                    expansion_rows: card_lines.output_rows,
+                    max_output_scroll: card_lines.max_output_scroll,
+                }
             } else if app.execution_has_unloaded_persisted_output(&id) {
-                (MAX_EXPANDED_OUTPUT_ROWS, 0)
+                ExecutionExpansionMetrics {
+                    expansion_rows: MAX_EXPANDED_OUTPUT_ROWS,
+                    max_output_scroll: 0,
+                }
             } else {
                 let expanded_lines =
                     execution::execution_card_lines(&card, width, true, output_scroll, 0.0);
-                (expanded_lines.output_rows, expanded_lines.max_output_scroll)
+                ExecutionExpansionMetrics {
+                    expansion_rows: expanded_lines.output_rows,
+                    max_output_scroll: expanded_lines.max_output_scroll,
+                }
             };
             execution_metrics.insert(id.clone(), expansion_metrics);
             line_meta.extend(
@@ -964,6 +984,40 @@ mod tests {
         assert!(hitboxes.iter().any(|hitbox| {
             hitbox.id == id && hitbox.region == ExecutionRegion::Output && hitbox.start_row == 0
         }));
+    }
+
+    #[test]
+    fn execution_expansion_metrics_include_offscreen_expanded_cards() {
+        let mut app = App::test_empty();
+        let first = ExecutionId::Tool("call-first".to_owned());
+        let second = ExecutionId::Tool("call-second".to_owned());
+        app.messages.push(finished_bash_message(
+            "call-first",
+            "git log first",
+            "first output",
+        ));
+        app.messages.push(Message::assistant(
+            (1..=40)
+                .map(|line| format!("filler line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        app.messages.push(finished_bash_message(
+            "call-second",
+            "git log second",
+            "second output",
+        ));
+        app.toggle_execution(first.clone(), 8);
+        app.toggle_execution(second.clone(), 8);
+        app.scroll = 0;
+
+        let visible_hitboxes = execution_hitboxes(&app, 80, 14);
+        let metrics = execution_expansion_metrics(&app, 80);
+
+        assert!(!visible_hitboxes.iter().any(|hitbox| hitbox.id == first));
+        assert!(visible_hitboxes.iter().any(|hitbox| hitbox.id == second));
+        assert_eq!(metrics[&first].expansion_rows, 1);
+        assert_eq!(metrics[&second].expansion_rows, 1);
     }
 
     #[test]

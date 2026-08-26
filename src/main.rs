@@ -97,26 +97,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
     while !app.should_quit {
         let size = terminal.size()?;
         app.update_tasks();
-        app.set_document_viewport(
-            ui::document_viewport_height(&app, size.width, size.height),
-            ui::document_scroll_top(&app, size.width, size.height),
-        );
-        let execution_hitboxes = ui::execution_hitboxes(&app, size.width, size.height);
-        app.set_execution_hitboxes(execution_hitboxes);
-        let (input_top_row, input_rows, input_content_width) =
-            ui::composer_hitbox(&app, size.width, size.height);
-        app.set_input_hitbox(input_top_row, input_rows, input_content_width);
-        app.set_return_bottom_button_hitbox(ui::return_bottom_button_hitbox(
-            &app,
-            size.width,
-            size.height,
-        ));
-        app.set_mcp_detail_max_scroll(ui::mcp_detail_max_scroll(&app, size.width, size.height));
-        app.set_plugins_detail_max_scroll(ui::plugins_detail_max_scroll(
-            &app,
-            size.width,
-            size.height,
-        ));
+        synchronize_layout_state(&mut app, size.width, size.height);
         draw_synchronized(terminal, |frame| {
             ui::render(frame, &app);
             io::Result::Ok(())
@@ -172,6 +153,22 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
     }
 
     Ok(())
+}
+
+fn synchronize_layout_state(app: &mut App, width: u16, height: u16) {
+    let execution_metrics = ui::execution_expansion_metrics(app, width);
+    app.reconcile_execution_expansion_metrics(execution_metrics);
+    app.set_document_viewport(
+        ui::document_viewport_height(app, width, height),
+        ui::document_scroll_top(app, width, height),
+    );
+    let execution_hitboxes = ui::execution_hitboxes(app, width, height);
+    app.set_execution_hitboxes(execution_hitboxes);
+    let (input_top_row, input_rows, input_content_width) = ui::composer_hitbox(app, width, height);
+    app.set_input_hitbox(input_top_row, input_rows, input_content_width);
+    app.set_return_bottom_button_hitbox(ui::return_bottom_button_hitbox(app, width, height));
+    app.set_mcp_detail_max_scroll(ui::mcp_detail_max_scroll(app, width, height));
+    app.set_plugins_detail_max_scroll(ui::plugins_detail_max_scroll(app, width, height));
 }
 
 fn copy_selection_to_clipboard(
