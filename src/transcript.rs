@@ -1241,14 +1241,14 @@ fn tool_input_summary(name: &str, args: &Value) -> String {
     match name {
         "Read" | "Edit" => string_arg(args, "file_path"),
         "Glob" | "Grep" => string_arg(args, "pattern"),
-        "Bash" | "TerminalRun" => string_arg(args, "command"),
+        "Bash" => string_arg(args, "command"),
         _ => None,
     }
     .unwrap_or_else(|| args.to_string())
 }
 
 fn tool_description(name: &str, args: &Value) -> Option<String> {
-    matches!(name, "Bash" | "TerminalRun")
+    matches!(name, "Bash")
         .then(|| string_arg(args, "description"))
         .flatten()
 }

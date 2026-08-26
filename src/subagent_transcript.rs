@@ -219,12 +219,12 @@ mod tests {
     fn finished_task(status: TaskStatus) -> TaskSnapshot {
         TaskSnapshot {
             id: "a1".to_owned(),
+            tool_call_id: "call-subagent".to_owned(),
             kind: TaskKind::Subagent,
             status,
             description: "inspect parser".to_owned(),
             backend: SubagentBackend::Codex,
             cwd: "/workspace".to_owned(),
-            terminal_tab: Some(0),
             started_at_ms: 1,
             ended_at_ms: Some(2),
             summary: Some("completed".to_owned()),
@@ -245,7 +245,7 @@ mod tests {
         transcript.apply(&AgentEvent::ToolStarted {
             id: "tool-1".to_owned(),
             name: "Grep".to_owned(),
-            input_summary: "TerminalRun".to_owned(),
+            input_summary: "Bash".to_owned(),
             input_description: None,
         });
         transcript.apply(&AgentEvent::ToolFinished {

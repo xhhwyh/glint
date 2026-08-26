@@ -41,10 +41,7 @@ use crate::{
     tasks::{
         self, SubagentRequest, SubagentStartResponse, SubagentSteering, TaskRequest, TaskSnapshot,
     },
-    terminal::{
-        TerminalMouseScroll, TerminalRequest, TerminalRunResult, TerminalStatus, TerminalTab,
-    },
-    tools::ShellToolMode,
+    terminal::{TerminalMouseScroll, TerminalTab},
     transcript::{TranscriptSessionSummary, WorkspaceUsageStats},
 };
 
@@ -955,7 +952,7 @@ impl App {
 
     #[cfg(test)]
     pub(crate) fn test_start_subagent_task(&mut self, request: &SubagentRequest) {
-        self.runtime.start_subagent_task(request, 0).unwrap();
+        self.runtime.start_subagent_task(request).unwrap();
         self.subagent_transcripts
             .insert(request.task_id.clone(), SubagentTranscript::new(request));
     }
@@ -968,41 +965,6 @@ impl App {
         for tab in &mut self.terminal_tabs {
             tab.tick();
         }
-
-        while let Some(request) = self.runtime.try_recv_terminal_request() {
-            match request {
-                TerminalRequest::Run {
-                    command,
-                    description,
-                    timeout,
-                    response,
-                } => {
-                    if let Some(tab_index) = self.terminal_run_tab_index() {
-                        if let Some(tab) = self.terminal_tabs.get_mut(tab_index) {
-                            tab.run_noninteractive(command, description, timeout, response);
-                        }
-                    } else {
-                        response
-                            .send(TerminalRunResult::failed(
-                                command,
-                                self.terminal_init_error
-                                    .clone()
-                                    .unwrap_or_else(|| "agent terminal is unavailable".to_owned()),
-                            ))
-                            .ok();
-                    }
-                }
-                TerminalRequest::CancelActive => {
-                    for tab in &mut self.terminal_tabs {
-                        tab.cancel_active();
-                    }
-                }
-            }
-        }
-
-        for tab in &mut self.terminal_tabs {
-            tab.tick();
-        }
         self.drain_subagent_events();
     }
 
@@ -1010,7 +972,7 @@ impl App {
         while let Some(request) = self.runtime.try_recv_task_request() {
             match request {
                 TaskRequest::StartSubagent { request, response } => {
-                    self.start_subagent_terminal(request, response);
+                    self.start_subagent_task(request, response);
                 }
                 TaskRequest::List { response } => {
                     response.send(self.runtime.task_snapshots()).ok();
@@ -1032,12 +994,6 @@ impl App {
                         if let Some(transcript) = self.subagent_transcripts.get_mut(&task.id) {
                             transcript.append_steering(message.clone());
                         }
-                        if let Some(tab) = task
-                            .terminal_tab
-                            .and_then(|terminal_tab| self.terminal_tabs.get_mut(terminal_tab))
-                        {
-                            tab.append_subagent_message(Message::user(message));
-                        }
                         self.run_notice = Some(format!("Sent a message to task {}.", task.id));
                     }
                     response.send(result).ok();
@@ -1053,31 +1009,7 @@ impl App {
         }
     }
 
-    fn terminal_run_tab_index(&mut self) -> Option<usize> {
-        if self
-            .terminal_tabs
-            .get(self.active_terminal_tab)
-            .is_some_and(TerminalTab::is_pty)
-        {
-            return Some(self.active_terminal_tab);
-        }
-        if let Some(index) = self.terminal_tabs.iter().position(TerminalTab::is_pty) {
-            return Some(index);
-        }
-        match TerminalTab::new_agent() {
-            Ok(tab) => {
-                self.terminal_tabs.push(tab);
-                self.terminal_init_error = None;
-                Some(self.terminal_tabs.len() - 1)
-            }
-            Err(error) => {
-                self.terminal_init_error = Some(format!("{error:#}"));
-                None
-            }
-        }
-    }
-
-    fn start_subagent_terminal(
+    fn start_subagent_task(
         &mut self,
         mut request: SubagentRequest,
         response: std::sync::mpsc::Sender<SubagentStartResponse>,
@@ -1096,8 +1028,7 @@ impl App {
                 }
             }
         }
-        let terminal_tab = self.terminal_tabs.len();
-        let task = match self.runtime.start_subagent_task(&request, terminal_tab) {
+        let task = match self.runtime.start_subagent_task(&request) {
             Ok(task) => task,
             Err(error) => {
                 response
@@ -1107,14 +1038,8 @@ impl App {
             }
         };
 
-        let mut tab = TerminalTab::new_subagent(subagent_terminal_title(&task));
-        tab.append_subagent_message(Message::user(request.prompt.clone()));
         self.subagent_transcripts
             .insert(task.id.clone(), SubagentTranscript::new(&request));
-        self.terminal_tabs.push(tab);
-        self.active_terminal_tab = terminal_tab;
-        self.terminal_visible = true;
-        self.terminal_focused = false;
         self.run_notice = Some(format!("Started Codex subagent {}.", task.id));
         self.messages
             .push(Message::assistant(tasks::task_started_message(&task)));
@@ -1137,9 +1062,7 @@ impl App {
                 active_progress: None,
                 current_user_message: request.prompt,
                 tool_results_dir: self.runtime.tool_results_dir(),
-                terminal_requests: self.runtime.terminal_request_sender(),
                 task_requests: self.runtime.task_request_sender(),
-                shell_tool_mode: ShellToolMode::TerminalRun,
                 read_file_state: self.runtime.read_file_state(),
                 lsp_manager: self.runtime.lsp_manager(),
                 dynamic_tools: self.runtime.dynamic_tools(),
@@ -1152,135 +1075,35 @@ impl App {
         );
         self.runtime.attach_subagent_run(
             task.id.clone(),
-            terminal_tab,
             event_rx,
             outcome_rx,
             control_tx,
             steering,
         );
-        response
-            .send(SubagentStartResponse::started(task.id, terminal_tab))
-            .ok();
+        response.send(SubagentStartResponse::started(task.id)).ok();
     }
 
     fn drain_subagent_events(&mut self) {
         for event in self.runtime.poll_subagent_events() {
             match event {
-                SubagentRuntimeEvent::Agent {
-                    task_id,
-                    terminal_tab,
-                    event,
-                } => {
+                SubagentRuntimeEvent::Agent { task_id, event } => {
                     if let Some(transcript) = self.subagent_transcripts.get_mut(&task_id) {
                         transcript.apply(&event);
                     }
                     self.preload_expanded_execution(&ExecutionId::Task(task_id.clone()));
-                    self.update_subagent_tab_event(terminal_tab, &event);
                 }
-                SubagentRuntimeEvent::Finished {
-                    task_id,
-                    terminal_tab,
-                    task,
-                } => {
-                    self.finish_subagent_result(&task_id, terminal_tab, task);
+                SubagentRuntimeEvent::Finished { task_id, task } => {
+                    self.finish_subagent_result(&task_id, task);
                 }
             }
         }
     }
 
-    fn update_subagent_tab_event(&mut self, terminal_tab: usize, event: &AgentEvent) {
-        let Some(tab) = self.terminal_tabs.get_mut(terminal_tab) else {
-            return;
-        };
-        match event {
-            AgentEvent::Started => {
-                tab.set_subagent_activity(Some("Thinking".to_owned()));
-                tab.append_subagent_message(Message::assistant(""));
-            }
-            AgentEvent::AssistantDelta(delta) => {
-                tab.set_subagent_activity(None);
-                tab.append_subagent_assistant_delta(delta);
-            }
-            AgentEvent::AssistantTurn { .. } => {}
-            AgentEvent::ToolStarted {
-                id,
-                name,
-                input_summary,
-                input_description,
-            } => {
-                tab.set_subagent_activity(Some(format!("Running {name}: {input_summary}")));
-                tab.remove_empty_subagent_assistant_tail();
-                tab.append_subagent_message(Message::tool_with_description(
-                    id.clone(),
-                    name.clone(),
-                    input_summary.clone(),
-                    input_description.clone(),
-                ));
-            }
-            AgentEvent::ToolFinished {
-                id,
-                name,
-                output,
-                is_error,
-                output_summary,
-            } => {
-                tab.set_subagent_activity(Some(format!("Finished {name}: {output_summary}")));
-                if name == "Read" {
-                    if let Some(message) = tab.subagent_tool_message_mut(id) {
-                        message.tool_finished = true;
-                        message.tool_is_error = *is_error;
-                    }
-                    return;
-                }
-                if let Some(message) = tab.subagent_tool_message_mut(id) {
-                    message.content = output.clone();
-                    message.tool_finished = true;
-                    message.tool_is_error = *is_error;
-                }
-            }
-            AgentEvent::ToolApprovalRequested(request) => {
-                tab.set_subagent_activity(Some(format!(
-                    "Approval unavailable: {}",
-                    request.command
-                )));
-            }
-            AgentEvent::ConversationPermissionChanged { .. } => {}
-            AgentEvent::TodoUpdated(_) => {}
-            AgentEvent::CompactStarted
-            | AgentEvent::CompactFinished { .. }
-            | AgentEvent::CompactFailed(_) => {}
-            AgentEvent::AssistantFinished => {
-                tab.set_subagent_activity(None);
-            }
-            AgentEvent::Failed(error) => {
-                tab.set_subagent_activity(None);
-                tab.remove_empty_subagent_assistant_tail();
-                tab.append_subagent_assistant_delta(error);
-                tab.finish_subagent(TerminalStatus::Error(error.clone()));
-            }
-        }
-    }
-
-    fn finish_subagent_result(&mut self, task_id: &str, terminal_tab: usize, task: TaskSnapshot) {
+    fn finish_subagent_result(&mut self, task_id: &str, task: TaskSnapshot) {
         if let Some(transcript) = self.subagent_transcripts.get_mut(task_id) {
             transcript.finish(&task);
             let snapshot = transcript.snapshot();
             self.runtime.append_subagent_presentation(&snapshot).ok();
-        }
-        if let Some(tab) = self.terminal_tabs.get_mut(terminal_tab) {
-            let status = match task.status {
-                tasks::TaskStatus::Completed => TerminalStatus::Idle,
-                tasks::TaskStatus::Cancelled => TerminalStatus::TimedOut,
-                tasks::TaskStatus::Failed => TerminalStatus::Error(
-                    task.error
-                        .clone()
-                        .unwrap_or_else(|| "subagent failed".to_owned()),
-                ),
-                tasks::TaskStatus::Queued | tasks::TaskStatus::Running => TerminalStatus::Running {
-                    description: format!("Codex subagent {}", task.id),
-                },
-            };
-            tab.finish_subagent(status);
         }
         self.run_notice = Some(tasks::task_finished_message(&task));
     }
@@ -1966,7 +1789,7 @@ impl App {
             KeyAction::Right | KeyAction::Tab => self.move_status_view(1),
             KeyAction::Up => self.move_status_task_selection(-1),
             KeyAction::Down => self.move_status_task_selection(1),
-            KeyAction::Submit => self.open_selected_status_task_terminal(),
+            KeyAction::Submit => {}
             _ => {}
         }
     }
@@ -1996,34 +1819,6 @@ impl App {
             return;
         }
         view.selected_task = move_index(view.selected_task, direction, task_count);
-    }
-
-    fn open_selected_status_task_terminal(&mut self) {
-        let Some(view) = self.status_view.as_ref() else {
-            return;
-        };
-        if view.tab != StatusTab::Tasks {
-            return;
-        }
-        let Some(task) = self
-            .runtime
-            .task_snapshots()
-            .get(view.selected_task)
-            .cloned()
-        else {
-            return;
-        };
-        let Some(tab) = task.terminal_tab else {
-            self.run_notice = Some(format!("Task {} has no terminal tab.", task.id));
-            return;
-        };
-        if tab >= self.terminal_tabs.len() {
-            self.run_notice = Some(format!("Task {} terminal tab is unavailable.", task.id));
-            return;
-        }
-        self.status_view = None;
-        self.input.set("");
-        self.select_terminal_tab(tab);
     }
 
     fn open_mcp_view(&mut self) {
@@ -3482,7 +3277,7 @@ impl App {
         self.terminal_visible = true;
         self.terminal_focused = true;
         self.terminal_tab_switcher = None;
-        self.run_notice = Some("Terminal visible. TerminalRun is active.".to_owned());
+        self.run_notice = Some("Terminal visible.".to_owned());
     }
 
     fn new_terminal_tab(&mut self) {
@@ -3499,13 +3294,8 @@ impl App {
         self.terminal_tab_switcher = None;
 
         let index = self.active_terminal_tab.min(self.terminal_tabs.len() - 1);
-        if self.runtime.terminal_tab_has_running_task(index) {
-            self.run_notice = Some("Codex subagent is running; cannot close this tab.".to_owned());
-            return;
-        }
         let tab = self.terminal_tabs.remove(index);
         tab.close();
-        self.runtime.handle_terminal_tab_closed(index);
 
         if self.terminal_tabs.is_empty() {
             self.active_terminal_tab = 0;
@@ -3847,7 +3637,6 @@ impl App {
             llm: self.config.llm.clone(),
             system_prompt: self.config.system_prompt.clone(),
             runtime_current_dir,
-            shell_tool_mode: self.shell_tool_mode(),
         }
     }
 
@@ -4138,14 +3927,6 @@ impl App {
         self.turn_started_at = None;
     }
 
-    fn shell_tool_mode(&self) -> ShellToolMode {
-        if self.terminal_visible {
-            ShellToolMode::TerminalRun
-        } else {
-            ShellToolMode::Bash
-        }
-    }
-
     fn remove_empty_assistant_tail(&mut self) {
         if matches!(
             self.messages.last(),
@@ -4343,22 +4124,6 @@ fn terminal_switcher_window_start(
     } else {
         current_start.min(max_start)
     }
-}
-
-fn subagent_terminal_title(task: &TaskSnapshot) -> String {
-    const MAX_DESCRIPTION_CHARS: usize = 18;
-    let description = if task.description.chars().count() <= MAX_DESCRIPTION_CHARS {
-        task.description.clone()
-    } else {
-        let mut value = task
-            .description
-            .chars()
-            .take(MAX_DESCRIPTION_CHARS.saturating_sub(3))
-            .collect::<String>();
-        value.push_str("...");
-        value
-    };
-    format!("codex {} {}", task.id, description)
 }
 
 fn subagent_transcripts_by_task_id(
@@ -5137,7 +4902,6 @@ mod tests {
         let (control_tx, _control_rx) = std::sync::mpsc::channel();
         app.runtime.attach_subagent_run(
             request.task_id.clone(),
-            0,
             event_rx,
             outcome_rx,
             control_tx,
@@ -5244,7 +5008,7 @@ mod tests {
     fn add_test_tabs(app: &mut App, count: usize) {
         for index in 0..count {
             app.terminal_tabs
-                .push(TerminalTab::new_subagent(format!("tab {}", index + 1)));
+                .push(TerminalTab::new_test(format!("tab {}", index + 1)));
         }
     }
 

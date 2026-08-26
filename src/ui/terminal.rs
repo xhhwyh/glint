@@ -15,7 +15,6 @@ use crate::{
 use super::{
     layout::{box_bottom, box_top_spans, pad_to_width, truncate_end_to_width},
     theme::*,
-    transcript_view,
 };
 
 const SWITCHER_CARD_WIDTH: u16 = 28;
@@ -176,17 +175,6 @@ fn terminal_content_lines(
         )])];
     };
 
-    if let Some(messages) = tab.subagent_messages() {
-        let mut lines = messages
-            .iter()
-            .flat_map(|message| transcript_view::message_lines(message, width))
-            .collect::<Vec<_>>();
-        if let Some(activity) = tab.subagent_activity() {
-            lines.push(transcript_view::notice_line(activity));
-        }
-        return visible_tail(lines, height, tab.subagent_scroll());
-    }
-
     let mut lines = tab
         .styled_screen_lines(height as u16, width)
         .into_iter()
@@ -316,8 +304,6 @@ fn terminal_switcher_card_spans(
 fn terminal_status_short(status: TerminalStatus) -> &'static str {
     match status {
         TerminalStatus::Idle => "idle",
-        TerminalStatus::Running { .. } => "running",
-        TerminalStatus::TimedOut => "timeout",
         TerminalStatus::Error(_) => "error",
     }
 }
@@ -334,8 +320,6 @@ pub(super) fn terminal_status_label(app: &App) -> String {
     };
     let status = match app.active_terminal_tab().map(|terminal| terminal.status()) {
         Some(TerminalStatus::Idle) => "idle".to_owned(),
-        Some(TerminalStatus::Running { description }) => format!("running {description}"),
-        Some(TerminalStatus::TimedOut) => "timed out".to_owned(),
         Some(TerminalStatus::Error(error)) => format!("error {error}"),
         None => "unavailable".to_owned(),
     };

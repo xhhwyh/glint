@@ -81,15 +81,13 @@ pub struct SubagentRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubagentStartResponse {
     pub task_id: String,
-    pub terminal_tab: Option<usize>,
     pub error: Option<String>,
 }
 
 impl SubagentStartResponse {
-    pub fn started(task_id: String, terminal_tab: usize) -> Self {
+    pub fn started(task_id: String) -> Self {
         Self {
             task_id,
-            terminal_tab: Some(terminal_tab),
             error: None,
         }
     }
@@ -97,7 +95,6 @@ impl SubagentStartResponse {
     pub fn failed(task_id: String, error: impl Into<String>) -> Self {
         Self {
             task_id,
-            terminal_tab: None,
             error: Some(error.into()),
         }
     }
@@ -106,12 +103,12 @@ impl SubagentStartResponse {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskSnapshot {
     pub id: String,
+    pub tool_call_id: String,
     pub kind: TaskKind,
     pub status: TaskStatus,
     pub description: String,
     pub backend: SubagentBackend,
     pub cwd: String,
-    pub terminal_tab: Option<usize>,
     pub started_at_ms: u64,
     pub ended_at_ms: Option<u64>,
     pub summary: Option<String>,
@@ -265,11 +262,7 @@ impl TaskManager {
             .collect()
     }
 
-    pub fn start_subagent(
-        &mut self,
-        request: &SubagentRequest,
-        terminal_tab: usize,
-    ) -> Result<TaskSnapshot, String> {
+    pub fn start_subagent(&mut self, request: &SubagentRequest) -> Result<TaskSnapshot, String> {
         if self.running_subagent_count() >= MAX_RUNNING_SUBAGENTS {
             return Err(format!(
                 "too many running subagents; limit is {MAX_RUNNING_SUBAGENTS}"
@@ -281,12 +274,12 @@ impl TaskManager {
 
         let mut task = TaskSnapshot {
             id: request.task_id.clone(),
+            tool_call_id: request.tool_call_id.clone(),
             kind: TaskKind::Subagent,
             status: TaskStatus::Queued,
             description: request.description.clone(),
             backend: request.backend,
             cwd: request.cwd.clone(),
-            terminal_tab: Some(terminal_tab),
             started_at_ms: now_ms(),
             ended_at_ms: None,
             summary: None,
@@ -336,27 +329,6 @@ impl TaskManager {
             task.tool_use_count = task.tool_use_count.saturating_add(1);
         }
     }
-
-    pub fn terminal_tab_has_running_task(&self, terminal_tab: usize) -> bool {
-        self.tasks.iter().any(|task| {
-            task.terminal_tab == Some(terminal_tab)
-                && task.kind == TaskKind::Subagent
-                && task.status.is_running()
-        })
-    }
-
-    pub fn handle_terminal_tab_closed(&mut self, closed_index: usize) {
-        for task in &mut self.tasks {
-            let Some(tab) = task.terminal_tab else {
-                continue;
-            };
-            if tab == closed_index {
-                task.terminal_tab = None;
-            } else if tab > closed_index {
-                task.terminal_tab = Some(tab - 1);
-            }
-        }
-    }
 }
 
 pub fn next_task_id() -> String {
@@ -399,10 +371,6 @@ pub fn task_model_context_message(task: &TaskSnapshot) -> String {
         .summary
         .clone()
         .unwrap_or_else(|| task_status_summary(task));
-    let terminal_tab = task
-        .terminal_tab
-        .map(|tab| format!("\n<terminal_tab>{}</terminal_tab>", tab + 1))
-        .unwrap_or_default();
     let result = task
         .result
         .as_deref()
@@ -422,7 +390,7 @@ pub fn task_model_context_message(task: &TaskSnapshot) -> String {
 <summary>{}</summary>\n\
 <description>{}</description>\n\
 <backend>{}</backend>\n\
-<cwd>{}</cwd>{terminal_tab}{result}{error}\n\
+<cwd>{}</cwd>{result}{error}\n\
 </subagent-outcome>",
         xml_escape(&task.id),
         task.status.label(),
@@ -503,10 +471,19 @@ mod tests {
     }
 
     #[test]
+    fn task_snapshot_has_no_terminal_identity() {
+        let mut manager = TaskManager::default();
+        let task = manager.start_subagent(&request("a1")).unwrap();
+
+        assert_eq!(task.id, "a1");
+        assert_eq!(task.tool_call_id, "call-subagent");
+    }
+
+    #[test]
     fn task_manager_tracks_subagent_lifecycle() {
         let mut manager = TaskManager::default();
         let request = request("a1");
-        manager.start_subagent(&request, 0).unwrap();
+        manager.start_subagent(&request).unwrap();
         assert_eq!(manager.running_subagent_count(), 1);
 
         let finished = manager
@@ -525,17 +502,17 @@ mod tests {
     #[test]
     fn task_manager_enforces_running_subagent_limit() {
         let mut manager = TaskManager::default();
-        manager.start_subagent(&request("a1"), 0).unwrap();
-        manager.start_subagent(&request("a2"), 1).unwrap();
+        manager.start_subagent(&request("a1")).unwrap();
+        manager.start_subagent(&request("a2")).unwrap();
 
-        assert!(manager.start_subagent(&request("a3"), 2).is_err());
+        assert!(manager.start_subagent(&request("a3")).is_err());
     }
 
     #[test]
     fn failed_subagent_records_error_without_external_artifacts() {
         let mut manager = TaskManager::default();
         let request = request("a1");
-        manager.start_subagent(&request, 0).unwrap();
+        manager.start_subagent(&request).unwrap();
 
         let finished = manager
             .finish_subagent("a1", SubagentOutcome::failed("model failed", "partial"))
@@ -550,7 +527,7 @@ mod tests {
     fn task_model_context_message_is_model_visible_payload() {
         let mut manager = TaskManager::default();
         let request = request("a1");
-        manager.start_subagent(&request, 0).unwrap();
+        manager.start_subagent(&request).unwrap();
         let finished = manager
             .finish_subagent("a1", SubagentOutcome::completed("final <answer>"))
             .unwrap();
@@ -567,7 +544,7 @@ mod tests {
     fn task_model_context_message_does_not_embed_transcript_log() {
         let mut manager = TaskManager::default();
         let request = request("a1");
-        manager.start_subagent(&request, 0).unwrap();
+        manager.start_subagent(&request).unwrap();
         let finished = manager
             .finish_subagent("a1", SubagentOutcome::completed("concise result"))
             .unwrap();
@@ -583,7 +560,7 @@ mod tests {
         let final_message = "this final answer should remain intact because it is the model-visible handoff from the completed subagent and trimming it would drop useful details";
         let mut manager = TaskManager::default();
         let request = request("a1");
-        manager.start_subagent(&request, 0).unwrap();
+        manager.start_subagent(&request).unwrap();
         let finished = manager
             .finish_subagent("a1", SubagentOutcome::completed(final_message))
             .unwrap();
@@ -608,7 +585,7 @@ mod tests {
     #[test]
     fn cancelled_subagent_has_cancelled_status() {
         let mut manager = TaskManager::default();
-        manager.start_subagent(&request("a1"), 0).unwrap();
+        manager.start_subagent(&request("a1")).unwrap();
 
         let finished = manager
             .finish_subagent("a1", SubagentOutcome::cancelled("partial"))

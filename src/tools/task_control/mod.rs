@@ -342,12 +342,12 @@ fn format_tasks(tasks: &[TaskSnapshot], timed_out: bool) -> String {
 fn task_json(task: &TaskSnapshot) -> Value {
     json!({
         "id": task.id,
+        "tool_call_id": task.tool_call_id,
         "kind": match task.kind { TaskKind::Subagent => "subagent" },
         "status": task.status.label(),
         "description": task.description,
         "backend": task.backend.label(),
         "cwd": task.cwd,
-        "terminal_tab": task.terminal_tab.map(|tab| tab + 1),
         "started_at_ms": task.started_at_ms,
         "ended_at_ms": task.ended_at_ms,
         "summary": task.summary,
@@ -374,12 +374,12 @@ mod tests {
     fn snapshot() -> TaskSnapshot {
         TaskSnapshot {
             id: "a1".to_owned(),
+            tool_call_id: "call-subagent".to_owned(),
             kind: TaskKind::Subagent,
             status: TaskStatus::Completed,
             description: "inspect parser".to_owned(),
             backend: SubagentBackend::Codex,
             cwd: "/workspace".to_owned(),
-            terminal_tab: Some(1),
             started_at_ms: 1,
             ended_at_ms: Some(2),
             summary: Some("completed".to_owned()),

@@ -22,9 +22,9 @@ Use TodoWrite to maintain a progress checklist for complex multi-step work. Do n
 
 Before every assistant turn that calls tools, write a brief visible sentence first. Explain what you are about to inspect or do, or what key fact you found that motivates the next tool call. Do not make tool calls with empty assistant text.
 
-Prefer dedicated tools over shell tools when they fit: Read for file contents, Glob for file discovery, Grep for content search, LSP for Rust symbol-aware queries, and Edit for file changes. Do not use TerminalRun or Bash with cat/head/tail, find/ls, grep/rg, sed/awk, echo/printf, or heredocs for those tasks.
+Prefer dedicated tools over shell tools when they fit: Read for file contents, Glob for file discovery, Grep for content search, LSP for Rust symbol-aware queries, and Edit for file changes. Do not use Bash with cat/head/tail, find/ls, grep/rg, sed/awk, echo/printf, or heredocs for those tasks.
 
-Use the shell tool currently listed in runtime context for non-interactive shell-only operations such as git, build/test, package manager, environment, and process commands. When TerminalRun is available, it runs in the visible terminal and returns command, exit_code, timed_out, and output; when TerminalRun is unavailable, use Bash for shell-only operations. Do not use shell tools for interactive programs such as vim, less, ssh, password prompts, or TUIs.
+Use Bash for non-interactive shell-only operations such as git, build/test, package manager, environment, and process commands. Do not use shell tools for interactive programs such as vim, less, ssh, password prompts, or TUIs.
 
 For local-file questions, use the provided current directory plus Glob/Read/Grep/LSP to inspect files. Do not run pwd or ls just to orient yourself. In Read, Glob, Grep, LSP, and Edit arguments, use paths relative to `current_directory` for files and directories under it; use absolute paths only for targets outside `current_directory`; do not use `~`.
 

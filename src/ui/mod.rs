@@ -1062,8 +1062,8 @@ mod tests {
     #[test]
     fn terminal_preview_tracks_switcher_candidate() {
         let mut app = App::test_empty();
-        app.terminal_tabs.push(TerminalTab::new_subagent("first"));
-        app.terminal_tabs.push(TerminalTab::new_subagent("second"));
+        app.terminal_tabs.push(TerminalTab::new_test("first"));
+        app.terminal_tabs.push(TerminalTab::new_test("second"));
         app.active_terminal_tab = 0;
         app.terminal_tab_switcher = Some(TerminalTabSwitcher {
             candidate: 1,

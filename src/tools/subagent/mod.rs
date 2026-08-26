@@ -34,7 +34,7 @@ impl ToolBehavior for SubagentTool {
     }
 
     fn execute(&self, call: &ToolCall, _is_cancelled: &mut dyn FnMut() -> bool) -> ToolResult {
-        error(call, "Subagent requires a terminal runtime.".to_owned())
+        error(call, "Subagent requires the task runtime.".to_owned())
     }
 
     fn requires_approval(
@@ -104,9 +104,8 @@ pub(super) fn subagent(call: &ToolCall, task_requests: Option<&Sender<TaskReques
             ok(
                 call,
                 format!(
-                    "Started Codex subagent {} in terminal tab {}. Use TaskWait for its result, TaskSend to refine it, or TaskCancel to stop it.",
+                    "Started Codex subagent {}. Use TaskWait for its result, TaskSend to refine it, or TaskCancel to stop it.",
                     response.task_id,
-                    response.terminal_tab.map(|tab| tab + 1).unwrap_or_default()
                 ),
             )
         }
@@ -214,7 +213,6 @@ mod tests {
             response
                 .send(crate::tasks::SubagentStartResponse::started(
                     request.task_id,
-                    0,
                 ))
                 .unwrap();
         });
@@ -224,6 +222,6 @@ mod tests {
 
         assert!(!result.is_error);
         assert!(result.content.contains("Started Codex subagent"));
-        assert!(result.content.contains("terminal tab 1"));
+        assert!(result.content.contains("Use TaskWait for its result"));
     }
 }

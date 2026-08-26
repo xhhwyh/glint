@@ -32,8 +32,7 @@ use crate::{
         self, SubagentOutcome, SubagentRequest, SubagentSteering, TaskManager, TaskRequest,
         TaskSnapshot, TaskWaitResponse,
     },
-    terminal::TerminalRequest,
-    tools::{DynamicTool, ReadFileState, ShellToolMode},
+    tools::{DynamicTool, ReadFileState},
     transcript::{
         AssistantTranscript, CompactTrigger, TranscriptSessionSummary, TranscriptStore,
         WorkspaceUsageStats,
@@ -77,7 +76,6 @@ pub struct StartPromptConfig {
     pub llm: LlmConfig,
     pub system_prompt: String,
     pub runtime_current_dir: String,
-    pub shell_tool_mode: ShellToolMode,
 }
 
 pub enum RuntimeCommand {
@@ -151,21 +149,12 @@ pub struct AssistantRecord {
 }
 
 pub enum SubagentRuntimeEvent {
-    Agent {
-        task_id: String,
-        terminal_tab: usize,
-        event: AgentEvent,
-    },
-    Finished {
-        task_id: String,
-        terminal_tab: usize,
-        task: TaskSnapshot,
-    },
+    Agent { task_id: String, event: AgentEvent },
+    Finished { task_id: String, task: TaskSnapshot },
 }
 
 struct RunningSubagent {
     task_id: String,
-    terminal_tab: usize,
     events: Receiver<AgentEvent>,
     outcome: Receiver<SubagentOutcome>,
     control: Sender<AgentControl>,
@@ -184,8 +173,6 @@ pub struct SessionRuntime {
     agent_tx: Sender<AgentEvent>,
     agent_events: Receiver<AgentEvent>,
     agent_control_tx: Option<mpsc::Sender<AgentControl>>,
-    terminal_request_tx: Sender<TerminalRequest>,
-    terminal_requests: Receiver<TerminalRequest>,
     task_request_tx: Sender<TaskRequest>,
     task_requests: Receiver<TaskRequest>,
     lsp_manager: LspManager,
@@ -227,7 +214,6 @@ impl SessionRuntime {
         hooks: Vec<PluginHook>,
     ) -> Self {
         let (agent_tx, agent_events) = mpsc::channel();
-        let (terminal_request_tx, terminal_requests) = mpsc::channel();
         let (task_request_tx, task_requests) = mpsc::channel();
         let lsp_manager = LspManager::new(lsp_config, PathBuf::from(&transcript_cwd));
         let mcp_manager = McpManager::new(mcp_config, PathBuf::from(&transcript_cwd));
@@ -239,8 +225,6 @@ impl SessionRuntime {
             agent_tx,
             agent_events,
             agent_control_tx: None,
-            terminal_request_tx,
-            terminal_requests,
             task_request_tx,
             task_requests,
             lsp_manager,
@@ -392,10 +376,6 @@ impl SessionRuntime {
         self.agent_events.try_recv().ok()
     }
 
-    pub fn try_recv_terminal_request(&self) -> Option<TerminalRequest> {
-        self.terminal_requests.try_recv().ok()
-    }
-
     pub fn try_recv_task_request(&self) -> Option<TaskRequest> {
         self.task_requests.try_recv().ok()
     }
@@ -440,10 +420,6 @@ impl SessionRuntime {
         self.progress_state.pinned()
     }
 
-    pub fn terminal_request_sender(&self) -> Sender<TerminalRequest> {
-        self.terminal_request_tx.clone()
-    }
-
     pub fn task_request_sender(&self) -> Sender<TaskRequest> {
         self.task_request_tx.clone()
     }
@@ -471,9 +447,8 @@ impl SessionRuntime {
     pub fn start_subagent_task(
         &mut self,
         request: &SubagentRequest,
-        terminal_tab: usize,
     ) -> Result<TaskSnapshot, String> {
-        let task = self.task_manager.start_subagent(request, terminal_tab)?;
+        let task = self.task_manager.start_subagent(request)?;
         self.transcript
             .append_subagent_started(
                 task.id.clone(),
@@ -489,7 +464,6 @@ impl SessionRuntime {
     pub fn attach_subagent_run(
         &mut self,
         task_id: String,
-        terminal_tab: usize,
         events: Receiver<AgentEvent>,
         outcome: Receiver<SubagentOutcome>,
         control: Sender<AgentControl>,
@@ -497,7 +471,6 @@ impl SessionRuntime {
     ) {
         self.running_subagents.push(RunningSubagent {
             task_id,
-            terminal_tab,
             events,
             outcome,
             control,
@@ -520,7 +493,6 @@ impl SessionRuntime {
                 }
                 runtime_events.push(SubagentRuntimeEvent::Agent {
                     task_id: run.task_id.clone(),
-                    terminal_tab: run.terminal_tab,
                     event,
                 });
             }
@@ -539,7 +511,6 @@ impl SessionRuntime {
             if let Some(task) = self.finish_subagent_task(&run.task_id, outcome) {
                 runtime_events.push(SubagentRuntimeEvent::Finished {
                     task_id: run.task_id,
-                    terminal_tab: run.terminal_tab,
                     task,
                 });
             }
@@ -676,20 +647,6 @@ impl SessionRuntime {
         snapshot: &SubagentTranscriptSnapshot,
     ) -> Result<()> {
         self.transcript.append_subagent_presentation(snapshot)
-    }
-
-    pub fn terminal_tab_has_running_task(&self, terminal_tab: usize) -> bool {
-        self.task_manager
-            .terminal_tab_has_running_task(terminal_tab)
-    }
-
-    pub fn handle_terminal_tab_closed(&mut self, closed_index: usize) {
-        self.task_manager.handle_terminal_tab_closed(closed_index);
-        for run in &mut self.running_subagents {
-            if run.terminal_tab > closed_index {
-                run.terminal_tab -= 1;
-            }
-        }
     }
 
     pub fn handle_command(&mut self, command: RuntimeCommand) -> RuntimeEvent {
@@ -939,16 +896,13 @@ impl SessionRuntime {
                 runtime_context: RuntimeContext::with_time(
                     self.runtime_time_label.clone(),
                     config.runtime_current_dir,
-                    config.shell_tool_mode,
                 ),
                 conversation_permissions: self.conversation_permissions.clone(),
                 conversation,
                 active_progress: self.progress_state.pinned().cloned(),
                 current_user_message: prompt.clone(),
                 tool_results_dir: self.transcript.tool_results_dir(),
-                terminal_requests: self.terminal_request_tx.clone(),
                 task_requests: self.task_request_tx.clone(),
-                shell_tool_mode: config.shell_tool_mode,
                 read_file_state: self.read_file_state.clone(),
                 lsp_manager: self.lsp_manager.clone(),
                 dynamic_tools: self.mcp_manager.dynamic_tools(),
@@ -1148,13 +1102,12 @@ mod tests {
     fn subagent_runtime_events_carry_task_id() {
         let mut runtime = runtime();
         let request = subagent_request();
-        runtime.start_subagent_task(&request, 0).unwrap();
+        runtime.start_subagent_task(&request).unwrap();
         let (event_tx, event_rx) = mpsc::channel();
         let (_outcome_tx, outcome_rx) = mpsc::channel();
         let (control_tx, _control_rx) = mpsc::channel();
         runtime.attach_subagent_run(
             request.task_id.clone(),
-            0,
             event_rx,
             outcome_rx,
             control_tx,
@@ -1187,7 +1140,7 @@ mod tests {
     fn subagent_outcome_is_model_visible_but_not_ui_visible() {
         let mut runtime = runtime();
         let request = subagent_request();
-        runtime.start_subagent_task(&request, 0).unwrap();
+        runtime.start_subagent_task(&request).unwrap();
         runtime
             .finish_subagent_task("a1", SubagentOutcome::completed("done"))
             .unwrap();
@@ -1204,14 +1157,13 @@ mod tests {
     fn runtime_controls_and_completes_a_running_subagent() {
         let mut runtime = runtime();
         let request = subagent_request();
-        runtime.start_subagent_task(&request, 0).unwrap();
+        runtime.start_subagent_task(&request).unwrap();
         let (event_tx, event_rx) = mpsc::channel();
         let (outcome_tx, outcome_rx) = mpsc::channel();
         let (control_tx, control_rx) = mpsc::channel();
         let steering = Arc::new(SubagentSteering::default());
         runtime.attach_subagent_run(
             request.task_id.clone(),
-            0,
             event_rx,
             outcome_rx,
             control_tx,
@@ -1252,13 +1204,12 @@ mod tests {
     fn task_waiter_receives_completed_result_after_runtime_poll() {
         let mut runtime = runtime();
         let request = subagent_request();
-        runtime.start_subagent_task(&request, 0).unwrap();
+        runtime.start_subagent_task(&request).unwrap();
         let (_event_tx, event_rx) = mpsc::channel();
         let (outcome_tx, outcome_rx) = mpsc::channel();
         let (control_tx, _control_rx) = mpsc::channel();
         runtime.attach_subagent_run(
             request.task_id.clone(),
-            0,
             event_rx,
             outcome_rx,
             control_tx,

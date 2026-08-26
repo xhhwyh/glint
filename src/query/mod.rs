@@ -32,8 +32,7 @@ use crate::{
     services::tool_results::ToolResultBudget,
     settings::ProjectSettings,
     tasks::{SubagentSteering, TaskRequest},
-    terminal::TerminalRequest,
-    tools::{DynamicTool, ReadFileState, ShellToolMode, ToolRegistry},
+    tools::{DynamicTool, ReadFileState, ToolRegistry},
 };
 
 const MAX_TOOL_ITERATIONS: usize = 8;
@@ -49,9 +48,7 @@ pub struct AgentRunInput {
     pub active_progress: Option<TodoUpdate>,
     pub current_user_message: String,
     pub tool_results_dir: PathBuf,
-    pub terminal_requests: Sender<TerminalRequest>,
     pub task_requests: Sender<TaskRequest>,
-    pub shell_tool_mode: ShellToolMode,
     pub read_file_state: ReadFileState,
     pub lsp_manager: LspManager,
     pub dynamic_tools: Vec<Arc<dyn DynamicTool>>,
@@ -84,14 +81,10 @@ pub fn spawn_agent_loop(
 ) {
     thread::spawn(move || {
         let mut provider = OpenAiProvider::new(input.llm.clone());
-        let registry = ToolRegistry::with_shell_tool(
-            input.shell_tool_mode,
-            Some(input.terminal_requests.clone()),
-            Some(input.task_requests.clone()),
-        )
-        .with_lsp_manager(input.lsp_manager.clone())
-        .with_read_file_state(input.read_file_state.clone())
-        .with_dynamic_tools(input.dynamic_tools.clone());
+        let registry = ToolRegistry::with_task_requests(Some(input.task_requests.clone()))
+            .with_lsp_manager(input.lsp_manager.clone())
+            .with_read_file_state(input.read_file_state.clone())
+            .with_dynamic_tools(input.dynamic_tools.clone());
 
         match run_agent_loop(
             input,
@@ -123,7 +116,6 @@ pub fn spawn_subagent_loop(
     thread::spawn(move || {
         let mut provider = OpenAiProvider::new(input.llm.clone());
         let registry = ToolRegistry::for_subagent(Some(input.task_requests.clone()))
-            .with_terminal_channel(input.terminal_requests.clone())
             .with_lsp_manager(input.lsp_manager.clone())
             .with_read_file_state(input.read_file_state.clone())
             .with_dynamic_tools(input.dynamic_tools.clone());
@@ -747,9 +739,6 @@ fn execute_approved_cancellable(
 fn approval_explanation(call: &ToolCall) -> String {
     match call.name.as_str() {
         "Bash" => "This Bash command can modify project state and needs approval.".to_owned(),
-        "TerminalRun" => {
-            "This terminal command can modify project state and needs approval.".to_owned()
-        }
         "Edit" => "This Edit will modify a file and always needs approval unless allowed for this conversation.".to_owned(),
         _ => format!("{} needs approval before it can run.", call.name),
     }
@@ -914,7 +903,6 @@ mod tests {
     }
 
     fn input() -> AgentRunInput {
-        let (terminal_requests, _terminal_rx) = mpsc::channel();
         let (task_requests, _task_rx) = mpsc::channel();
         AgentRunInput {
             llm: LlmConfig {
@@ -950,14 +938,23 @@ mod tests {
             active_progress: None,
             current_user_message: "hello".to_owned(),
             tool_results_dir: std::env::temp_dir(),
-            terminal_requests,
             task_requests,
-            shell_tool_mode: ShellToolMode::Bash,
             read_file_state: ReadFileState::new(),
             lsp_manager: LspManager::new(LspConfig::default(), PathBuf::from("/workspace")),
             dynamic_tools: Vec::new(),
             hook_runner: HookRunner::default(),
         }
+    }
+
+    #[test]
+    fn query_registry_does_not_publish_terminal_run() {
+        let names = ToolRegistry::with_task_requests(None)
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+
+        assert!(!names.contains(&"TerminalRun".to_owned()));
     }
 
     fn final_response(text: &str) -> ModelResponse {
@@ -1353,17 +1350,6 @@ mod tests {
         );
         assert_eq!(
             summarize_tool_input(&ToolCall {
-                id: "terminal".to_owned(),
-                name: "TerminalRun".to_owned(),
-                arguments: json!({
-                    "command": "cargo test --lib",
-                    "description": "Run library tests"
-                }),
-            }),
-            "cargo test --lib"
-        );
-        assert_eq!(
-            summarize_tool_input(&ToolCall {
                 id: "edit".to_owned(),
                 name: "Edit".to_owned(),
                 arguments: json!({ "file_path": "src/main.rs" }),
@@ -1374,17 +1360,6 @@ mod tests {
 
     #[test]
     fn summarizes_shell_description_separately_from_command() {
-        assert_eq!(
-            summarize_tool_description(&ToolCall {
-                id: "terminal".to_owned(),
-                name: "TerminalRun".to_owned(),
-                arguments: json!({
-                    "command": "cargo test --lib",
-                    "description": "Run library tests"
-                }),
-            }),
-            Some("Run library tests".to_owned())
-        );
         assert_eq!(
             summarize_tool_description(&ToolCall {
                 id: "read".to_owned(),

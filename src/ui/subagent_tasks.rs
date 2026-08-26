@@ -128,12 +128,12 @@ mod tests {
     fn task(id: &str, status: TaskStatus) -> TaskSnapshot {
         TaskSnapshot {
             id: id.to_owned(),
+            tool_call_id: "call-subagent".to_owned(),
             kind: TaskKind::Subagent,
             status,
             description: "Inspect parser".to_owned(),
             backend: SubagentBackend::Codex,
             cwd: "/workspace".to_owned(),
-            terminal_tab: Some(1),
             started_at_ms: now_ms().saturating_sub(12_000),
             ended_at_ms: None,
             summary: None,

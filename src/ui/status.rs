@@ -117,11 +117,6 @@ fn status_general_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         .providers
         .iter()
         .find(|provider| provider.name == app.config.llm.provider);
-    let terminal_mode = if app.terminal_visible {
-        "TerminalRun"
-    } else {
-        "Bash"
-    };
     let terminal_status = terminal_status_label(app).trim().to_owned();
     let edit_permission = if app.edit_always_allowed() {
         "edit auto-approved"
@@ -136,7 +131,7 @@ fn status_general_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 ("State", format!("{:?}", app.status)),
                 ("Workspace", app.current_dir.clone()),
                 ("Terminal", terminal_status),
-                ("Shell tool", terminal_mode.to_owned()),
+                ("Shell tool", "Bash".to_owned()),
                 ("Permissions", edit_permission.to_owned()),
             ],
         },
@@ -335,11 +330,6 @@ fn status_task_lines(
             lines.push(status_kv_line("Activity", activity, width));
         }
         lines.push(status_kv_line("Cwd", &task.cwd, width));
-        lines.push(status_kv_line(
-            "Terminal",
-            &task_terminal_label(task),
-            width,
-        ));
         if let Some(summary) = task
             .summary
             .as_deref()
@@ -356,14 +346,8 @@ fn status_task_lines(
 
 fn task_list_line(task: &TaskSnapshot, selected: bool, width: usize) -> Line<'static> {
     let marker = if selected { ">" } else { " " };
-    let tab = task_terminal_label(task);
     let elapsed = task_elapsed_label(task);
-    let prefix = format!(
-        "{marker} {:<9} {:<4} {:<7} ",
-        task.status.label(),
-        task.id,
-        tab
-    );
+    let prefix = format!("{marker} {:<9} {:<4} ", task.status.label(), task.id);
     let suffix = format!(" {elapsed}");
     let description_width = width.saturating_sub(prefix.width() + suffix.width());
     let description = truncate_end_to_width(&task.description, description_width);
@@ -376,8 +360,6 @@ fn task_list_line(task: &TaskSnapshot, selected: bool, width: usize) -> Line<'st
         ),
         Span::raw(" "),
         Span::styled(format!("{:<4}", task.id), Style::default().fg(TEXT_COLOR)),
-        Span::raw(" "),
-        Span::styled(format!("{:<7}", tab), Style::default().fg(MUTED_TEXT_COLOR)),
         Span::styled(description, Style::default().fg(BORDER_BRIGHT_COLOR)),
         Span::raw(suffix),
     ])
@@ -390,12 +372,6 @@ fn task_status_style(status: TaskStatus) -> Style {
         TaskStatus::Failed | TaskStatus::Cancelled => Color::Red,
     };
     Style::default().fg(color).add_modifier(Modifier::BOLD)
-}
-
-fn task_terminal_label(task: &TaskSnapshot) -> String {
-    task.terminal_tab
-        .map(|tab| format!("tab{}", tab + 1))
-        .unwrap_or_else(|| "-".to_owned())
 }
 
 fn task_elapsed_label(task: &TaskSnapshot) -> String {
