@@ -115,7 +115,7 @@ agent thread -> AgentEvent -> AppEvent::Agent -> App::update -> ui::render
 - While the agent is not idle, text input is disabled and up/down scroll the transcript.
 - Assistant responses stream into the transcript as provider deltas arrive.
 - Conversation history is persisted and model requests include prior model history plus the current user request.
-- Tool execution supports Read, Glob, Grep, LSP, TerminalRun, Bash, Edit, and TodoWrite with approval, cancellation, read-only batching, visible agent-terminal command execution, progress checklist updates, and large-result budgeting.
+- Tool execution supports Read, Glob, Grep, LSP, Bash, Edit, and TodoWrite with approval, cancellation, read-only batching, Bash command execution with inline execution-card output, progress checklist updates, and large-result budgeting.
 - Plugins contribute namespaced commands, skills, specialized subagents, hooks, MCP servers, LSP servers, and settings.
 - MCP supports stdio and Streamable HTTP, bearer and OAuth authentication, tools, resources, prompts, notifications, cancellation, timeouts, approvals, and elicitation on an isolated Tokio runtime; the TUI remains synchronous.
 - No general model-request retries or multi-session tabs yet.

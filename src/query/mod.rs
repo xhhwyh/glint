@@ -81,10 +81,7 @@ pub fn spawn_agent_loop(
 ) {
     thread::spawn(move || {
         let mut provider = OpenAiProvider::new(input.llm.clone());
-        let registry = ToolRegistry::with_task_requests(Some(input.task_requests.clone()))
-            .with_lsp_manager(input.lsp_manager.clone())
-            .with_read_file_state(input.read_file_state.clone())
-            .with_dynamic_tools(input.dynamic_tools.clone());
+        let registry = main_tool_registry(&input);
 
         match run_agent_loop(
             input,
@@ -115,10 +112,7 @@ pub fn spawn_subagent_loop(
 ) {
     thread::spawn(move || {
         let mut provider = OpenAiProvider::new(input.llm.clone());
-        let registry = ToolRegistry::for_subagent(Some(input.task_requests.clone()))
-            .with_lsp_manager(input.lsp_manager.clone())
-            .with_read_file_state(input.read_file_state.clone())
-            .with_dynamic_tools(input.dynamic_tools.clone());
+        let registry = subagent_tool_registry(&input);
         let cwd = PathBuf::from(input.runtime_context.current_dir.clone());
         let result = crate::tools::with_tool_cwd(cwd, || {
             run_agent_loop(
@@ -158,6 +152,19 @@ pub fn spawn_subagent_loop(
             }
         }
     });
+}
+
+fn main_tool_registry(input: &AgentRunInput) -> ToolRegistry {
+    ToolRegistry::with_task_requests(Some(input.task_requests.clone()))
+        .with_lsp_manager(input.lsp_manager.clone())
+        .with_read_file_state(input.read_file_state.clone())
+        .with_dynamic_tools(input.dynamic_tools.clone())
+}
+
+fn subagent_tool_registry(input: &AgentRunInput) -> ToolRegistry {
+    ToolRegistry::for_subagent(Some(input.task_requests.clone()))
+        .with_lsp_manager(input.lsp_manager.clone())
+        .with_read_file_state(input.read_file_state.clone())
 }
 
 fn run_agent_loop(
@@ -844,7 +851,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        agent::provider::{ModelRole, ToolResult},
+        agent::provider::{ModelRole, ToolResult, ToolSpec},
         config::{LlmProviderConfig, LspConfig},
         settings::{ProjectPermissions, ProjectSettings},
     };
@@ -955,6 +962,50 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(!names.contains(&"TerminalRun".to_owned()));
+    }
+
+    struct FakeMcpTool;
+
+    impl DynamicTool for FakeMcpTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "mcp__test__echo".to_owned(),
+                description: "Echoes a test MCP payload.".to_owned(),
+                parameters: json!({"type":"object"}),
+            }
+        }
+
+        fn execute(&self, call: &ToolCall, _is_cancelled: &mut dyn FnMut() -> bool) -> ToolResult {
+            ToolResult {
+                call_id: call.id.clone(),
+                content: "dynamic tool result".to_owned(),
+                is_error: false,
+            }
+        }
+    }
+
+    #[test]
+    fn subagent_registry_excludes_dynamic_tools_while_main_keeps_them() {
+        let mut run_input = input();
+        run_input.dynamic_tools = vec![Arc::new(FakeMcpTool)];
+        let call = ToolCall {
+            id: "dynamic-tool".to_owned(),
+            name: "mcp__test__echo".to_owned(),
+            arguments: json!({}),
+        };
+
+        let main = main_tool_registry(&run_input);
+        let subagent = subagent_tool_registry(&run_input);
+
+        assert!(main.specs().iter().any(|spec| spec.name == call.name));
+        assert!(!subagent.specs().iter().any(|spec| spec.name == call.name));
+        assert_eq!(main.execute(&call).content, "dynamic tool result");
+        let subagent_result = subagent.execute(&call);
+        assert!(subagent_result.is_error);
+        assert_eq!(
+            subagent_result.content,
+            "Tool 'mcp__test__echo' is not registered."
+        );
     }
 
     fn final_response(text: &str) -> ModelResponse {
