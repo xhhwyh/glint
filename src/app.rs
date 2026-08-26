@@ -696,6 +696,31 @@ impl App {
         self.execution_scrolls.get(id).copied().unwrap_or_default()
     }
 
+    pub fn execution_has_unloaded_persisted_output(&self, id: &ExecutionId) -> bool {
+        match id {
+            ExecutionId::Tool(tool_call_id) => self
+                .messages
+                .iter()
+                .rev()
+                .find(|message| {
+                    message.role == Role::Tool
+                        && message.tool_name.as_deref() == Some("Bash")
+                        && message.tool_call_id.as_deref() == Some(tool_call_id)
+                })
+                .is_some_and(|message| self.has_unloaded_persisted_output(&message.content)),
+            ExecutionId::Task(task_id) => {
+                self.subagent_transcripts
+                    .get(task_id)
+                    .is_some_and(|transcript| {
+                        transcript.messages().iter().any(|message| {
+                            message.role == Role::Tool
+                                && self.has_unloaded_persisted_output(&message.content)
+                        })
+                    })
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub fn scroll_execution(&mut self, id: &ExecutionId, delta: i16) {
         let Some(max_output_scroll) = self
@@ -719,7 +744,9 @@ impl App {
     #[allow(dead_code)]
     pub fn set_execution_hitboxes(&mut self, hitboxes: Vec<ExecutionHitbox>) {
         for hitbox in &hitboxes {
-            if let Some(scroll) = self.execution_scrolls.get_mut(&hitbox.id) {
+            if hitbox.region == crate::execution::ExecutionRegion::Output
+                && let Some(scroll) = self.execution_scrolls.get_mut(&hitbox.id)
+            {
                 *scroll = (*scroll).min(hitbox.max_output_scroll);
             }
         }
@@ -799,6 +826,13 @@ impl App {
                 .map(|persisted| Cow::Owned(replace_persisted_output_marker(output, persisted)))
                 .unwrap_or(Cow::Borrowed(output)),
         }
+    }
+
+    fn has_unloaded_persisted_output(&self, output: &str) -> bool {
+        matches!(
+            ExecutionOutputSource::from_tool_output(output),
+            ExecutionOutputSource::Persisted(path) if !self.persisted_execution_outputs.contains_key(&path)
+        )
     }
 
     fn preload_expanded_execution(&mut self, id: &ExecutionId) {
@@ -4325,6 +4359,26 @@ mod tests {
 
         app.toggle_execution(id, 6);
         assert_eq!(app.scroll, 4);
+    }
+
+    #[test]
+    fn summary_hitbox_does_not_clamp_internal_execution_output_scroll() {
+        let mut app = App::test_empty();
+        let id = ExecutionId::Tool("call-1".to_owned());
+        app.execution_scrolls.insert(id.clone(), 5);
+
+        app.set_execution_hitboxes(vec![ExecutionHitbox {
+            id: id.clone(),
+            region: ExecutionRegion::Summary,
+            start_row: 0,
+            end_row: 1,
+            start_column: 0,
+            end_column: 80,
+            expansion_rows: 8,
+            max_output_scroll: 0,
+        }]);
+
+        assert_eq!(app.execution_scroll(&id), 5);
     }
 
     fn finished_tool_message(id: &str, name: &str, output: &str) -> Message {

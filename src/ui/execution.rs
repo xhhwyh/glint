@@ -71,8 +71,10 @@ pub(super) fn execution_card<'a>(
             Some(ExecutionCardView {
                 id: id.clone(),
                 name: "Subagent",
-                summary: transcript.description(),
-                description: Some(transcript.prompt()),
+                summary: transcript
+                    .activity()
+                    .unwrap_or_else(|| transcript.description()),
+                description: Some(transcript.description()),
                 status: status.label().to_owned(),
                 output: app.execution_output_view(&id)?,
                 finished: status.is_terminal(),
@@ -92,7 +94,8 @@ pub(super) fn execution_card_lines(
     _hover_fraction: f32,
 ) -> ExecutionCardLines {
     let width = width.max(1) as usize;
-    let summary = card_summary(card, width, expanded);
+    let output_lines = wrap_text(&card.output, (width.saturating_sub(4)) as u16);
+    let summary = card_summary(card, width, expanded, output_lines.len());
     let mut lines = vec![Line::from(""), Line::from(summary)];
     let mut regions = vec![None, Some(ExecutionRegion::Summary)];
 
@@ -105,11 +108,7 @@ pub(super) fn execution_card_lines(
         };
     }
 
-    let output_lines = wrap_text(&card.output, (width.saturating_sub(4)) as u16);
-    let max_output_scroll = output_lines
-        .len()
-        .saturating_sub(MAX_EXPANDED_OUTPUT_ROWS as usize) as u16;
-    let output_rows = output_lines.len().min(MAX_EXPANDED_OUTPUT_ROWS as usize) as u16;
+    let (output_rows, max_output_scroll) = output_metrics(output_lines.len());
     let output_scroll = output_scroll.min(max_output_scroll) as usize;
     let end = output_lines.len().saturating_sub(output_scroll);
     let start = end.saturating_sub(output_rows as usize);
@@ -140,7 +139,20 @@ fn tool_status(message: &Message) -> String {
     }
 }
 
-fn card_summary(card: &ExecutionCardView<'_>, width: usize, expanded: bool) -> Vec<Span<'static>> {
+fn output_metrics(output_row_count: usize) -> (u16, u16) {
+    let output_rows = output_row_count.min(MAX_EXPANDED_OUTPUT_ROWS as usize) as u16;
+    let max_output_scroll = output_row_count
+        .saturating_sub(MAX_EXPANDED_OUTPUT_ROWS as usize)
+        .min(u16::MAX as usize) as u16;
+    (output_rows, max_output_scroll)
+}
+
+fn card_summary(
+    card: &ExecutionCardView<'_>,
+    width: usize,
+    expanded: bool,
+    output_row_count: usize,
+) -> Vec<Span<'static>> {
     let details = if card.summary.trim().is_empty() {
         card.description.unwrap_or("")
     } else {
@@ -151,14 +163,13 @@ fn card_summary(card: &ExecutionCardView<'_>, width: usize, expanded: bool) -> V
     } else {
         "pending".to_owned()
     };
-    let output_count = card.output.lines().count();
     let hint = if expanded {
         "click to collapse"
     } else {
         "click to expand"
     };
     let prefix = format!("  ◇ {} ", card.name);
-    let suffix = format!(" · {status} · {output_count} lines · {hint}");
+    let suffix = format!(" · {status} · {output_row_count} lines · {hint}");
     let available = width.saturating_sub(prefix.width() + suffix.width());
     let details = truncate_end_to_width(details, available);
     let status_style = if card.is_error {
@@ -179,7 +190,7 @@ fn card_summary(card: &ExecutionCardView<'_>, width: usize, expanded: bool) -> V
         Span::styled(details, Style::default().fg(TEXT_COLOR)),
         Span::styled(format!(" · {status}"), status_style),
         Span::styled(
-            format!(" · {output_count} lines · {hint}"),
+            format!(" · {output_row_count} lines · {hint}"),
             Style::default().fg(MUTED_TEXT_COLOR),
         ),
     ]
@@ -189,6 +200,7 @@ fn card_summary(card: &ExecutionCardView<'_>, width: usize, expanded: bool) -> V
 mod tests {
     use super::*;
     use crate::{
+        agent::AgentEvent,
         subagent_transcript::{SubagentTranscript, SubagentTranscriptSnapshot},
         tasks::TaskStatus,
     };
@@ -271,5 +283,100 @@ mod tests {
         let mut unlinked_app = App::test_empty();
         unlinked_app.messages.push(linked);
         assert!(execution_card(&unlinked_app, &unlinked_app.messages[0]).is_none());
+    }
+
+    #[test]
+    fn running_subagent_card_uses_live_activity_in_its_summary() {
+        let mut app = App::test_empty();
+        app.messages.push(Message::tool_with_description(
+            "call-subagent",
+            "Subagent",
+            "inspect parser",
+            None,
+        ));
+        let mut transcript = SubagentTranscript::from_snapshot(SubagentTranscriptSnapshot {
+            task_id: "task-1".to_owned(),
+            tool_call_id: "call-subagent".to_owned(),
+            description: "inspect parser".to_owned(),
+            prompt: "inspect parser behavior".to_owned(),
+            messages: vec![Message::assistant("working")],
+            activity: Some("Thinking".to_owned()),
+            status: TaskStatus::Running,
+            tool_use_count: 0,
+        });
+        transcript.apply(&AgentEvent::ToolStarted {
+            id: "tool-1".to_owned(),
+            name: "Grep".to_owned(),
+            input_summary: "needle".to_owned(),
+            input_description: None,
+        });
+        app.subagent_transcripts
+            .insert("task-1".to_owned(), transcript);
+
+        let card = execution_card(&app, &app.messages[0]).expect("running card");
+        assert_eq!(card.summary, "Running Grep: needle");
+        assert_eq!(card.status, "running");
+    }
+
+    #[test]
+    fn summary_line_count_tracks_wrapped_output_at_the_current_width() {
+        let card = bash_card_with_output("0123456789abcdefghij".to_owned());
+        let narrow = execution_card_lines(&card, 20, false, 0, 0.0);
+        let wide = execution_card_lines(&card, 40, false, 0, 0.0);
+        let narrow_text = narrow
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<String>();
+        let wide_text = wide
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<String>();
+
+        assert!(narrow_text.contains("2 lines"));
+        assert!(wide_text.contains("1 lines"));
+    }
+
+    #[test]
+    fn output_metrics_saturate_for_more_than_u16_maximum_wrapped_rows() {
+        assert_eq!(
+            output_metrics(usize::MAX),
+            (MAX_EXPANDED_OUTPUT_ROWS, u16::MAX)
+        );
+    }
+
+    #[test]
+    fn expanded_output_offset_is_measured_from_the_bottom() {
+        let card = bash_card_with_output(
+            (1..=20)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let rendered = execution_card_lines(&card, 80, true, 3, 0.0)
+            .lines
+            .into_iter()
+            .skip(2)
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered.first().map(String::as_str), Some("    line 10"));
+        assert_eq!(rendered.last().map(String::as_str), Some("    line 17"));
     }
 }

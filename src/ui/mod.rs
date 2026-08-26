@@ -35,7 +35,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::app::{App, TextSelection};
 use crate::approval::ApprovalFocus;
 use crate::event::{ExtensionMouseAction, MouseAction};
-use crate::execution::{ExecutionHitbox, ExecutionId, ExecutionRegion};
+use crate::execution::{ExecutionHitbox, ExecutionId, ExecutionRegion, MAX_EXPANDED_OUTPUT_ROWS};
 use crate::message::{Message, Role};
 
 use layout::box_top;
@@ -144,7 +144,7 @@ fn render_document(frame: &mut Frame, app: &App, area: Rect) {
         composer_height,
     );
     let scroll = document_scroll_for_len(document.lines.len(), app.scroll, document_height);
-    let sticky_question = sticky_question_lines(app, &document, scroll, document_height, width);
+    let sticky_question = sticky_question_overlay(app, &document, scroll, document_height, width);
     let return_bottom_button_row = return_bottom_button_row(app.scroll, document_height);
     document.lines = apply_text_selection(document.lines, app.text_selection, width);
 
@@ -163,8 +163,7 @@ fn render_document(frame: &mut Frame, app: &App, area: Rect) {
                 document_area.y + visible_y,
             ));
         }
-        if let Some(lines) = sticky_question {
-            let sticky_height = (lines.len() as u16).min(document_height);
+        if let Some((lines, sticky_height)) = sticky_question {
             let sticky_area = Rect::new(area.x, area.y, area.width, sticky_height);
             frame.render_widget(Clear, sticky_area);
             frame.render_widget(
@@ -223,11 +222,18 @@ pub fn execution_hitboxes(app: &App, width: u16, height: u16) -> Vec<ExecutionHi
     let document = document(app, width);
     let viewport_height = document_viewport_height(app, width, height);
     let scroll = document_scroll_for_len(document.lines.len(), app.scroll, viewport_height);
+    let occluded_top = sticky_question_overlay(app, &document, scroll, viewport_height, width)
+        .map(|(_, height)| height)
+        .unwrap_or_default();
     let visible_end = (scroll as usize + viewport_height as usize).min(document.line_meta.len());
     let mut hitboxes = Vec::new();
     let mut row = scroll as usize;
 
     while row < visible_end {
+        if (row - scroll as usize) < occluded_top as usize {
+            row += 1;
+            continue;
+        }
         let Some((id, region)) = document.line_meta[row].execution.clone() else {
             row += 1;
             continue;
@@ -252,7 +258,11 @@ pub fn execution_hitboxes(app: &App, width: u16, height: u16) -> Vec<ExecutionHi
             start_column: 0,
             end_column: width,
             expansion_rows,
-            max_output_scroll,
+            max_output_scroll: if region == ExecutionRegion::Output {
+                max_output_scroll
+            } else {
+                0
+            },
         });
     }
 
@@ -348,6 +358,8 @@ fn document(app: &App, width: u16) -> Document {
                 execution::execution_card_lines(&card, width, expanded, output_scroll, 0.0);
             let expansion_metrics = if expanded {
                 (card_lines.output_rows, card_lines.max_output_scroll)
+            } else if app.execution_has_unloaded_persisted_output(&id) {
+                (MAX_EXPANDED_OUTPUT_ROWS, 0)
             } else {
                 let expanded_lines =
                     execution::execution_card_lines(&card, width, true, output_scroll, 0.0);
@@ -520,6 +532,18 @@ fn sticky_question_lines(
     let question = app.messages.get(question_index)?;
 
     Some(sticky_question_block(question, width))
+}
+
+fn sticky_question_overlay(
+    app: &App,
+    document: &Document,
+    scroll: u16,
+    height: u16,
+    width: u16,
+) -> Option<(Vec<Line<'static>>, u16)> {
+    let lines = sticky_question_lines(app, document, scroll, height, width)?;
+    let sticky_height = (lines.len() as u16).min(height);
+    Some((lines, sticky_height))
 }
 
 fn sticky_question_index(
@@ -771,7 +795,8 @@ mod tests {
         event::AppEvent,
         execution::{ExecutionId, ExecutionRegion},
         progress::{TodoItem, TodoStatus, TodoUpdate},
-        tasks::{SubagentBackend, SubagentRequest},
+        subagent_transcript::{SubagentTranscript, SubagentTranscriptSnapshot},
+        tasks::{SubagentBackend, SubagentRequest, TaskStatus},
         terminal::TerminalTab,
     };
     use ratatui::style::{Color, Modifier};
@@ -781,6 +806,12 @@ mod tests {
         message.content = output.to_owned();
         message.tool_finished = true;
         message
+    }
+
+    fn persisted_output_marker(path: &str) -> String {
+        format!(
+            "preview\n\n<persisted-output>\nFull Bash output was 60000 characters, exceeding the 50000 character tool-result budget. The full output was written to:\n{path}\nUse a narrower tool call if you need more focused output.\n</persisted-output>"
+        )
     }
 
     #[test]
@@ -852,6 +883,105 @@ mod tests {
         assert!(hitboxes.iter().any(|hitbox| {
             hitbox.id == id && hitbox.region == ExecutionRegion::Output && hitbox.start_row == 0
         }));
+    }
+
+    #[test]
+    fn sticky_question_occlusion_removes_top_execution_hitboxes_after_scroll() {
+        let mut app = App::test_empty();
+        app.messages.push(Message::user("What changed?"));
+        app.messages
+            .push(Message::assistant("I am checking the command output."));
+        let id = ExecutionId::Tool("call-bash".to_owned());
+        app.messages.push(finished_bash_message(
+            "call-bash",
+            "git log",
+            &(1..=20)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        app.toggle_execution(id.clone(), 8);
+        app.scroll = 1;
+
+        let document = document(&app, 80);
+        let viewport_height = document_viewport_height(&app, 80, 14);
+        let scroll = document_scroll_for_len(document.lines.len(), app.scroll, viewport_height);
+        let sticky_height = sticky_question_lines(&app, &document, scroll, viewport_height, 80)
+            .expect("sticky question")
+            .len() as u16;
+        let hitboxes = execution_hitboxes(&app, 80, 14);
+
+        assert!(sticky_height > 0);
+        assert!(hitboxes.iter().any(|hitbox| hitbox.id == id));
+        assert!(
+            hitboxes
+                .iter()
+                .all(|hitbox| hitbox.start_row >= sticky_height)
+        );
+    }
+
+    #[test]
+    fn collapsed_persisted_bash_hitbox_uses_capped_anchor_metrics_at_all_widths() {
+        let mut app = App::test_empty();
+        let id = ExecutionId::Tool("call-bash".to_owned());
+        app.messages.push(finished_bash_message(
+            "call-bash",
+            "git log",
+            &persisted_output_marker("/missing/bash-output.txt"),
+        ));
+
+        for width in [20, 80] {
+            let hitbox = execution_hitboxes(&app, width, 30)
+                .into_iter()
+                .find(|hitbox| hitbox.id == id && hitbox.region == ExecutionRegion::Summary)
+                .expect("summary hitbox");
+            assert_eq!(
+                hitbox.expansion_rows,
+                crate::execution::MAX_EXPANDED_OUTPUT_ROWS
+            );
+            assert_eq!(hitbox.max_output_scroll, 0);
+        }
+    }
+
+    #[test]
+    fn collapsed_persisted_subagent_hitbox_uses_capped_anchor_metrics() {
+        let mut app = App::test_empty();
+        let id = ExecutionId::Task("task-1".to_owned());
+        app.messages.push(Message::tool_with_description(
+            "call-subagent",
+            "Subagent",
+            "inspect parser",
+            None,
+        ));
+        app.subagent_transcripts.insert(
+            "task-1".to_owned(),
+            SubagentTranscript::from_snapshot(SubagentTranscriptSnapshot {
+                task_id: "task-1".to_owned(),
+                tool_call_id: "call-subagent".to_owned(),
+                description: "inspect parser".to_owned(),
+                prompt: "inspect parser behavior".to_owned(),
+                messages: vec![finished_bash_message(
+                    "nested-grep",
+                    "needle",
+                    &persisted_output_marker("/missing/subagent-output.txt"),
+                )],
+                activity: None,
+                status: TaskStatus::Running,
+                tool_use_count: 1,
+            }),
+        );
+
+        for width in [20, 80] {
+            let hitbox = execution_hitboxes(&app, width, 30)
+                .into_iter()
+                .find(|hitbox| hitbox.id == id && hitbox.region == ExecutionRegion::Summary)
+                .expect("summary hitbox");
+            assert_eq!(
+                hitbox.expansion_rows,
+                crate::execution::MAX_EXPANDED_OUTPUT_ROWS
+            );
+            assert_eq!(hitbox.max_output_scroll, 0);
+        }
     }
 
     #[test]
