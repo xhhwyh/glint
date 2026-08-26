@@ -114,6 +114,7 @@ fn user_rule(width: u16) -> Line<'static> {
 }
 
 fn tool_message_lines(message: &crate::message::Message, width: u16) -> Vec<Line<'static>> {
+    // `ui::document` projects Bash and linked Subagent messages before this generic fallback.
     let name = message.tool_name.as_deref().unwrap_or("Tool");
     let input = message.tool_input.as_deref().unwrap_or("");
 

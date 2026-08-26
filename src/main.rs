@@ -118,6 +118,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
             ui::document_viewport_height(&app, size.width, document_height),
             ui::document_scroll_top(&app, size.width, document_height),
         );
+        let execution_hitboxes = ui::execution_hitboxes(&app, size.width, document_height);
+        app.set_execution_hitboxes(execution_hitboxes);
         let (input_top_row, input_rows, input_content_width) =
             ui::composer_hitbox(&app, size.width, document_height);
         app.set_input_hitbox(input_top_row, input_rows, input_content_width);

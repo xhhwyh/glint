@@ -1,5 +1,6 @@
 mod approval;
 mod dashboard;
+mod execution;
 mod format;
 mod input_view;
 mod layout;
@@ -17,7 +18,10 @@ mod terminal;
 mod theme;
 mod transcript_view;
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use ratatui::{
     Frame,
@@ -31,6 +35,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::app::{App, TextSelection};
 use crate::approval::ApprovalFocus;
 use crate::event::{ExtensionMouseAction, MouseAction};
+use crate::execution::{ExecutionHitbox, ExecutionId, ExecutionRegion};
 use crate::message::{Message, Role};
 
 use layout::box_top;
@@ -76,6 +81,7 @@ pub fn extension_mouse_action(
 struct Document {
     lines: Vec<Line<'static>>,
     line_meta: Vec<DocumentLineMeta>,
+    execution_metrics: HashMap<ExecutionId, (u16, u16)>,
     cursor: Option<(u16, u16)>,
 }
 
@@ -88,10 +94,11 @@ struct Composer {
     cursor_y: u16,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct DocumentLineMeta {
     message_index: Option<usize>,
     role: Option<Role>,
+    execution: Option<(ExecutionId, ExecutionRegion)>,
 }
 
 pub fn render(frame: &mut Frame, app: &App) {
@@ -211,6 +218,47 @@ pub fn document_viewport_height(app: &App, width: u16, height: u16) -> u16 {
     height.saturating_sub(composer_visible_height(&composer, height))
 }
 
+pub fn execution_hitboxes(app: &App, width: u16, height: u16) -> Vec<ExecutionHitbox> {
+    let width = width.max(1);
+    let document = document(app, width);
+    let viewport_height = document_viewport_height(app, width, height);
+    let scroll = document_scroll_for_len(document.lines.len(), app.scroll, viewport_height);
+    let visible_end = (scroll as usize + viewport_height as usize).min(document.line_meta.len());
+    let mut hitboxes = Vec::new();
+    let mut row = scroll as usize;
+
+    while row < visible_end {
+        let Some((id, region)) = document.line_meta[row].execution.clone() else {
+            row += 1;
+            continue;
+        };
+        let start = row;
+        row += 1;
+        while row < visible_end
+            && document.line_meta[row].execution.as_ref() == Some(&(id.clone(), region))
+        {
+            row += 1;
+        }
+        let (expansion_rows, max_output_scroll) = document
+            .execution_metrics
+            .get(&id)
+            .copied()
+            .unwrap_or_default();
+        hitboxes.push(ExecutionHitbox {
+            id,
+            region,
+            start_row: (start - scroll as usize) as u16,
+            end_row: (row - scroll as usize) as u16,
+            start_column: 0,
+            end_column: width,
+            expansion_rows,
+            max_output_scroll,
+        });
+    }
+
+    hitboxes
+}
+
 pub fn selected_text(app: &App, width: u16) -> Option<String> {
     let selection = app.text_selection?;
     let document = document(app, width.max(1));
@@ -286,18 +334,47 @@ fn document_scroll_for_len(line_count: usize, scroll_offset: u16, height: u16) -
 fn document(app: &App, width: u16) -> Document {
     let mut lines = dashboard::idle_panel_lines(app, width);
     let mut line_meta = vec![DocumentLineMeta::default(); lines.len()];
+    let mut execution_metrics = HashMap::new();
     let has_status_line = app.processing_elapsed().is_some()
         || app.run_notice.is_some()
         || app.last_turn_duration().is_some();
 
     for (message_index, message) in app.messages.iter().enumerate() {
-        let message_lines = transcript_view::message_lines(message, width);
-        let meta = DocumentLineMeta {
-            message_index: Some(message_index),
-            role: Some(message.role),
-        };
-        line_meta.extend(vec![meta; message_lines.len()]);
-        lines.extend(message_lines);
+        if let Some(card) = execution::execution_card(app, message) {
+            let id = card.id.clone();
+            let expanded = app.is_execution_expanded(&id);
+            let output_scroll = app.execution_scroll(&id);
+            let card_lines =
+                execution::execution_card_lines(&card, width, expanded, output_scroll, 0.0);
+            let expansion_metrics = if expanded {
+                (card_lines.output_rows, card_lines.max_output_scroll)
+            } else {
+                let expanded_lines =
+                    execution::execution_card_lines(&card, width, true, output_scroll, 0.0);
+                (expanded_lines.output_rows, expanded_lines.max_output_scroll)
+            };
+            execution_metrics.insert(id.clone(), expansion_metrics);
+            line_meta.extend(
+                card_lines
+                    .regions
+                    .into_iter()
+                    .map(|region| DocumentLineMeta {
+                        message_index: Some(message_index),
+                        role: Some(message.role),
+                        execution: region.map(|region| (id.clone(), region)),
+                    }),
+            );
+            lines.extend(card_lines.lines);
+        } else {
+            let message_lines = transcript_view::message_lines(message, width);
+            let meta = DocumentLineMeta {
+                message_index: Some(message_index),
+                role: Some(message.role),
+                execution: None,
+            };
+            line_meta.extend(vec![meta; message_lines.len()]);
+            lines.extend(message_lines);
+        }
     }
     if !app.messages.is_empty() && !has_status_line {
         lines.push(Line::from(""));
@@ -339,6 +416,7 @@ fn document(app: &App, width: u16) -> Document {
     Document {
         lines,
         line_meta,
+        execution_metrics,
         cursor: approval_cursor,
     }
 }
@@ -691,11 +769,90 @@ mod tests {
         app::App,
         app::{ModelPicker, ModelPickerStage, TerminalTabSwitcher, TextPosition},
         event::AppEvent,
+        execution::{ExecutionId, ExecutionRegion},
         progress::{TodoItem, TodoStatus, TodoUpdate},
         tasks::{SubagentBackend, SubagentRequest},
         terminal::TerminalTab,
     };
     use ratatui::style::{Color, Modifier};
+
+    fn finished_bash_message(id: &str, input: &str, output: &str) -> Message {
+        let mut message = Message::tool_with_description(id, "Bash", input, None);
+        message.content = output.to_owned();
+        message.tool_finished = true;
+        message
+    }
+
+    #[test]
+    fn execution_hitboxes_follow_rendered_document_rows_for_adjacent_fetch_and_push() {
+        let mut app = App::test_empty();
+        let id = ExecutionId::Tool("call-bash".to_owned());
+        app.messages.push(finished_bash_message(
+            "call-bash",
+            "git remote update",
+            "origin repository (fetch)\norigin repository (push)",
+        ));
+
+        let collapsed = execution_hitboxes(&app, 80, 30);
+        let summary = collapsed
+            .iter()
+            .find(|hitbox| hitbox.id == id && hitbox.region == ExecutionRegion::Summary)
+            .expect("summary hitbox");
+        assert_eq!(summary.expansion_rows, 2);
+        assert!(
+            collapsed
+                .iter()
+                .all(|hitbox| hitbox.region != ExecutionRegion::Output)
+        );
+
+        app.toggle_execution(id.clone(), 8);
+        let document = document(&app, 80);
+        let rendered = document.lines.iter().map(line_text).collect::<Vec<_>>();
+        let fetch_row = rendered
+            .iter()
+            .position(|line| line.contains("(fetch)"))
+            .expect("fetch output");
+        let push_row = rendered
+            .iter()
+            .position(|line| line.contains("(push)"))
+            .expect("push output");
+        assert_eq!(push_row, fetch_row + 1);
+
+        let expanded = execution_hitboxes(&app, 80, 30);
+        let output = expanded
+            .iter()
+            .find(|hitbox| hitbox.id == id && hitbox.region == ExecutionRegion::Output)
+            .expect("output hitbox");
+        assert!(output.end_row - output.start_row <= 8);
+    }
+
+    #[test]
+    fn execution_hitboxes_clip_to_the_scrolled_document_viewport() {
+        let mut app = App::test_empty();
+        let id = ExecutionId::Tool("call-bash".to_owned());
+        app.messages.push(finished_bash_message(
+            "call-bash",
+            "git log",
+            &(1..=20)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        app.toggle_execution(id.clone(), 8);
+        app.scroll = 0;
+
+        let viewport_height = document_viewport_height(&app, 80, 14);
+        let hitboxes = execution_hitboxes(&app, 80, 14);
+
+        assert!(
+            hitboxes
+                .iter()
+                .all(|hitbox| hitbox.end_row <= viewport_height)
+        );
+        assert!(hitboxes.iter().any(|hitbox| {
+            hitbox.id == id && hitbox.region == ExecutionRegion::Output && hitbox.start_row == 0
+        }));
+    }
 
     #[test]
     fn token_labels_show_cached_percentage() {
@@ -1136,6 +1293,7 @@ mod tests {
         DocumentLineMeta {
             message_index: Some(message_index),
             role: Some(role),
+            execution: None,
         }
     }
 

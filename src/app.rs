@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, mpsc::Receiver},
@@ -679,6 +680,7 @@ impl App {
             return;
         }
 
+        self.preload_execution_output(&id);
         self.expanded_executions.insert(id);
         if self.scroll != 0 {
             self.scroll = self.scroll.saturating_add(expansion_rows);
@@ -688,6 +690,10 @@ impl App {
     #[allow(dead_code)]
     pub fn is_execution_expanded(&self, id: &ExecutionId) -> bool {
         self.expanded_executions.contains(id)
+    }
+
+    pub fn execution_scroll(&self, id: &ExecutionId) -> u16 {
+        self.execution_scrolls.get(id).copied().unwrap_or_default()
     }
 
     #[allow(dead_code)]
@@ -722,9 +728,14 @@ impl App {
 
     #[allow(dead_code)]
     pub fn execution_output(&mut self, id: &ExecutionId) -> Option<String> {
+        self.preload_execution_output(id);
+        self.execution_output_view(id).map(Cow::into_owned)
+    }
+
+    pub fn execution_output_view<'a>(&'a self, id: &ExecutionId) -> Option<Cow<'a, str>> {
         match id {
-            ExecutionId::Tool(tool_call_id) => self.bash_execution_output(tool_call_id),
-            ExecutionId::Task(task_id) => self.subagent_execution_output(task_id),
+            ExecutionId::Tool(tool_call_id) => self.bash_execution_output_view(tool_call_id),
+            ExecutionId::Task(task_id) => self.subagent_execution_output_view(task_id),
         }
     }
 
@@ -737,7 +748,7 @@ impl App {
     }
 
     #[allow(dead_code)]
-    fn bash_execution_output(&mut self, tool_call_id: &str) -> Option<String> {
+    fn bash_execution_output_view<'a>(&'a self, tool_call_id: &str) -> Option<Cow<'a, str>> {
         let output = self
             .messages
             .iter()
@@ -747,20 +758,21 @@ impl App {
                     && message.tool_name.as_deref() == Some("Bash")
                     && message.tool_call_id.as_deref() == Some(tool_call_id)
             })
-            .map(|message| message.content.clone())?;
+            .map(|message| message.content.as_str())?;
 
-        Some(self.project_tool_output(&output))
+        Some(self.project_cached_tool_output(output))
     }
 
-    #[allow(dead_code)]
-    fn subagent_execution_output(&mut self, task_id: &str) -> Option<String> {
-        let messages = self.subagent_transcripts.get(task_id)?.messages().to_vec();
+    fn subagent_execution_output_view(&self, task_id: &str) -> Option<Cow<'_, str>> {
+        let messages = self.subagent_transcripts.get(task_id)?.messages();
         let mut entries = Vec::new();
 
         for message in messages {
             let output = match message.role {
-                Role::Tool => self.project_tool_output(&message.content),
-                _ => message.content,
+                Role::Tool => self
+                    .project_cached_tool_output(&message.content)
+                    .into_owned(),
+                _ => message.content.clone(),
             };
             if output.is_empty() {
                 continue;
@@ -775,24 +787,62 @@ impl App {
             entries.push(format!("{label}: {output}"));
         }
 
-        Some(entries.join("\n\n"))
+        Some(Cow::Owned(entries.join("\n\n")))
     }
 
-    #[allow(dead_code)]
-    fn project_tool_output(&mut self, output: &str) -> String {
+    fn project_cached_tool_output<'a>(&'a self, output: &'a str) -> Cow<'a, str> {
         match ExecutionOutputSource::from_tool_output(output) {
-            ExecutionOutputSource::Inline(output) => output,
-            ExecutionOutputSource::Persisted(path) => self.replace_persisted_output(output, &path),
+            ExecutionOutputSource::Inline(_) => Cow::Borrowed(output),
+            ExecutionOutputSource::Persisted(path) => self
+                .persisted_execution_outputs
+                .get(&path)
+                .map(|persisted| Cow::Owned(replace_persisted_output_marker(output, persisted)))
+                .unwrap_or(Cow::Borrowed(output)),
         }
     }
 
-    #[allow(dead_code)]
-    fn replace_persisted_output(&mut self, output: &str, path: &Path) -> String {
-        let persisted_output = self.persisted_output(path);
-        replace_persisted_output_marker(output, &persisted_output)
+    fn preload_expanded_execution(&mut self, id: &ExecutionId) {
+        if self.is_execution_expanded(id) {
+            self.preload_execution_output(id);
+        }
     }
 
-    #[allow(dead_code)]
+    fn preload_execution_output(&mut self, id: &ExecutionId) {
+        let outputs = match id {
+            ExecutionId::Tool(tool_call_id) => self
+                .messages
+                .iter()
+                .rev()
+                .find(|message| {
+                    message.role == Role::Tool
+                        && message.tool_name.as_deref() == Some("Bash")
+                        && message.tool_call_id.as_deref() == Some(tool_call_id)
+                })
+                .map(|message| vec![message.content.clone()])
+                .unwrap_or_default(),
+            ExecutionId::Task(task_id) => self
+                .subagent_transcripts
+                .get(task_id)
+                .map(|transcript| {
+                    transcript
+                        .messages()
+                        .iter()
+                        .filter(|message| message.role == Role::Tool)
+                        .map(|message| message.content.clone())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+
+        for output in outputs {
+            if let ExecutionOutputSource::Persisted(path) =
+                ExecutionOutputSource::from_tool_output(&output)
+            {
+                self.persisted_output(&path);
+            }
+        }
+    }
+
     fn persisted_output(&mut self, path: &Path) -> String {
         self.persisted_execution_outputs
             .entry(path.to_path_buf())
@@ -1036,6 +1086,7 @@ impl App {
                     if let Some(transcript) = self.subagent_transcripts.get_mut(&task_id) {
                         transcript.apply(&event);
                     }
+                    self.preload_expanded_execution(&ExecutionId::Task(task_id.clone()));
                     self.update_subagent_tab_event(terminal_tab, &event);
                 }
                 SubagentRuntimeEvent::Finished {
@@ -3797,6 +3848,7 @@ impl App {
                     message.tool_finished = true;
                     message.tool_is_error = is_error;
                 }
+                self.preload_expanded_execution(&ExecutionId::Tool(id));
             }
             AgentEvent::ToolApprovalRequested(request) => {
                 self.status = AgentStatus::AwaitingApproval;
@@ -4384,6 +4436,61 @@ mod tests {
 
         assert!(output.contains("first file contents"));
         assert!(!output.contains("changed file contents"));
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn expanded_live_subagent_preloads_new_persisted_tool_output_without_caching_transcript() {
+        let mut app = App::test_empty();
+        let path = std::env::temp_dir().join(format!(
+            "glint-live-task-marker-{}.txt",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(&path, "first persisted result").expect("write persisted output");
+        app.subagent_transcripts.insert(
+            "a1".to_owned(),
+            task_transcript(vec![Message::assistant("before")]),
+        );
+        let id = ExecutionId::Task("a1".to_owned());
+        app.toggle_execution(id.clone(), 8);
+
+        let marker = persisted_output_marker(&path);
+        app.subagent_transcripts
+            .get_mut("a1")
+            .expect("transcript")
+            .apply(&AgentEvent::ToolStarted {
+                id: "tool-1".to_owned(),
+                name: "Grep".to_owned(),
+                input_summary: "needle".to_owned(),
+                input_description: None,
+            });
+        app.subagent_transcripts
+            .get_mut("a1")
+            .expect("transcript")
+            .apply(&AgentEvent::ToolFinished {
+                id: "tool-1".to_owned(),
+                name: "Grep".to_owned(),
+                output: marker,
+                is_error: false,
+                output_summary: "found result".to_owned(),
+            });
+
+        app.preload_expanded_execution(&id);
+        fs::write(&path, "changed persisted result").expect("change persisted output");
+
+        let output = app.execution_output_view(&id).expect("live task output");
+        assert!(output.contains("first persisted result"));
+        assert!(!output.contains("changed persisted result"));
+
+        app.subagent_transcripts
+            .get_mut("a1")
+            .expect("transcript")
+            .apply(&AgentEvent::AssistantDelta(" after".to_owned()));
+        assert!(
+            app.execution_output_view(&id)
+                .expect("updated live task output")
+                .contains("after")
+        );
         fs::remove_file(path).ok();
     }
 

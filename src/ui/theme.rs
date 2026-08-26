@@ -9,4 +9,5 @@ pub(super) const KEY_HINT_COLOR: Color = ACCENT_COLOR;
 pub(super) const TEXT_COLOR: Color = Color::Rgb(248, 250, 252);
 pub(super) const SOFT_TEXT_COLOR: Color = Color::Rgb(226, 232, 240);
 pub(super) const MUTED_TEXT_COLOR: Color = Color::Rgb(148, 163, 184);
+pub(super) const EXECUTION_OUTPUT_COLOR: Color = MUTED_TEXT_COLOR;
 pub(super) const CONTEXT_BAR_WIDTH: usize = 24;
