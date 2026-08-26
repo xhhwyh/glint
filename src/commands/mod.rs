@@ -89,7 +89,7 @@ pub const SLASH_COMMANDS: [BuiltinSlashCommand; 12] = [
     },
     BuiltinSlashCommand {
         name: "/terminal",
-        description: "Toggle the visible terminal and terminal-backed shell tool",
+        description: "Toggle the visible terminal",
         kind: SlashCommandKind::Terminal,
     },
 ];
@@ -139,6 +139,17 @@ mod tests {
         sorted.sort_unstable();
 
         assert_eq!(names, sorted);
+    }
+
+    #[test]
+    fn terminal_command_describes_only_the_visible_terminal() {
+        let terminal = SLASH_COMMANDS
+            .iter()
+            .find(|command| command.name == "/terminal")
+            .expect("terminal command is registered");
+
+        assert_eq!(terminal.description, "Toggle the visible terminal");
+        assert!(!terminal.description.contains("terminal-backed shell tool"));
     }
 
     #[test]
