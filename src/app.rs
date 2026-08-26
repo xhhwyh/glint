@@ -32,7 +32,7 @@ use crate::{
         McpApprovalPolicy, McpConfig, McpOAuthConfig, McpServerConfig, McpTransportConfig,
         persist_mcp_server,
     },
-    subagent_transcript::SubagentTranscript,
+    subagent_transcript::{SubagentTranscript, SubagentTranscriptSnapshot},
     tasks::{
         self, SubagentRequest, SubagentStartResponse, SubagentSteering, TaskRequest, TaskSnapshot,
     },
@@ -481,16 +481,8 @@ impl App {
             config.extensions.hooks.clone(),
         )?;
         let messages = runtime.ui_messages();
-        let subagent_transcripts = runtime
-            .ui_subagent_transcripts()
-            .into_iter()
-            .map(|snapshot| {
-                (
-                    snapshot.task_id.clone(),
-                    SubagentTranscript::from_snapshot(snapshot),
-                )
-            })
-            .collect();
+        let subagent_transcripts =
+            subagent_transcripts_by_task_id(runtime.ui_subagent_transcripts());
         let usage = runtime.usage();
         Ok(Self {
             should_quit: false,
@@ -1630,9 +1622,7 @@ impl App {
             self.close_resume_picker();
             return;
         };
-        self.messages = loaded.messages;
-        self.usage = loaded.usage;
-        self.scroll = 0;
+        self.apply_loaded_transcript(loaded);
         self.close_resume_picker();
     }
 
@@ -2653,16 +2643,7 @@ impl App {
     fn apply_loaded_transcript(&mut self, loaded: LoadedTranscript) {
         self.messages = loaded.messages;
         self.usage = loaded.usage;
-        self.subagent_transcripts = loaded
-            .subagent_transcripts
-            .into_iter()
-            .map(|snapshot| {
-                (
-                    snapshot.task_id.clone(),
-                    SubagentTranscript::from_snapshot(snapshot),
-                )
-            })
-            .collect();
+        self.subagent_transcripts = subagent_transcripts_by_task_id(loaded.subagent_transcripts);
         self.scroll = 0;
         self.approval = None;
     }
@@ -3999,6 +3980,21 @@ fn subagent_terminal_title(task: &TaskSnapshot) -> String {
     format!("codex {} {}", task.id, description)
 }
 
+fn subagent_transcripts_by_task_id(
+    snapshots: Vec<SubagentTranscriptSnapshot>,
+) -> BTreeMap<String, SubagentTranscript> {
+    tasks::reserve_task_ids(snapshots.iter().map(|snapshot| snapshot.task_id.as_str()));
+    snapshots
+        .into_iter()
+        .map(|snapshot| {
+            (
+                snapshot.task_id.clone(),
+                SubagentTranscript::from_snapshot(snapshot),
+            )
+        })
+        .collect()
+}
+
 fn current_dir_label() -> String {
     std::env::current_dir()
         .map(|path| home_relative_path(&path))
@@ -4033,7 +4029,6 @@ mod tests {
         agent::should_auto_compact,
         commands::SLASH_COMMANDS,
         plugins::PluginsConfig,
-        subagent_transcript::SubagentTranscriptSnapshot,
         tasks::{SubagentBackend, TaskStatus},
     };
 
@@ -4079,6 +4074,76 @@ mod tests {
 
         let transcript = app.subagent_transcripts.get("a1").expect("transcript");
         assert_eq!(transcript.tool_call_id(), "call-subagent");
+    }
+
+    #[test]
+    fn resume_confirmation_restores_subagent_transcripts() {
+        let mut app = app();
+        let path = std::env::temp_dir().join(format!(
+            "glint-app-resume-subagents-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        app.runtime = SessionRuntime::test_empty(path.clone(), "/workspace".to_owned());
+        app.runtime
+            .transcript_mut()
+            .append_subagent_presentation(&subagent_snapshot())
+            .unwrap();
+        app.resume_picker = Some(ResumePicker {
+            sessions: vec![TranscriptSessionSummary {
+                path,
+                session_id: "session-1".to_owned(),
+                title: "Resume task".to_owned(),
+                last_timestamp: 1,
+            }],
+            selected: 0,
+        });
+
+        app.confirm_resume_picker();
+
+        assert_eq!(
+            app.subagent_transcripts["a1"].tool_call_id(),
+            "call-subagent"
+        );
+    }
+
+    #[test]
+    fn resume_confirmation_reserves_restored_task_ids() {
+        let mut app = app();
+        let current = tasks::next_task_id()
+            .strip_prefix('a')
+            .expect("compact task id")
+            .parse::<u64>()
+            .expect("numeric task id");
+        let restored = current + 1_000;
+        let mut snapshot = subagent_snapshot();
+        snapshot.task_id = format!("a{restored}");
+        let path = std::env::temp_dir().join(format!(
+            "glint-app-resume-task-ids-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        app.runtime = SessionRuntime::test_empty(path.clone(), "/workspace".to_owned());
+        app.runtime
+            .transcript_mut()
+            .append_subagent_presentation(&snapshot)
+            .unwrap();
+        app.resume_picker = Some(ResumePicker {
+            sessions: vec![TranscriptSessionSummary {
+                path,
+                session_id: "session-1".to_owned(),
+                title: "Resume task".to_owned(),
+                last_timestamp: 1,
+            }],
+            selected: 0,
+        });
+
+        app.confirm_resume_picker();
+
+        let generated = tasks::next_task_id()
+            .strip_prefix('a')
+            .expect("compact task id")
+            .parse::<u64>()
+            .expect("numeric task id");
+        assert!(generated > restored);
     }
 
     #[test]

@@ -11,6 +11,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 pub const MAX_RUNNING_SUBAGENTS: usize = 2;
+static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskKind {
@@ -359,8 +360,19 @@ impl TaskManager {
 }
 
 pub fn next_task_id() -> String {
-    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-    format!("a{}", NEXT_ID.fetch_add(1, Ordering::Relaxed))
+    format!("a{}", NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+pub fn reserve_task_ids<'a>(task_ids: impl IntoIterator<Item = &'a str>) {
+    let next_id = task_ids
+        .into_iter()
+        .filter_map(|task_id| task_id.strip_prefix('a'))
+        .filter_map(|number| number.parse::<u64>().ok())
+        .filter_map(|number| number.checked_add(1))
+        .max();
+    if let Some(next_id) = next_id {
+        NEXT_TASK_ID.fetch_max(next_id, Ordering::Relaxed);
+    }
 }
 
 pub fn task_started_message(task: &TaskSnapshot) -> String {
@@ -474,6 +486,20 @@ mod tests {
             backend: SubagentBackend::Codex,
             cwd: "/tmp".to_owned(),
         }
+    }
+
+    #[test]
+    fn reserving_restored_task_ids_advances_next_task_id() {
+        const RESTORED_ID: u64 = 1_000_000;
+        reserve_task_ids(["not-a-task", "a12x", "a1000000"]);
+
+        let generated = next_task_id()
+            .strip_prefix('a')
+            .expect("compact task id")
+            .parse::<u64>()
+            .expect("numeric task id");
+
+        assert!(generated > RESTORED_ID);
     }
 
     #[test]
