@@ -3729,7 +3729,7 @@ fn home_relative_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, time::Duration};
+    use std::{fs, path::PathBuf, time::Duration};
 
     use crate::{
         agent::provider::{FinishReason, ToolCall},
@@ -3740,11 +3740,20 @@ mod tests {
         runtime::AssistantRecord,
         tasks::{SubagentBackend, TaskStatus},
     };
+    use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
 
     fn app() -> App {
         App::test_empty()
+    }
+
+    struct RemoveFileOnDrop(PathBuf);
+
+    impl Drop for RemoveFileOnDrop {
+        fn drop(&mut self) {
+            fs::remove_file(&self.0).ok();
+        }
     }
 
     fn finished_bash_message(id: &str, output: &str) -> Message {
@@ -4500,6 +4509,7 @@ mod tests {
             "glint-resumed-subagent-card-{}.jsonl",
             uuid::Uuid::new_v4()
         ));
+        let _cleanup = RemoveFileOnDrop(path.clone());
         app.runtime = SessionRuntime::test_empty(path.clone(), "/workspace".to_owned());
         let request = subagent_request();
         app.runtime.record_assistant(AssistantRecord {
@@ -4620,18 +4630,43 @@ mod tests {
         assert!(!app.is_execution_expanded(&bash_id));
 
         app.toggle_execution(bash_id.clone(), 8);
-        assert!(
-            app.execution_output(&bash_id)
-                .expect("resumed Bash output")
-                .contains("(fetch)")
-        );
         app.toggle_execution(subagent_id.clone(), 8);
+        assert!(app.is_execution_expanded(&bash_id));
+        assert!(app.is_execution_expanded(&subagent_id));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("test terminal");
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .expect("render resumed execution cards");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
         assert!(
-            app.execution_output(&subagent_id)
-                .expect("resumed subagent output")
-                .contains("src/parser.rs")
+            rendered.contains("◇ Bash") && rendered.contains("◇ Subagent"),
+            "resumed originating Bash and Subagent calls must project to cards"
         );
-        std::fs::remove_file(path).ok();
+        assert!(rendered.contains("(fetch)"));
+        assert!(rendered.contains("src/parser.rs"));
+
+        let resumed_history = app.runtime.model_history();
+        let resumed_outcome_count = resumed_history
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .map(|content| content.matches("<subagent-outcome>").count())
+            .sum::<usize>();
+        assert_eq!(resumed_outcome_count, 1);
+        assert!(
+            resumed_history
+                .iter()
+                .filter_map(|message| message.content.as_deref())
+                .all(|content| !content.contains("Parser is inspected.")
+                    && !content.contains("src/parser.rs")),
+            "presentation-only nested transcript content must not enter resumed model history"
+        );
     }
 
     #[test]

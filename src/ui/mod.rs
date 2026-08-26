@@ -820,6 +820,22 @@ mod tests {
         buffer_rows(terminal)
     }
 
+    fn assert_buffer_occurrences(
+        terminal: &mut Terminal<TestBackend>,
+        app: &App,
+        expected: usize,
+        frame: &str,
+    ) {
+        let buffer = render_execution_frame(terminal, app).concat();
+        for marker in ["(fetch)", "(push)"] {
+            assert_eq!(
+                buffer.matches(marker).count(),
+                expected,
+                "{marker} occurrence count in {frame}"
+            );
+        }
+    }
+
     #[test]
     fn git_remote_output_survives_main_and_internal_scroll_without_stale_collapsed_rows() {
         let mut app = App::test_empty();
@@ -835,49 +851,48 @@ mod tests {
             "git remote -v && git log -1 --format='%h %ci %s'",
             "origin\thttps://github.com/xhhwyh/glint.git (fetch)\norigin\thttps://github.com/xhhwyh/glint.git (push)\n186bba1 2026-08-12 11:44:19 +0800 merge: integrate subagent task control",
         ));
-        let mut terminal = Terminal::new(TestBackend::new(100, 28)).expect("test terminal");
-
         app.toggle_execution(id.clone(), 8);
-        for scroll in [0, 1, 0] {
-            app.scroll = scroll;
-            let rows = render_execution_frame(&mut terminal, &app);
-            assert_eq!(
-                rows.iter().filter(|row| row.contains("(fetch)")).count(),
-                1,
-                "fetch row at document scroll {scroll}"
-            );
-            assert_eq!(
-                rows.iter().filter(|row| row.contains("(push)")).count(),
-                1,
-                "push row at document scroll {scroll}"
-            );
-        }
-
-        let mut narrow_terminal = Terminal::new(TestBackend::new(15, 28)).expect("test terminal");
-        let narrow_before = render_execution_frame(&mut narrow_terminal, &app);
-        let hitboxes = execution_hitboxes(&app, 15, 28);
+        let mut narrow_terminal = Terminal::new(TestBackend::new(25, 28)).expect("test terminal");
+        let hitboxes = execution_hitboxes(&app, 25, 28);
+        let max_output_scroll = hitboxes
+            .iter()
+            .filter(|hitbox| hitbox.id == id)
+            .map(|hitbox| hitbox.max_output_scroll)
+            .max()
+            .expect("execution hitbox");
+        assert_eq!(max_output_scroll, 2);
         assert!(
-            hitboxes
-                .iter()
-                .any(|hitbox| hitbox.id == id && hitbox.max_output_scroll > 0),
+            max_output_scroll > 0,
             "narrow TestBackend fixture must expose internal output scrolling"
         );
         app.set_execution_hitboxes(hitboxes);
-        app.scroll_execution(&id, 1);
-        let narrow_scrolled = render_execution_frame(&mut narrow_terminal, &app);
-        assert_ne!(
-            narrow_scrolled, narrow_before,
-            "internal output scrolling must redraw the narrow buffer"
-        );
+
+        for (output_scroll, document_scroll) in (0..=max_output_scroll).zip([0, 1, 0]) {
+            while app.execution_scroll(&id) < output_scroll {
+                app.scroll_execution(&id, 1);
+            }
+            app.scroll = document_scroll;
+            assert_buffer_occurrences(
+                &mut narrow_terminal,
+                &app,
+                1,
+                &format!("narrow expanded output {output_scroll}, document {document_scroll}"),
+            );
+        }
+
+        let mut wide_terminal = Terminal::new(TestBackend::new(100, 28)).expect("test terminal");
+        for document_scroll in [0, 1, 0] {
+            app.scroll = document_scroll;
+            assert_buffer_occurrences(
+                &mut wide_terminal,
+                &app,
+                1,
+                &format!("wide expanded document {document_scroll}"),
+            );
+        }
 
         app.toggle_execution(id, 8);
-        let collapsed_rows = render_execution_frame(&mut terminal, &app);
-        assert!(
-            collapsed_rows
-                .iter()
-                .all(|row| !row.contains("(fetch)") && !row.contains("(push)")),
-            "collapsed render must clear rows emitted by the expanded frame"
-        );
+        assert_buffer_occurrences(&mut narrow_terminal, &app, 0, "narrow collapsed");
     }
 
     #[test]
