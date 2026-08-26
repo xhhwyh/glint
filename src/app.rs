@@ -61,8 +61,6 @@ pub struct App {
     #[allow(dead_code)]
     execution_scrolls: HashMap<ExecutionId, u16>,
     #[allow(dead_code)]
-    execution_outputs: HashMap<ExecutionId, String>,
-    #[allow(dead_code)]
     persisted_execution_outputs: HashMap<PathBuf, String>,
     #[allow(dead_code)]
     execution_hitboxes: Vec<ExecutionHitbox>,
@@ -512,7 +510,6 @@ impl App {
             scroll: 0,
             expanded_executions: HashSet::new(),
             execution_scrolls: HashMap::new(),
-            execution_outputs: HashMap::new(),
             persisted_execution_outputs: HashMap::new(),
             execution_hitboxes: Vec::new(),
             hovered_execution: None,
@@ -567,7 +564,6 @@ impl App {
             scroll: 0,
             expanded_executions: HashSet::new(),
             execution_scrolls: HashMap::new(),
-            execution_outputs: HashMap::new(),
             persisted_execution_outputs: HashMap::new(),
             execution_hitboxes: Vec::new(),
             hovered_execution: None,
@@ -683,7 +679,6 @@ impl App {
             return;
         }
 
-        self.resolve_execution_output(&id);
         self.expanded_executions.insert(id);
         if self.scroll != 0 {
             self.scroll = self.scroll.saturating_add(expansion_rows);
@@ -728,7 +723,7 @@ impl App {
     #[allow(dead_code)]
     pub fn execution_output(&mut self, id: &ExecutionId) -> Option<String> {
         match id {
-            ExecutionId::Tool(_) => self.execution_outputs.get(id).cloned(),
+            ExecutionId::Tool(tool_call_id) => self.bash_execution_output(tool_call_id),
             ExecutionId::Task(task_id) => self.subagent_execution_output(task_id),
         }
     }
@@ -742,15 +737,8 @@ impl App {
     }
 
     #[allow(dead_code)]
-    fn resolve_execution_output(&mut self, id: &ExecutionId) {
-        if self.execution_outputs.contains_key(id) {
-            return;
-        }
-
-        let ExecutionId::Tool(tool_call_id) = id else {
-            return;
-        };
-        let Some(output) = self
+    fn bash_execution_output(&mut self, tool_call_id: &str) -> Option<String> {
+        let output = self
             .messages
             .iter()
             .rev()
@@ -759,16 +747,9 @@ impl App {
                     && message.tool_name.as_deref() == Some("Bash")
                     && message.tool_call_id.as_deref() == Some(tool_call_id)
             })
-            .map(|message| message.content.clone())
-        else {
-            return;
-        };
+            .map(|message| message.content.clone())?;
 
-        let display_output = match ExecutionOutputSource::from_tool_output(&output) {
-            ExecutionOutputSource::Inline(output) => output,
-            ExecutionOutputSource::Persisted(path) => self.replace_persisted_output(&output, &path),
-        };
-        self.execution_outputs.insert(id.clone(), display_output);
+        Some(self.project_tool_output(&output))
     }
 
     #[allow(dead_code)]
@@ -778,12 +759,7 @@ impl App {
 
         for message in messages {
             let output = match message.role {
-                Role::Tool => match ExecutionOutputSource::from_tool_output(&message.content) {
-                    ExecutionOutputSource::Inline(output) => output,
-                    ExecutionOutputSource::Persisted(path) => {
-                        self.replace_persisted_output(&message.content, &path)
-                    }
-                },
+                Role::Tool => self.project_tool_output(&message.content),
                 _ => message.content,
             };
             if output.is_empty() {
@@ -800,6 +776,14 @@ impl App {
         }
 
         Some(entries.join("\n\n"))
+    }
+
+    #[allow(dead_code)]
+    fn project_tool_output(&mut self, output: &str) -> String {
+        match ExecutionOutputSource::from_tool_output(output) {
+            ExecutionOutputSource::Inline(output) => output,
+            ExecutionOutputSource::Persisted(path) => self.replace_persisted_output(output, &path),
+        }
     }
 
     #[allow(dead_code)]
@@ -2825,11 +2809,22 @@ impl App {
     }
 
     fn apply_loaded_transcript(&mut self, loaded: LoadedTranscript) {
+        self.reset_execution_presentation();
         self.messages = loaded.messages;
         self.usage = loaded.usage;
         self.subagent_transcripts = subagent_transcripts_by_task_id(loaded.subagent_transcripts);
         self.scroll = 0;
         self.approval = None;
+    }
+
+    fn reset_execution_presentation(&mut self) {
+        self.expanded_executions.clear();
+        self.execution_scrolls.clear();
+        self.persisted_execution_outputs.clear();
+        self.execution_hitboxes.clear();
+        self.hovered_execution = None;
+        self.previous_hovered_execution = None;
+        self.hover_changed_at = None;
     }
 
     fn clamp_slash_command_selection(&mut self) {
@@ -3790,6 +3785,7 @@ impl App {
                 if name == "Read" {
                     if let Some(message) = self.find_tool_message(&id) {
                         message.tool_finished = true;
+                        message.tool_is_error = is_error;
                     }
                     return;
                 }
@@ -3799,6 +3795,7 @@ impl App {
                 }) {
                     message.content = output;
                     message.tool_finished = true;
+                    message.tool_is_error = is_error;
                 }
             }
             AgentEvent::ToolApprovalRequested(request) => {
@@ -4388,6 +4385,148 @@ mod tests {
         assert!(output.contains("first file contents"));
         assert!(!output.contains("changed file contents"));
         fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn resume_confirmation_resets_execution_state_and_path_cache_for_reused_task_id() {
+        let mut app = app();
+        let path =
+            std::env::temp_dir().join(format!("glint-resume-output-{}.txt", uuid::Uuid::new_v4()));
+        fs::write(&path, "old persisted output").expect("write old output");
+        let id = ExecutionId::Task("a1".to_owned());
+        app.subagent_transcripts.insert(
+            "a1".to_owned(),
+            task_transcript(vec![finished_tool_message(
+                "old-tool",
+                "Grep",
+                &persisted_output_marker(&path),
+            )]),
+        );
+        app.toggle_execution(id.clone(), 6);
+        assert!(
+            app.execution_output(&id)
+                .expect("old task output")
+                .contains("old persisted output")
+        );
+        app.execution_scrolls.insert(id.clone(), 3);
+        app.set_execution_hitboxes(vec![ExecutionHitbox {
+            id: id.clone(),
+            region: ExecutionRegion::Output,
+            start_row: 0,
+            end_row: 6,
+            start_column: 0,
+            end_column: 80,
+            expansion_rows: 6,
+            max_output_scroll: 3,
+        }]);
+        app.set_hovered_execution(Some(id.clone()));
+
+        fs::write(&path, "resumed persisted output").expect("replace output");
+        let mut snapshot = subagent_snapshot();
+        snapshot.messages = vec![finished_tool_message(
+            "resumed-tool",
+            "Grep",
+            &persisted_output_marker(&path),
+        )];
+        let resume_path = std::env::temp_dir().join(format!(
+            "glint-app-resume-execution-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        app.runtime = SessionRuntime::test_empty(resume_path.clone(), "/workspace".to_owned());
+        app.runtime
+            .transcript_mut()
+            .append_subagent_presentation(&snapshot)
+            .expect("append resumed transcript");
+        app.resume_picker = Some(ResumePicker {
+            sessions: vec![TranscriptSessionSummary {
+                path: resume_path,
+                session_id: "session-1".to_owned(),
+                title: "Resume execution".to_owned(),
+                last_timestamp: 1,
+            }],
+            selected: 0,
+        });
+
+        app.confirm_resume_picker();
+
+        assert!(!app.is_execution_expanded(&id));
+        assert!(!app.execution_scrolls.contains_key(&id));
+        assert!(app.execution_hitboxes.is_empty());
+        assert!(app.hovered_execution.is_none());
+        assert!(app.previous_hovered_execution.is_none());
+        assert!(app.hover_changed_at.is_none());
+        assert!(
+            app.execution_output(&id)
+                .expect("resumed task output")
+                .contains("resumed persisted output")
+        );
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn clear_command_resets_execution_presentation_state() {
+        let mut app = app();
+        let id = ExecutionId::Tool("call-1".to_owned());
+        app.toggle_execution(id.clone(), 6);
+        app.execution_scrolls.insert(id.clone(), 2);
+        app.execution_hitboxes.push(ExecutionHitbox {
+            id: id.clone(),
+            region: ExecutionRegion::Summary,
+            start_row: 0,
+            end_row: 1,
+            start_column: 0,
+            end_column: 80,
+            expansion_rows: 6,
+            max_output_scroll: 2,
+        });
+        app.set_hovered_execution(Some(id.clone()));
+        app.persisted_execution_outputs.insert(
+            std::env::temp_dir().join("old-execution-output"),
+            "old".to_owned(),
+        );
+        app.input.set("/clear");
+
+        let command = SLASH_COMMANDS
+            .iter()
+            .find(|command| command.name == "/clear")
+            .copied()
+            .expect("clear command");
+        app.run_slash_command(command);
+
+        assert!(!app.is_execution_expanded(&id));
+        assert!(app.execution_scrolls.is_empty());
+        assert!(app.persisted_execution_outputs.is_empty());
+        assert!(app.execution_hitboxes.is_empty());
+        assert!(app.hovered_execution.is_none());
+        assert!(app.previous_hovered_execution.is_none());
+        assert!(app.hover_changed_at.is_none());
+    }
+
+    #[test]
+    fn running_bash_expansion_projects_finished_output_and_error_state() {
+        let mut app = app();
+        let id = ExecutionId::Tool("call-1".to_owned());
+        app.update_agent(AgentEvent::ToolStarted {
+            id: "call-1".to_owned(),
+            name: "Bash".to_owned(),
+            input_summary: "false".to_owned(),
+            input_description: None,
+        });
+
+        app.toggle_execution(id.clone(), 6);
+        assert_eq!(app.execution_output(&id).as_deref(), Some(""));
+
+        app.update_agent(AgentEvent::ToolFinished {
+            id: "call-1".to_owned(),
+            name: "Bash".to_owned(),
+            output: "command failed".to_owned(),
+            is_error: true,
+            output_summary: "failed".to_owned(),
+        });
+
+        assert_eq!(app.execution_output(&id).as_deref(), Some("command failed"));
+        assert!(app.messages[0].tool_finished);
+        assert!(app.messages[0].tool_is_error);
     }
 
     fn subagent_request() -> SubagentRequest {
