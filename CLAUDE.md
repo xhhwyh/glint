@@ -104,7 +104,7 @@ agent thread -> AgentEvent -> AppEvent::Agent -> App::update -> ui::render
 - `src/services/`: cross-cutting agent services such as tool-result budgeting.
 - `src/services/mcp/`: persistent MCP client runtime, transports, OAuth, elicitation, dynamic tools, resources, and prompts.
 - `src/plugins/`: local/Git plugin discovery, manifests, commands, skills, agents, hooks, settings, MCP, and LSP contributions.
-- `src/terminal.rs`: persistent agent PTY, visible non-interactive terminal command execution, sentinel parsing, and terminal output truncation.
+- `src/terminal.rs`: persistent interactive PTY tabs, styled scrollback, input, resizing, and process-title tracking.
 - `src/tools/`: Glint tool registry, `utils.rs` helpers, and per-tool directories with local descriptions.
 - `src/transcript.rs`: session persistence, resume summaries, model history, and UI-message reconstruction.
 - `src/ui/`: state-driven, side-effect-free rendering; includes layout, markdown, and idle star mark.
