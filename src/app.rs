@@ -37,6 +37,7 @@ use crate::{
         McpApprovalPolicy, McpConfig, McpOAuthConfig, McpServerConfig, McpTransportConfig,
         persist_mcp_server,
     },
+    services::tool_results::tool_result_artifact_path,
     subagent_transcript::{SubagentTranscript, SubagentTranscriptSnapshot},
     tasks::{
         self, SubagentRequest, SubagentStartResponse, SubagentSteering, TaskRequest, TaskSnapshot,
@@ -58,6 +59,8 @@ pub struct App {
     expanded_executions: HashSet<ExecutionId>,
     #[allow(dead_code)]
     execution_scrolls: HashMap<ExecutionId, u16>,
+    #[allow(dead_code)]
+    execution_expansion_rows: HashMap<ExecutionId, u16>,
     #[allow(dead_code)]
     persisted_execution_outputs: HashMap<PathBuf, String>,
     #[allow(dead_code)]
@@ -492,6 +495,7 @@ impl App {
             scroll: 0,
             expanded_executions: HashSet::new(),
             execution_scrolls: HashMap::new(),
+            execution_expansion_rows: HashMap::new(),
             persisted_execution_outputs: HashMap::new(),
             execution_hitboxes: Vec::new(),
             hovered_execution: None,
@@ -534,6 +538,7 @@ impl App {
             scroll: 0,
             expanded_executions: HashSet::new(),
             execution_scrolls: HashMap::new(),
+            execution_expansion_rows: HashMap::new(),
             persisted_execution_outputs: HashMap::new(),
             execution_hitboxes: Vec::new(),
             hovered_execution: None,
@@ -630,6 +635,10 @@ impl App {
 
     pub fn toggle_execution(&mut self, id: ExecutionId, expansion_rows: u16) {
         if self.expanded_executions.remove(&id) {
+            let expansion_rows = self
+                .execution_expansion_rows
+                .remove(&id)
+                .unwrap_or(expansion_rows);
             if self.scroll != 0 {
                 self.scroll = self.scroll.saturating_sub(expansion_rows);
             }
@@ -637,7 +646,8 @@ impl App {
         }
 
         self.preload_execution_output(&id);
-        self.expanded_executions.insert(id);
+        self.expanded_executions.insert(id.clone());
+        self.execution_expansion_rows.insert(id, expansion_rows);
         if self.scroll != 0 {
             self.scroll = self.scroll.saturating_add(expansion_rows);
         }
@@ -662,14 +672,14 @@ impl App {
                         && message.tool_name.as_deref() == Some("Bash")
                         && message.tool_call_id.as_deref() == Some(tool_call_id)
                 })
-                .is_some_and(|message| self.has_unloaded_persisted_output(&message.content)),
+                .is_some_and(|message| self.has_unloaded_persisted_output(message)),
             ExecutionId::Task(task_id) => {
                 self.subagent_transcripts
                     .get(task_id)
                     .is_some_and(|transcript| {
                         transcript.messages().iter().any(|message| {
                             message.role == Role::Tool
-                                && self.has_unloaded_persisted_output(&message.content)
+                                && self.has_unloaded_persisted_output(message)
                         })
                     })
             }
@@ -697,10 +707,28 @@ impl App {
 
     pub fn set_execution_hitboxes(&mut self, hitboxes: Vec<ExecutionHitbox>) {
         for hitbox in &hitboxes {
-            if hitbox.region == ExecutionRegion::Output
-                && let Some(scroll) = self.execution_scrolls.get_mut(&hitbox.id)
-            {
-                *scroll = (*scroll).min(hitbox.max_output_scroll);
+            if hitbox.region == ExecutionRegion::Output {
+                if let Some(scroll) = self.execution_scrolls.get_mut(&hitbox.id) {
+                    *scroll = (*scroll).min(hitbox.max_output_scroll);
+                }
+                if self.expanded_executions.contains(&hitbox.id) {
+                    let stored_rows = self
+                        .execution_expansion_rows
+                        .entry(hitbox.id.clone())
+                        .or_insert(hitbox.expansion_rows);
+                    if self.scroll != 0 {
+                        if hitbox.expansion_rows >= *stored_rows {
+                            self.scroll = self
+                                .scroll
+                                .saturating_add(hitbox.expansion_rows - *stored_rows);
+                        } else {
+                            self.scroll = self
+                                .scroll
+                                .saturating_sub(*stored_rows - hitbox.expansion_rows);
+                        }
+                    }
+                    *stored_rows = hitbox.expansion_rows;
+                }
             }
         }
         self.execution_hitboxes = hitboxes;
@@ -774,18 +802,13 @@ impl App {
 
     #[allow(dead_code)]
     fn bash_execution_output_view<'a>(&'a self, tool_call_id: &str) -> Option<Cow<'a, str>> {
-        let output = self
-            .messages
-            .iter()
-            .rev()
-            .find(|message| {
-                message.role == Role::Tool
-                    && message.tool_name.as_deref() == Some("Bash")
-                    && message.tool_call_id.as_deref() == Some(tool_call_id)
-            })
-            .map(|message| message.content.as_str())?;
+        let message = self.messages.iter().rev().find(|message| {
+            message.role == Role::Tool
+                && message.tool_name.as_deref() == Some("Bash")
+                && message.tool_call_id.as_deref() == Some(tool_call_id)
+        })?;
 
-        Some(self.project_cached_tool_output(output))
+        Some(self.project_cached_tool_output(message))
     }
 
     fn subagent_execution_output_view(&self, task_id: &str) -> Option<Cow<'_, str>> {
@@ -794,9 +817,7 @@ impl App {
 
         for message in messages {
             let output = match message.role {
-                Role::Tool => self
-                    .project_cached_tool_output(&message.content)
-                    .into_owned(),
+                Role::Tool => self.project_cached_tool_output(message).into_owned(),
                 _ => message.content.clone(),
             };
             if output.is_empty() {
@@ -815,22 +836,25 @@ impl App {
         Some(Cow::Owned(entries.join("\n\n")))
     }
 
-    fn project_cached_tool_output<'a>(&'a self, output: &'a str) -> Cow<'a, str> {
-        match ExecutionOutputSource::from_tool_output(output) {
-            ExecutionOutputSource::Inline(_) => Cow::Borrowed(output),
-            ExecutionOutputSource::Persisted(path) => self
+    fn project_cached_tool_output<'a>(&'a self, message: &'a Message) -> Cow<'a, str> {
+        let output = message.content.as_str();
+        match self.trusted_persisted_output_path(message) {
+            None => Cow::Borrowed(output),
+            Some(Ok(path)) => self
                 .persisted_execution_outputs
                 .get(&path)
                 .map(|persisted| Cow::Owned(replace_persisted_output_marker(output, persisted)))
                 .unwrap_or(Cow::Borrowed(output)),
+            Some(Err(reason)) => Cow::Owned(replace_persisted_output_marker(output, &reason)),
         }
     }
 
-    fn has_unloaded_persisted_output(&self, output: &str) -> bool {
-        matches!(
-            ExecutionOutputSource::from_tool_output(output),
-            ExecutionOutputSource::Persisted(path) if !self.persisted_execution_outputs.contains_key(&path)
-        )
+    fn has_unloaded_persisted_output(&self, message: &Message) -> bool {
+        match self.trusted_persisted_output_path(message) {
+            Some(Ok(path)) => !self.persisted_execution_outputs.contains_key(&path),
+            Some(Err(_)) => true,
+            None => false,
+        }
     }
 
     fn preload_expanded_execution(&mut self, id: &ExecutionId) {
@@ -850,7 +874,7 @@ impl App {
                         && message.tool_name.as_deref() == Some("Bash")
                         && message.tool_call_id.as_deref() == Some(tool_call_id)
                 })
-                .map(|message| vec![message.content.clone()])
+                .map(|message| vec![message.clone()])
                 .unwrap_or_default(),
             ExecutionId::Task(task_id) => self
                 .subagent_transcripts
@@ -860,18 +884,42 @@ impl App {
                         .messages()
                         .iter()
                         .filter(|message| message.role == Role::Tool)
-                        .map(|message| message.content.clone())
+                        .cloned()
                         .collect()
                 })
                 .unwrap_or_default(),
         };
 
-        for output in outputs {
-            if let ExecutionOutputSource::Persisted(path) =
-                ExecutionOutputSource::from_tool_output(&output)
-            {
+        for message in outputs {
+            if let Some(Ok(path)) = self.trusted_persisted_output_path(&message) {
                 self.persisted_output(&path);
             }
+        }
+    }
+
+    fn trusted_persisted_output_path(&self, message: &Message) -> Option<Result<PathBuf, String>> {
+        let ExecutionOutputSource::Persisted(marker_path) =
+            ExecutionOutputSource::from_tool_output(&message.content)
+        else {
+            return None;
+        };
+        let (Some(call_id), Some(tool_name)) = (
+            message.tool_call_id.as_deref(),
+            message.tool_name.as_deref(),
+        ) else {
+            return Some(Err(
+                "Persisted output marker rejected: missing tool identity.".to_owned(),
+            ));
+        };
+        let expected =
+            tool_result_artifact_path(&self.runtime.tool_results_dir(), call_id, tool_name);
+        if marker_path == expected {
+            Some(Ok(expected))
+        } else {
+            Some(Err(
+                "Persisted output marker rejected: path does not match the trusted artifact."
+                    .to_owned(),
+            ))
         }
     }
 
@@ -879,11 +927,8 @@ impl App {
         self.persisted_execution_outputs
             .entry(path.to_path_buf())
             .or_insert_with(|| {
-                std::fs::read_to_string(path).unwrap_or_else(|error| {
-                    format!(
-                        "Could not read full output from {}: {error}",
-                        path.display()
-                    )
+                read_trusted_persisted_output(path).unwrap_or_else(|error| {
+                    format!("Could not read trusted persisted output: {error}")
                 })
             })
             .clone()
@@ -2537,6 +2582,7 @@ impl App {
     fn reset_execution_presentation(&mut self) {
         self.expanded_executions.clear();
         self.execution_scrolls.clear();
+        self.execution_expansion_rows.clear();
         self.persisted_execution_outputs.clear();
         self.execution_hitboxes.clear();
         self.hovered_execution = None;
@@ -3727,17 +3773,44 @@ fn home_relative_path(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+fn read_trusted_persisted_output(path: &Path) -> std::io::Result<String> {
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        return Err(std::io::Error::other(
+            "safe artifact reading is unavailable on this platform",
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::{fs::File, io::Read, os::unix::fs::OpenOptionsExt};
+
+        let mut file = File::options()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(std::io::Error::other("artifact is not a regular file"));
+        }
+        let mut output = String::new();
+        file.read_to_string(&mut output)?;
+        Ok(output)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, path::PathBuf, time::Duration};
 
     use crate::{
-        agent::provider::{FinishReason, ToolCall},
+        agent::provider::{FinishReason, ToolCall, ToolResult},
         agent::should_auto_compact,
         commands::SLASH_COMMANDS,
         execution::ExecutionRegion,
         plugins::PluginsConfig,
         runtime::AssistantRecord,
+        services::tool_results::{ToolResultBudget, tool_result_artifact_path},
         tasks::{SubagentBackend, TaskStatus},
     };
     use ratatui::{Terminal, backend::TestBackend};
@@ -3975,10 +4048,11 @@ mod tests {
     #[test]
     fn expanding_persisted_output_reads_once_and_keeps_failure_local() {
         let mut app = App::test_empty();
+        let path = expected_artifact(&app, "call-1", "Bash");
         let id = ExecutionId::Tool("call-1".to_owned());
         app.messages.push(finished_bash_message(
             "call-1",
-            "preview\n\n<persisted-output>\nFull Bash output was 60000 characters, exceeding the 50000 character tool-result budget. The full output was written to:\n/missing/output.txt\nUse a narrower tool call if you need more focused output.\n</persisted-output>",
+            &persisted_output_marker(&path),
         ));
 
         app.toggle_execution(id.clone(), 6);
@@ -3987,7 +4061,7 @@ mod tests {
         assert!(
             app.execution_output(&id)
                 .expect("expanded output")
-                .contains("Could not read full output")
+                .contains("Could not read trusted persisted output")
         );
     }
 
@@ -4067,6 +4141,202 @@ mod tests {
         )
     }
 
+    fn expected_artifact(app: &App, call_id: &str, tool_name: &str) -> PathBuf {
+        tool_result_artifact_path(&app.runtime.tool_results_dir(), call_id, tool_name)
+    }
+
+    #[test]
+    fn execution_reads_a_marker_written_to_its_expected_artifact_path() {
+        let mut app = App::test_empty();
+        let call_id = "call-trusted";
+        let content = "trusted result\n".repeat(4_000);
+        let result = ToolResultBudget::new(app.runtime.tool_results_dir()).apply(
+            "Bash",
+            ToolResult {
+                call_id: call_id.to_owned(),
+                content: content.clone(),
+                is_error: false,
+            },
+        );
+        let id = ExecutionId::Tool(call_id.to_owned());
+        app.messages
+            .push(finished_bash_message(call_id, &result.content));
+
+        app.toggle_execution(id.clone(), 8);
+
+        assert!(
+            app.execution_output(&id)
+                .expect("trusted output")
+                .contains(&content)
+        );
+        fs::remove_file(expected_artifact(&app, call_id, "Bash")).ok();
+    }
+
+    #[test]
+    fn forged_bash_marker_never_reads_an_arbitrary_regular_file() {
+        let mut app = App::test_empty();
+        let secret =
+            std::env::temp_dir().join(format!("glint-secret-{}.txt", uuid::Uuid::new_v4()));
+        fs::write(&secret, "do not disclose this content").expect("write secret");
+        let id = ExecutionId::Tool("call-forged".to_owned());
+        app.messages.push(finished_bash_message(
+            "call-forged",
+            &persisted_output_marker(&secret),
+        ));
+
+        app.toggle_execution(id.clone(), 8);
+
+        let output = app.execution_output(&id).expect("safe output");
+        assert!(output.contains("rejected"));
+        assert!(!output.contains("do not disclose this content"));
+        fs::remove_file(secret).ok();
+    }
+
+    #[test]
+    fn forged_nested_subagent_marker_never_reads_an_arbitrary_regular_file() {
+        let mut app = App::test_empty();
+        let secret =
+            std::env::temp_dir().join(format!("glint-nested-secret-{}.txt", uuid::Uuid::new_v4()));
+        fs::write(&secret, "nested secret").expect("write secret");
+        let id = ExecutionId::Task("a1".to_owned());
+        app.subagent_transcripts.insert(
+            "a1".to_owned(),
+            task_transcript(vec![finished_tool_message(
+                "nested-forged",
+                "Grep",
+                &persisted_output_marker(&secret),
+            )]),
+        );
+
+        app.toggle_execution(id.clone(), 8);
+
+        let output = app.execution_output(&id).expect("safe nested output");
+        assert!(output.contains("rejected"));
+        assert!(!output.contains("nested secret"));
+        fs::remove_file(secret).ok();
+    }
+
+    #[test]
+    fn missing_expected_artifact_is_a_local_execution_output_error() {
+        let mut app = App::test_empty();
+        let call_id = "call-missing";
+        let expected = expected_artifact(&app, call_id, "Bash");
+        let id = ExecutionId::Tool(call_id.to_owned());
+        app.messages.push(finished_bash_message(
+            call_id,
+            &persisted_output_marker(&expected),
+        ));
+
+        app.toggle_execution(id.clone(), 8);
+
+        assert!(
+            app.execution_output(&id)
+                .expect("missing output")
+                .contains("Could not read trusted persisted output")
+        );
+    }
+
+    #[test]
+    fn expected_nonregular_artifact_is_rejected_without_reading_it() {
+        let mut app = App::test_empty();
+        let call_id = "call-directory";
+        let expected = expected_artifact(&app, call_id, "Bash");
+        fs::create_dir_all(&expected).expect("create expected directory");
+        let id = ExecutionId::Tool(call_id.to_owned());
+        app.messages.push(finished_bash_message(
+            call_id,
+            &persisted_output_marker(&expected),
+        ));
+
+        app.toggle_execution(id.clone(), 8);
+
+        assert!(
+            app.execution_output(&id)
+                .expect("rejected output")
+                .contains("Could not read trusted persisted output")
+        );
+        fs::remove_dir_all(expected).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expected_symlink_artifact_is_rejected_without_following_it() {
+        let mut app = App::test_empty();
+        let call_id = "call-symlink";
+        let expected = expected_artifact(&app, call_id, "Bash");
+        let target =
+            std::env::temp_dir().join(format!("glint-symlink-secret-{}.txt", uuid::Uuid::new_v4()));
+        fs::write(&target, "symlink secret").expect("write target");
+        fs::create_dir_all(expected.parent().expect("artifact parent")).expect("create parent");
+        std::os::unix::fs::symlink(&target, &expected).expect("create expected symlink");
+        let id = ExecutionId::Tool(call_id.to_owned());
+        app.messages.push(finished_bash_message(
+            call_id,
+            &persisted_output_marker(&expected),
+        ));
+
+        app.toggle_execution(id.clone(), 8);
+
+        let output = app.execution_output(&id).expect("rejected output");
+        assert!(output.contains("Could not read trusted persisted output"));
+        assert!(!output.contains("symlink secret"));
+        fs::remove_file(expected).ok();
+        fs::remove_file(target).ok();
+    }
+
+    #[test]
+    fn missing_artifact_reanchors_scroll_to_actual_rows_and_collapses_stably() {
+        let mut app = App::test_empty();
+        let call_id = "call-anchor";
+        let expected = expected_artifact(&app, call_id, "Bash");
+        let id = ExecutionId::Tool(call_id.to_owned());
+        app.messages.push(finished_bash_message(
+            call_id,
+            &persisted_output_marker(&expected),
+        ));
+        app.scroll = 5;
+
+        app.toggle_execution(id.clone(), 8);
+        assert_eq!(app.scroll, 13);
+        app.set_execution_hitboxes(vec![ExecutionHitbox {
+            id: id.clone(),
+            region: ExecutionRegion::Output,
+            start_row: 0,
+            end_row: 1,
+            start_column: 0,
+            end_column: 100,
+            expansion_rows: 1,
+            max_output_scroll: 0,
+        }]);
+        assert_eq!(app.scroll, 6);
+
+        app.toggle_execution(id, 8);
+        assert_eq!(app.scroll, 5);
+    }
+
+    #[test]
+    fn normal_eight_row_expansion_keeps_its_original_anchor_across_geometry_refresh() {
+        let mut app = App::test_empty();
+        let id = ExecutionId::Tool("call-normal".to_owned());
+        app.scroll = 4;
+
+        app.toggle_execution(id.clone(), 8);
+        app.set_execution_hitboxes(vec![ExecutionHitbox {
+            id: id.clone(),
+            region: ExecutionRegion::Output,
+            start_row: 0,
+            end_row: 8,
+            start_column: 0,
+            end_column: 100,
+            expansion_rows: 8,
+            max_output_scroll: 12,
+        }]);
+        assert_eq!(app.scroll, 12);
+
+        app.toggle_execution(id, 1);
+        assert_eq!(app.scroll, 4);
+    }
+
     #[test]
     fn expanded_task_output_reflects_later_live_transcript_events() {
         let mut app = App::test_empty();
@@ -4098,10 +4368,11 @@ mod tests {
     #[test]
     fn task_output_keeps_other_entries_when_nested_persisted_read_fails() {
         let mut app = App::test_empty();
-        let path =
-            std::env::temp_dir().join(format!("glint-task-output-{}.txt", uuid::Uuid::new_v4()));
+        let path = expected_artifact(&app, "tool-ok", "Grep");
+        fs::create_dir_all(path.parent().expect("artifact parent"))
+            .expect("create artifact parent");
         fs::write(&path, "available nested output").expect("write nested output");
-        let missing = path.with_extension("missing");
+        let missing = expected_artifact(&app, "tool-missing", "Grep");
         app.subagent_transcripts.insert(
             "a1".to_owned(),
             task_transcript(vec![
@@ -4116,7 +4387,7 @@ mod tests {
         let output = app.execution_output(&id).expect("task output");
 
         assert!(output.contains("available nested output"));
-        assert!(output.contains("Could not read full output"));
+        assert!(output.contains("Could not read trusted persisted output"));
         assert!(output.contains("tail remains visible"));
         fs::remove_file(path).ok();
     }
@@ -4124,8 +4395,9 @@ mod tests {
     #[test]
     fn task_persisted_output_is_cached_by_path_without_caching_live_transcript() {
         let mut app = App::test_empty();
-        let path =
-            std::env::temp_dir().join(format!("glint-task-cache-{}.txt", uuid::Uuid::new_v4()));
+        let path = expected_artifact(&app, "tool-1", "Grep");
+        fs::create_dir_all(path.parent().expect("artifact parent"))
+            .expect("create artifact parent");
         fs::write(&path, "first file contents").expect("write first output");
         app.subagent_transcripts.insert(
             "a1".to_owned(),
@@ -4155,10 +4427,9 @@ mod tests {
     #[test]
     fn expanded_live_subagent_preloads_new_persisted_tool_output_without_caching_transcript() {
         let mut app = App::test_empty();
-        let path = std::env::temp_dir().join(format!(
-            "glint-live-task-marker-{}.txt",
-            uuid::Uuid::new_v4()
-        ));
+        let path = expected_artifact(&app, "tool-1", "Grep");
+        fs::create_dir_all(path.parent().expect("artifact parent"))
+            .expect("create artifact parent");
         fs::write(&path, "first persisted result").expect("write persisted output");
         app.subagent_transcripts.insert(
             "a1".to_owned(),
@@ -4210,8 +4481,9 @@ mod tests {
     #[test]
     fn resume_confirmation_resets_execution_state_and_path_cache_for_reused_task_id() {
         let mut app = app();
-        let path =
-            std::env::temp_dir().join(format!("glint-resume-output-{}.txt", uuid::Uuid::new_v4()));
+        let path = expected_artifact(&app, "old-tool", "Grep");
+        fs::create_dir_all(path.parent().expect("artifact parent"))
+            .expect("create artifact parent");
         fs::write(&path, "old persisted output").expect("write old output");
         let id = ExecutionId::Task("a1".to_owned());
         app.subagent_transcripts.insert(
@@ -4241,18 +4513,21 @@ mod tests {
         }]);
         app.set_hovered_execution(Some(id.clone()));
 
-        fs::write(&path, "resumed persisted output").expect("replace output");
-        let mut snapshot = subagent_snapshot();
-        snapshot.messages = vec![finished_tool_message(
-            "resumed-tool",
-            "Grep",
-            &persisted_output_marker(&path),
-        )];
         let resume_path = std::env::temp_dir().join(format!(
             "glint-app-resume-execution-{}.jsonl",
             uuid::Uuid::new_v4()
         ));
         app.runtime = SessionRuntime::test_empty(resume_path.clone(), "/workspace".to_owned());
+        let resumed_path = expected_artifact(&app, "resumed-tool", "Grep");
+        fs::create_dir_all(resumed_path.parent().expect("artifact parent"))
+            .expect("create resumed artifact parent");
+        fs::write(&resumed_path, "resumed persisted output").expect("write resumed output");
+        let mut snapshot = subagent_snapshot();
+        snapshot.messages = vec![finished_tool_message(
+            "resumed-tool",
+            "Grep",
+            &persisted_output_marker(&resumed_path),
+        )];
         app.runtime
             .transcript_mut()
             .append_subagent_presentation(&snapshot)
@@ -4271,6 +4546,7 @@ mod tests {
 
         assert!(!app.is_execution_expanded(&id));
         assert!(!app.execution_scrolls.contains_key(&id));
+        assert!(!app.execution_expansion_rows.contains_key(&id));
         assert!(app.execution_hitboxes.is_empty());
         assert!(app.hovered_execution.is_none());
         assert!(app.execution_hover_transitions.is_empty());
@@ -4280,6 +4556,7 @@ mod tests {
                 .contains("resumed persisted output")
         );
         fs::remove_file(path).ok();
+        fs::remove_file(resumed_path).ok();
     }
 
     #[test]
@@ -4314,6 +4591,7 @@ mod tests {
 
         assert!(!app.is_execution_expanded(&id));
         assert!(app.execution_scrolls.is_empty());
+        assert!(app.execution_expansion_rows.is_empty());
         assert!(app.persisted_execution_outputs.is_empty());
         assert!(app.execution_hitboxes.is_empty());
         assert!(app.hovered_execution.is_none());

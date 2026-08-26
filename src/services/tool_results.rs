@@ -60,11 +60,7 @@ impl ToolResultBudget {
 
     fn persist(&self, tool_name: &str, call_id: &str, content: &str) -> std::io::Result<String> {
         fs::create_dir_all(&self.directory)?;
-        let path = self.directory.join(format!(
-            "{}-{}.txt",
-            sanitize_segment(call_id),
-            sanitize_segment(tool_name)
-        ));
+        let path = tool_result_artifact_path(&self.directory, call_id, tool_name);
         fs::write(&path, content)?;
 
         Ok(persisted_output_message(
@@ -75,6 +71,18 @@ impl ToolResultBudget {
             self.preview_chars,
         ))
     }
+}
+
+pub(crate) fn tool_result_artifact_path(
+    directory: &Path,
+    call_id: &str,
+    tool_name: &str,
+) -> PathBuf {
+    directory.join(format!(
+        "{}-{}.txt",
+        sanitize_segment(call_id),
+        sanitize_segment(tool_name)
+    ))
 }
 
 fn persisted_output_message(
@@ -162,5 +170,15 @@ mod tests {
     fn sanitizes_empty_path_segments() {
         assert_eq!(sanitize_segment(""), "tool");
         assert_eq!(sanitize_segment("call/1 Glob"), "call_1_Glob");
+    }
+
+    #[test]
+    fn artifact_path_matches_the_writer_sanitization() {
+        let directory = Path::new("/tmp/glint-tool-results");
+
+        assert_eq!(
+            tool_result_artifact_path(directory, "call/1", "Bash output"),
+            directory.join("call_1-Bash_output.txt")
+        );
     }
 }

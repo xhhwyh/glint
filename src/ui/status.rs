@@ -66,23 +66,25 @@ pub(super) fn render_status_view(frame: &mut Frame, app: &App, view: &StatusView
         "─".repeat(width),
         Style::default().fg(MUTED_TEXT_COLOR),
     )));
-    lines.push(Line::from(vec![
+    lines.push(status_footer_line());
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(BG_COLOR)),
+        frame.area(),
+    );
+}
+
+fn status_footer_line() -> Line<'static> {
+    Line::from(vec![
         Span::styled("←/→", Style::default().fg(KEY_HINT_COLOR)),
         Span::styled(" tab  ", Style::default().fg(MUTED_TEXT_COLOR)),
         Span::styled("Tab", Style::default().fg(KEY_HINT_COLOR)),
         Span::styled(" next  ", Style::default().fg(MUTED_TEXT_COLOR)),
         Span::styled("↑/↓", Style::default().fg(KEY_HINT_COLOR)),
         Span::styled(" select  ", Style::default().fg(MUTED_TEXT_COLOR)),
-        Span::styled("Enter", Style::default().fg(KEY_HINT_COLOR)),
-        Span::styled(" open  ", Style::default().fg(MUTED_TEXT_COLOR)),
         Span::styled("Esc", Style::default().fg(KEY_HINT_COLOR)),
         Span::styled(" exit", Style::default().fg(MUTED_TEXT_COLOR)),
-    ]));
-
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(BG_COLOR)),
-        frame.area(),
-    );
+    ])
 }
 
 fn status_tab_line(selected: StatusTab) -> Line<'static> {
@@ -763,6 +765,15 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>()
+    }
+
+    #[test]
+    fn status_footer_does_not_advertise_an_open_action() {
+        let footer = status_footer_line();
+        let text = line_text(&footer);
+
+        assert!(!text.contains("Enter open"));
+        assert!(text.contains("Esc exit"));
     }
 
     #[test]
