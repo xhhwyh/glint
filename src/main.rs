@@ -97,9 +97,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
     while !app.should_quit {
         let size = terminal.size()?;
         app.update_tasks();
-        synchronize_layout_state(&mut app, size.width, size.height);
+        let prepared_document = ui::prepare_document(&app, size.width, size.height);
+        synchronize_layout_state(&mut app, &prepared_document);
         draw_synchronized(terminal, |frame| {
-            ui::render(frame, &app);
+            ui::render_prepared_document(frame, &app, &prepared_document);
             io::Result::Ok(())
         })?;
 
@@ -155,18 +156,19 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
     Ok(())
 }
 
-fn synchronize_layout_state(app: &mut App, width: u16, height: u16) {
-    let execution_metrics = ui::execution_expansion_metrics(app, width);
+fn synchronize_layout_state(app: &mut App, prepared_document: &ui::PreparedDocument) {
+    let execution_metrics = prepared_document.execution_expansion_metrics(app);
     app.reconcile_execution_expansion_metrics(execution_metrics);
     app.set_document_viewport(
-        ui::document_viewport_height(app, width, height),
-        ui::document_scroll_top(app, width, height),
+        prepared_document.document_viewport_height(),
+        prepared_document.document_scroll_top(app),
     );
-    let execution_hitboxes = ui::execution_hitboxes(app, width, height);
+    let execution_hitboxes = prepared_document.execution_hitboxes(app);
     app.set_execution_hitboxes(execution_hitboxes);
-    let (input_top_row, input_rows, input_content_width) = ui::composer_hitbox(app, width, height);
+    let (input_top_row, input_rows, input_content_width) = prepared_document.composer_hitbox();
     app.set_input_hitbox(input_top_row, input_rows, input_content_width);
-    app.set_return_bottom_button_hitbox(ui::return_bottom_button_hitbox(app, width, height));
+    app.set_return_bottom_button_hitbox(prepared_document.return_bottom_button_hitbox(app));
+    let (width, height) = prepared_document.size();
     app.set_mcp_detail_max_scroll(ui::mcp_detail_max_scroll(app, width, height));
     app.set_plugins_detail_max_scroll(ui::plugins_detail_max_scroll(app, width, height));
 }

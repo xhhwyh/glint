@@ -692,31 +692,6 @@ impl App {
         self.execution_scrolls.get(id).copied().unwrap_or_default()
     }
 
-    pub fn execution_has_unloaded_persisted_output(&self, id: &ExecutionId) -> bool {
-        match id {
-            ExecutionId::Tool(tool_call_id) => self
-                .messages
-                .iter()
-                .rev()
-                .find(|message| {
-                    message.role == Role::Tool
-                        && message.tool_name.as_deref() == Some("Bash")
-                        && message.tool_call_id.as_deref() == Some(tool_call_id)
-                })
-                .is_some_and(|message| self.has_unloaded_persisted_output(message)),
-            ExecutionId::Task(task_id) => {
-                self.subagent_transcripts
-                    .get(task_id)
-                    .is_some_and(|transcript| {
-                        transcript.messages().iter().any(|message| {
-                            message.role == Role::Tool
-                                && self.has_unloaded_persisted_output(message)
-                        })
-                    })
-            }
-        }
-    }
-
     pub fn scroll_execution(&mut self, id: &ExecutionId, delta: i16) {
         let Some(max_output_scroll) = self
             .execution_hitboxes
@@ -878,16 +853,6 @@ impl App {
                 .map(|persisted| Cow::Owned(replace_persisted_output_marker(output, persisted)))
                 .unwrap_or(Cow::Borrowed(output)),
             Some(Err(reason)) => Cow::Owned(replace_persisted_output_marker(output, &reason)),
-        }
-    }
-
-    fn has_unloaded_persisted_output(&self, message: &Message) -> bool {
-        match self.trusted_persisted_output_path(message) {
-            Some(Ok(artifact)) => !self
-                .persisted_execution_outputs
-                .contains_key(&artifact.path),
-            Some(Err(_)) => true,
-            None => false,
         }
     }
 
@@ -1133,12 +1098,18 @@ impl App {
     }
 
     fn finish_subagent_result(&mut self, task_id: &str, task: TaskSnapshot) {
+        let mut presentation_error = None;
         if let Some(transcript) = self.subagent_transcripts.get_mut(task_id) {
             transcript.finish(&task);
             let snapshot = transcript.snapshot();
-            self.runtime.append_subagent_presentation(&snapshot).ok();
+            presentation_error = self.runtime.append_subagent_presentation(&snapshot).err();
         }
-        self.run_notice = Some(tasks::task_finished_message(&task));
+        self.run_notice = Some(match presentation_error {
+            Some(error) => {
+                format!("Could not save completed subagent {task_id} for resume: {error:#}")
+            }
+            None => tasks::task_finished_message(&task),
+        });
     }
 
     pub fn set_document_viewport(&mut self, height: u16, top_row: u16) {
@@ -5179,6 +5150,55 @@ mod tests {
             TaskStatus::Completed
         );
         assert_eq!(app.runtime.ui_subagent_transcripts().len(), 1);
+    }
+
+    #[test]
+    fn completed_subagent_presentation_persistence_failure_is_visible_without_losing_live_card() {
+        let mut app = app();
+        let request = subagent_request();
+        app.test_start_subagent_task(&request);
+        let transcript_directory = std::env::temp_dir().join(format!(
+            "glint-subagent-presentation-directory-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&transcript_directory).expect("create transcript directory");
+        app.runtime =
+            SessionRuntime::test_empty(transcript_directory.clone(), "/workspace".to_owned());
+
+        app.finish_subagent_result(
+            &request.task_id,
+            TaskSnapshot {
+                id: request.task_id.clone(),
+                tool_call_id: request.tool_call_id.clone(),
+                kind: tasks::TaskKind::Subagent,
+                status: TaskStatus::Completed,
+                description: request.description.clone(),
+                backend: request.backend,
+                cwd: request.cwd.clone(),
+                started_at_ms: 1,
+                ended_at_ms: Some(2),
+                summary: Some("done".to_owned()),
+                activity: None,
+                tool_use_count: 0,
+                result: Some("done".to_owned()),
+                error: None,
+            },
+        );
+
+        assert_eq!(
+            app.subagent_transcripts[&request.task_id].status(),
+            TaskStatus::Completed
+        );
+        assert!(
+            app.execution_output(&ExecutionId::Task(request.task_id))
+                .is_some()
+        );
+        assert!(
+            app.run_notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("Could not save completed subagent"))
+        );
+        fs::remove_dir(transcript_directory).ok();
     }
 
     #[test]

@@ -97,19 +97,25 @@ pub(super) fn execution_card_lines(
     hover_fraction: f32,
 ) -> ExecutionCardLines {
     let width = width.max(1) as usize;
-    let output_lines = wrap_text(&card.output, (width.saturating_sub(4)) as u16);
-    let summary = card_summary(card, width, expanded, output_lines.len(), hover_fraction);
-    let mut lines = vec![Line::from(""), Line::from(summary)];
-    let mut regions = vec![None, Some(ExecutionRegion::Summary)];
-
     if !expanded {
+        let output_row_count = if card.output.is_empty() {
+            0
+        } else {
+            MAX_EXPANDED_OUTPUT_ROWS as usize
+        };
+        let summary = card_summary(card, width, false, output_row_count, hover_fraction);
         return ExecutionCardLines {
-            lines,
-            regions,
+            lines: vec![Line::from(""), Line::from(summary)],
+            regions: vec![None, Some(ExecutionRegion::Summary)],
             output_rows: 0,
             max_output_scroll: 0,
         };
     }
+
+    let output_lines = wrap_text(&card.output, (width.saturating_sub(4)) as u16);
+    let summary = card_summary(card, width, expanded, output_lines.len(), hover_fraction);
+    let mut lines = vec![Line::from(""), Line::from(summary)];
+    let mut regions = vec![None, Some(ExecutionRegion::Summary)];
 
     let (output_rows, max_output_scroll) = output_metrics(output_lines.len());
     let output_scroll = output_scroll.min(max_output_scroll) as usize;
@@ -173,7 +179,14 @@ fn card_summary(
         "click to expand"
     };
     let prefix = format!("  ◇ {} ", card.name);
-    let suffix = format!(" · {status} · {output_row_count} lines · {hint}");
+    let output_hint = if expanded {
+        format!(" · {output_row_count} lines")
+    } else if output_row_count == 0 {
+        String::new()
+    } else {
+        format!(" · preview up to {output_row_count} rows")
+    };
+    let suffix = format!(" · {status}{output_hint} · {hint}");
     let available = width.saturating_sub(prefix.width() + suffix.width());
     let details = truncate_end_to_width(details, available);
     let background = interpolate_color(BG_COLOR, Color::Rgb(8, 47, 73), hover_fraction);
@@ -212,7 +225,8 @@ fn card_summary(
         Span::styled(prefix, marker_style),
         Span::styled(details, detail_style),
         Span::styled(format!(" · {status}"), status_style),
-        Span::styled(format!(" · {output_row_count} lines · {hint}"), muted_style),
+        Span::styled(output_hint, muted_style),
+        Span::styled(format!(" · {hint}"), muted_style),
     ]
 }
 
@@ -364,8 +378,8 @@ mod tests {
     }
 
     #[test]
-    fn summary_line_count_tracks_wrapped_output_at_the_current_width() {
-        let card = bash_card_with_output("0123456789abcdefghij".to_owned());
+    fn collapsed_summary_uses_a_bounded_expansion_estimate_without_wrapping_output() {
+        let card = bash_card_with_output("0123456789abcdefghij".repeat(10_000));
         let narrow = execution_card_lines(&card, 20, false, 0, 0.0);
         let wide = execution_card_lines(&card, 40, false, 0, 0.0);
         let narrow_text = narrow
@@ -389,8 +403,8 @@ mod tests {
             })
             .collect::<String>();
 
-        assert!(narrow_text.contains("2 lines"));
-        assert!(wide_text.contains("1 lines"));
+        assert!(narrow_text.contains("preview up to 8 rows"));
+        assert!(wide_text.contains("preview up to 8 rows"));
     }
 
     #[test]

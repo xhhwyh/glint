@@ -89,6 +89,16 @@ struct Composer {
     cursor_y: u16,
 }
 
+/// A single, immutable projection of the transcript and composer for one frame.
+/// Layout reconciliation may update `App::scroll`; viewport-derived methods below
+/// intentionally read that reconciled value without rebuilding the projection.
+pub struct PreparedDocument {
+    document: Document,
+    composer: Composer,
+    width: u16,
+    height: u16,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct DocumentLineMeta {
     message_index: Option<usize>,
@@ -96,6 +106,7 @@ struct DocumentLineMeta {
     execution: Option<(ExecutionId, ExecutionRegion)>,
 }
 
+#[cfg(test)]
 pub fn render(frame: &mut Frame, app: &App) {
     if let Some(picker) = &app.resume_picker {
         resume::render_resume_picker(frame, app, picker);
@@ -113,14 +124,45 @@ pub fn render(frame: &mut Frame, app: &App) {
         status::render_status_view(frame, app, view);
         return;
     }
-    render_document(frame, app, frame.area());
+    let prepared = prepare_document(app, frame.area().width, frame.area().height);
+    render_prepared_document(frame, app, &prepared);
 }
 
-fn render_document(frame: &mut Frame, app: &App, area: Rect) {
-    let width = area.width.max(1);
-    let mut document = document(app, width);
-    let composer = composer(app, width);
-    let composer_height = composer_visible_height(&composer, area.height);
+pub fn prepare_document(app: &App, width: u16, height: u16) -> PreparedDocument {
+    let width = width.max(1);
+    PreparedDocument {
+        document: document(app, width),
+        composer: composer(app, width),
+        width,
+        height,
+    }
+}
+
+pub fn render_prepared_document(frame: &mut Frame, app: &App, prepared: &PreparedDocument) {
+    if let Some(picker) = &app.resume_picker {
+        resume::render_resume_picker(frame, app, picker);
+        return;
+    }
+    if let Some(view) = &app.mcp_view {
+        mcp::render_mcp_view(frame, app, view);
+        return;
+    }
+    if let Some(view) = &app.plugins_view {
+        plugins::render_plugins_view(frame, app, view);
+        return;
+    }
+    if let Some(view) = &app.status_view {
+        status::render_status_view(frame, app, view);
+        return;
+    }
+    render_document(frame, app, frame.area(), prepared);
+}
+
+fn render_document(frame: &mut Frame, app: &App, area: Rect, prepared: &PreparedDocument) {
+    let width = prepared.width;
+    let mut document_lines = prepared.document.lines.clone();
+    let composer = &prepared.composer;
+    let composer_height = composer_visible_height(composer, area.height);
     let document_height = area.height.saturating_sub(composer_height);
     let document_area = Rect::new(area.x, area.y, area.width, document_height);
     let composer_area = Rect::new(
@@ -129,19 +171,21 @@ fn render_document(frame: &mut Frame, app: &App, area: Rect) {
         area.width,
         composer_height,
     );
-    let scroll = document_scroll_for_len(document.lines.len(), app.scroll, document_height);
-    let sticky_question = sticky_question_overlay(app, &document, scroll, document_height, width);
+    let scroll =
+        document_scroll_for_len(prepared.document.lines.len(), app.scroll, document_height);
+    let sticky_question =
+        sticky_question_overlay(app, &prepared.document, scroll, document_height, width);
     let return_bottom_button_row = return_bottom_button_row(app.scroll, document_height);
-    document.lines = apply_text_selection(document.lines, app.text_selection, width);
+    document_lines = apply_text_selection(document_lines, app.text_selection, width);
 
     if document_height > 0 {
         frame.render_widget(
-            Paragraph::new(document.lines)
+            Paragraph::new(document_lines)
                 .scroll((scroll, 0))
                 .style(Style::default().bg(BG_COLOR)),
             document_area,
         );
-        if let Some((cursor_x, cursor_y)) = document.cursor
+        if let Some((cursor_x, cursor_y)) = prepared.document.cursor
             && let Some(visible_y) = visible_cursor_y(cursor_y, scroll, document_height)
         {
             frame.set_cursor_position(Position::new(
@@ -167,7 +211,12 @@ fn render_document(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    render_composer(frame, &composer, composer_area, document.cursor.is_none());
+    render_composer(
+        frame,
+        composer,
+        composer_area,
+        prepared.document.cursor.is_none(),
+    );
 }
 
 fn render_composer(frame: &mut Frame, composer: &Composer, area: Rect, show_cursor: bool) {
@@ -192,78 +241,121 @@ fn render_composer(frame: &mut Frame, composer: &Composer, area: Rect, show_curs
     }
 }
 
+#[cfg(test)]
 pub fn document_scroll_top(app: &App, width: u16, height: u16) -> u16 {
-    let viewport_height = document_viewport_height(app, width, height);
-    let document = document(app, width.max(1));
-    document_scroll_for_len(document.lines.len(), app.scroll, viewport_height)
+    prepare_document(app, width, height).document_scroll_top(app)
 }
 
+#[cfg(test)]
 pub fn document_viewport_height(app: &App, width: u16, height: u16) -> u16 {
-    let composer = composer(app, width.max(1));
-    height.saturating_sub(composer_visible_height(&composer, height))
+    prepare_document(app, width, height).document_viewport_height()
 }
 
+#[cfg(test)]
 pub fn execution_expansion_metrics(
     app: &App,
     width: u16,
 ) -> HashMap<ExecutionId, ExecutionExpansionMetrics> {
-    document(app, width.max(1))
-        .execution_metrics
-        .into_iter()
-        .filter(|(id, _)| app.is_execution_expanded(id))
-        .collect()
+    prepare_document(app, width, 0).execution_expansion_metrics(app)
 }
 
+#[cfg(test)]
 pub fn execution_hitboxes(app: &App, width: u16, height: u16) -> Vec<ExecutionHitbox> {
-    let width = width.max(1);
-    let document = document(app, width);
-    let viewport_height = document_viewport_height(app, width, height);
-    let scroll = document_scroll_for_len(document.lines.len(), app.scroll, viewport_height);
-    let occluded_top = sticky_question_overlay(app, &document, scroll, viewport_height, width)
-        .map(|(_, height)| height)
-        .unwrap_or_default();
-    let visible_end = (scroll as usize + viewport_height as usize).min(document.line_meta.len());
-    let mut hitboxes = Vec::new();
-    let mut row = scroll as usize;
+    prepare_document(app, width, height).execution_hitboxes(app)
+}
 
-    while row < visible_end {
-        if (row - scroll as usize) < occluded_top as usize {
-            row += 1;
-            continue;
-        }
-        let Some((id, region)) = document.line_meta[row].execution.clone() else {
-            row += 1;
-            continue;
-        };
-        let start = row;
-        row += 1;
-        while row < visible_end
-            && document.line_meta[row].execution.as_ref() == Some(&(id.clone(), region))
-        {
-            row += 1;
-        }
-        let metrics = document
-            .execution_metrics
-            .get(&id)
-            .copied()
-            .unwrap_or_default();
-        hitboxes.push(ExecutionHitbox {
-            id,
-            region,
-            start_row: (start - scroll as usize) as u16,
-            end_row: (row - scroll as usize) as u16,
-            start_column: 0,
-            end_column: width,
-            expansion_rows: metrics.expansion_rows,
-            max_output_scroll: if region == ExecutionRegion::Output {
-                metrics.max_output_scroll
-            } else {
-                0
-            },
-        });
+impl PreparedDocument {
+    pub fn size(&self) -> (u16, u16) {
+        (self.width, self.height)
     }
 
-    hitboxes
+    pub fn execution_expansion_metrics(
+        &self,
+        app: &App,
+    ) -> HashMap<ExecutionId, ExecutionExpansionMetrics> {
+        self.document
+            .execution_metrics
+            .iter()
+            .filter(|(id, _)| app.is_execution_expanded(id))
+            .map(|(id, metrics)| (id.clone(), *metrics))
+            .collect()
+    }
+
+    pub fn document_viewport_height(&self) -> u16 {
+        self.height
+            .saturating_sub(composer_visible_height(&self.composer, self.height))
+    }
+
+    pub fn document_scroll_top(&self, app: &App) -> u16 {
+        document_scroll_for_len(
+            self.document.lines.len(),
+            app.scroll,
+            self.document_viewport_height(),
+        )
+    }
+
+    pub fn execution_hitboxes(&self, app: &App) -> Vec<ExecutionHitbox> {
+        let viewport_height = self.document_viewport_height();
+        let scroll = self.document_scroll_top(app);
+        let occluded_top =
+            sticky_question_overlay(app, &self.document, scroll, viewport_height, self.width)
+                .map(|(_, height)| height)
+                .unwrap_or_default();
+        let visible_end =
+            (scroll as usize + viewport_height as usize).min(self.document.line_meta.len());
+        let mut hitboxes = Vec::new();
+        let mut row = scroll as usize;
+
+        while row < visible_end {
+            if (row - scroll as usize) < occluded_top as usize {
+                row += 1;
+                continue;
+            }
+            let Some((id, region)) = self.document.line_meta[row].execution.clone() else {
+                row += 1;
+                continue;
+            };
+            let start = row;
+            row += 1;
+            while row < visible_end
+                && self.document.line_meta[row].execution.as_ref() == Some(&(id.clone(), region))
+            {
+                row += 1;
+            }
+            let metrics = self
+                .document
+                .execution_metrics
+                .get(&id)
+                .copied()
+                .unwrap_or_default();
+            hitboxes.push(ExecutionHitbox {
+                id,
+                region,
+                start_row: (start - scroll as usize) as u16,
+                end_row: (row - scroll as usize) as u16,
+                start_column: 0,
+                end_column: self.width,
+                expansion_rows: metrics.expansion_rows,
+                max_output_scroll: if region == ExecutionRegion::Output {
+                    metrics.max_output_scroll
+                } else {
+                    0
+                },
+            });
+        }
+
+        hitboxes
+    }
+
+    pub fn composer_hitbox(&self) -> (u16, u16, u16) {
+        composer_input_hitbox_for_height(&self.composer, self.height)
+    }
+
+    pub fn return_bottom_button_hitbox(&self, app: &App) -> Option<(u16, u16, u16)> {
+        let row = return_bottom_button_row(app.scroll, self.document_viewport_height())?;
+        let (start, end) = return_bottom_button_columns(self.width);
+        Some((row, start, end))
+    }
 }
 
 pub fn selected_text(app: &App, width: u16) -> Option<String> {
@@ -272,17 +364,14 @@ pub fn selected_text(app: &App, width: u16) -> Option<String> {
     selected_text_from_lines(&document.lines, selection, width.max(1))
 }
 
+#[cfg(test)]
 pub fn composer_hitbox(app: &App, width: u16, height: u16) -> (u16, u16, u16) {
-    let composer = composer(app, width.max(1));
-    composer_input_hitbox_for_height(&composer, height)
+    prepare_document(app, width, height).composer_hitbox()
 }
 
+#[cfg(test)]
 pub fn return_bottom_button_hitbox(app: &App, width: u16, height: u16) -> Option<(u16, u16, u16)> {
-    let width = width.max(1);
-    let document_height = document_viewport_height(app, width, height);
-    let row = return_bottom_button_row(app.scroll, document_height)?;
-    let (start, end) = return_bottom_button_columns(width.max(1));
-    Some((row, start, end))
+    prepare_document(app, width, height).return_bottom_button_hitbox(app)
 }
 
 fn composer_visible_height(composer: &Composer, height: u16) -> u16 {
@@ -364,17 +453,15 @@ fn document(app: &App, width: u16) -> Document {
                     expansion_rows: card_lines.output_rows,
                     max_output_scroll: card_lines.max_output_scroll,
                 }
-            } else if app.execution_has_unloaded_persisted_output(&id) {
+            } else if !card.output.is_empty() {
                 ExecutionExpansionMetrics {
                     expansion_rows: MAX_EXPANDED_OUTPUT_ROWS,
                     max_output_scroll: 0,
                 }
             } else {
-                let expanded_lines =
-                    execution::execution_card_lines(&card, width, true, output_scroll, 0.0);
                 ExecutionExpansionMetrics {
-                    expansion_rows: expanded_lines.output_rows,
-                    max_output_scroll: expanded_lines.max_output_scroll,
+                    expansion_rows: 0,
+                    max_output_scroll: 0,
                 }
             };
             execution_metrics.insert(id.clone(), expansion_metrics);
@@ -930,7 +1017,7 @@ mod tests {
             .iter()
             .find(|hitbox| hitbox.id == id && hitbox.region == ExecutionRegion::Summary)
             .expect("summary hitbox");
-        assert_eq!(summary.expansion_rows, 2);
+        assert_eq!(summary.expansion_rows, MAX_EXPANDED_OUTPUT_ROWS);
         assert!(
             collapsed
                 .iter()
@@ -1018,6 +1105,30 @@ mod tests {
         assert!(visible_hitboxes.iter().any(|hitbox| hitbox.id == second));
         assert_eq!(metrics[&first].expansion_rows, 1);
         assert_eq!(metrics[&second].expansion_rows, 1);
+    }
+
+    #[test]
+    fn prepared_document_derives_hitboxes_after_anchor_reconciliation_without_reprojection() {
+        let mut app = App::test_empty();
+        let id = ExecutionId::Tool("call-bash".to_owned());
+        app.messages.push(finished_bash_message(
+            "call-bash",
+            "git status",
+            "one rendered output row",
+        ));
+        app.scroll = 5;
+        app.toggle_execution(id.clone(), MAX_EXPANDED_OUTPUT_ROWS);
+
+        let prepared = prepare_document(&app, 80, 20);
+        let metrics = prepared.execution_expansion_metrics(&app);
+        assert_eq!(metrics[&id].expansion_rows, 1);
+
+        app.reconcile_execution_expansion_metrics(metrics);
+        assert_eq!(app.scroll, 6);
+        assert_eq!(
+            prepared.execution_hitboxes(&app),
+            execution_hitboxes(&app, 80, 20)
+        );
     }
 
     #[test]
