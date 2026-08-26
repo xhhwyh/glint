@@ -111,6 +111,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
             app.set_terminal_content_geometry(0, 0, 1);
         }
         app.update_terminal();
+        app.update_tasks();
         app.set_document_viewport(
             ui::document_viewport_height(&app, size.width, document_height),
             ui::document_scroll_top(&app, size.width, document_height),
@@ -188,6 +189,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
 
         app.update_agent_events();
         app.update_terminal();
+        app.update_tasks();
     }
 
     Ok(())

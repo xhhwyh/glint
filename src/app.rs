@@ -685,6 +685,13 @@ impl App {
             }
         }
 
+        for tab in &mut self.terminal_tabs {
+            tab.tick();
+        }
+        self.drain_subagent_events();
+    }
+
+    pub fn update_tasks(&mut self) {
         while let Some(request) = self.runtime.try_recv_task_request() {
             match request {
                 TaskRequest::StartSubagent { request, response } => {
@@ -726,11 +733,6 @@ impl App {
                 }
             }
         }
-
-        for tab in &mut self.terminal_tabs {
-            tab.tick();
-        }
-        self.drain_subagent_events();
     }
 
     fn terminal_run_tab_index(&mut self) -> Option<usize> {
@@ -3984,6 +3986,18 @@ mod tests {
 
     fn app() -> App {
         App::test_empty()
+    }
+
+    #[test]
+    fn task_requests_drain_without_terminal_update() {
+        let mut app = app();
+        let sender = app.runtime.task_request_sender();
+        let (response, receiver) = std::sync::mpsc::channel();
+
+        sender.send(TaskRequest::List { response }).unwrap();
+        app.update_tasks();
+
+        assert!(receiver.recv().unwrap().is_empty());
     }
 
     #[test]
