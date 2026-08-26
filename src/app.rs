@@ -69,9 +69,7 @@ pub struct App {
     #[allow(dead_code)]
     hovered_execution: Option<ExecutionId>,
     #[allow(dead_code)]
-    previous_hovered_execution: Option<ExecutionId>,
-    #[allow(dead_code)]
-    hover_changed_at: Option<Instant>,
+    execution_hover_transitions: HashMap<ExecutionId, ExecutionHoverTransition>,
     pub usage: ConversationUsage,
     pub slash_command_selection: usize,
     pub model_picker: Option<ModelPicker>,
@@ -406,8 +404,24 @@ struct TerminalTabHitbox {
     tab_count: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ExecutionHoverTransition {
+    from: f32,
+    to: f32,
+    started: Instant,
+}
+
 const TERMINAL_SWITCHER_CARD_WIDTH: u16 = 28;
 const TERMINAL_SWITCHER_CARD_GAP: u16 = 1;
+
+impl ExecutionHoverTransition {
+    fn value_at(self, now: Instant) -> f32 {
+        let progress = (now.saturating_duration_since(self.started).as_secs_f32()
+            / HOVER_TRANSITION.as_secs_f32())
+        .clamp(0.0, 1.0);
+        self.from + (self.to - self.from) * progress
+    }
+}
 
 impl TextSelection {
     fn new(position: TextPosition) -> Self {
@@ -515,8 +529,7 @@ impl App {
             persisted_execution_outputs: HashMap::new(),
             execution_hitboxes: Vec::new(),
             hovered_execution: None,
-            previous_hovered_execution: None,
-            hover_changed_at: None,
+            execution_hover_transitions: HashMap::new(),
             usage,
             slash_command_selection: 0,
             model_picker: None,
@@ -569,8 +582,7 @@ impl App {
             persisted_execution_outputs: HashMap::new(),
             execution_hitboxes: Vec::new(),
             hovered_execution: None,
-            previous_hovered_execution: None,
-            hover_changed_at: None,
+            execution_hover_transitions: HashMap::new(),
             usage: ConversationUsage::default(),
             slash_command_selection: 0,
             model_picker: None,
@@ -748,6 +760,7 @@ impl App {
             }
         }
         self.execution_hitboxes = hitboxes;
+        self.cleanup_execution_hover_transitions_at(Instant::now());
     }
 
     #[allow(dead_code)]
@@ -764,10 +777,21 @@ impl App {
     }
 
     pub fn set_hovered_execution(&mut self, id: Option<ExecutionId>) {
-        if self.hovered_execution != id {
-            self.previous_hovered_execution = std::mem::replace(&mut self.hovered_execution, id);
-            self.hover_changed_at = Some(Instant::now());
+        self.set_hovered_execution_at(id, Instant::now());
+    }
+
+    pub fn set_hovered_execution_at(&mut self, id: Option<ExecutionId>, now: Instant) {
+        if self.hovered_execution == id {
+            return;
         }
+
+        if let Some(previous) = self.hovered_execution.clone() {
+            self.transition_execution_hover_to(previous, 0.0, now);
+        }
+        if let Some(next) = id.clone() {
+            self.transition_execution_hover_to(next, 1.0, now);
+        }
+        self.hovered_execution = id;
     }
 
     pub fn execution_hover_progress(&self, id: &ExecutionId) -> f32 {
@@ -775,18 +799,33 @@ impl App {
     }
 
     pub fn execution_hover_progress_at(&self, id: &ExecutionId, now: Instant) -> f32 {
-        let elapsed = self
-            .hover_changed_at
-            .map(|started| now.saturating_duration_since(started))
-            .unwrap_or(HOVER_TRANSITION);
-        let progress = (elapsed.as_secs_f32() / HOVER_TRANSITION.as_secs_f32()).clamp(0.0, 1.0);
-        if self.hovered_execution.as_ref() == Some(id) {
-            progress
-        } else if self.previous_hovered_execution.as_ref() == Some(id) {
-            1.0 - progress
-        } else {
-            0.0
+        self.execution_hover_transitions
+            .get(id)
+            .map(|transition| transition.value_at(now))
+            .unwrap_or_else(|| u8::from(self.hovered_execution.as_ref() == Some(id)) as f32)
+    }
+
+    fn transition_execution_hover_to(&mut self, id: ExecutionId, to: f32, now: Instant) {
+        let from = self.execution_hover_progress_at(&id, now);
+        if (from - to).abs() < f32::EPSILON {
+            if to == 0.0 {
+                self.execution_hover_transitions.remove(&id);
+            }
+            return;
         }
+        self.execution_hover_transitions.insert(
+            id,
+            ExecutionHoverTransition {
+                from,
+                to,
+                started: now,
+            },
+        );
+    }
+
+    fn cleanup_execution_hover_transitions_at(&mut self, now: Instant) {
+        self.execution_hover_transitions
+            .retain(|_, transition| transition.to != 0.0 || transition.value_at(now) > 0.0);
     }
 
     #[allow(dead_code)]
@@ -2923,8 +2962,7 @@ impl App {
         self.persisted_execution_outputs.clear();
         self.execution_hitboxes.clear();
         self.hovered_execution = None;
-        self.previous_hovered_execution = None;
-        self.hover_changed_at = None;
+        self.execution_hover_transitions.clear();
     }
 
     fn clamp_slash_command_selection(&mut self) {
@@ -3122,10 +3160,17 @@ impl App {
     fn update_mouse(&mut self, mouse: MouseAction) {
         match mouse {
             MouseAction::Move { column, row } => {
-                self.set_hovered_execution(
-                    self.execution_hitbox_at(column, row, ExecutionRegion::Summary)
-                        .map(|hitbox| hitbox.id.clone()),
-                );
+                let hovered = (!self.mouse_over_return_bottom(column, row))
+                    .then(|| self.execution_hitbox_at(column, row, ExecutionRegion::Summary))
+                    .flatten()
+                    .map(|hitbox| hitbox.id.clone());
+                self.set_hovered_execution(hovered);
+            }
+            MouseAction::LeftDown { column, row } if self.mouse_over_return_bottom(column, row) => {
+                self.scroll = 0;
+                self.text_selection = None;
+                self.input_selection = None;
+                self.terminal_focused = false;
             }
             MouseAction::LeftDown { column, row }
                 if self
@@ -3141,12 +3186,6 @@ impl App {
                 self.input_selection = None;
                 self.terminal_focused = false;
                 self.toggle_execution(id, expansion_rows);
-            }
-            MouseAction::LeftDown { column, row } if self.mouse_over_return_bottom(column, row) => {
-                self.scroll = 0;
-                self.text_selection = None;
-                self.input_selection = None;
-                self.terminal_focused = false;
             }
             MouseAction::LeftDown { column, row } if !self.mouse_over_terminal_area(row) => {
                 self.terminal_focused = false;
@@ -4450,34 +4489,151 @@ mod tests {
     }
 
     #[test]
-    fn hover_progress_interpolates_and_fades_out_after_leaving_cards() {
+    fn hover_progress_leaves_from_its_current_halfway_brightness() {
         let (mut app, id) = app_with_execution_hitboxes();
         let started = Instant::now();
 
-        app.set_hovered_execution(Some(id.clone()));
-        app.hover_changed_at = Some(started);
+        app.set_hovered_execution_at(Some(id.clone()), started);
         assert_eq!(app.execution_hover_progress_at(&id, started), 0.0);
         assert_eq!(
             app.execution_hover_progress_at(&id, started + Duration::from_millis(80)),
             0.5
         );
-        assert_eq!(
-            app.execution_hover_progress_at(&id, started + Duration::from_millis(160)),
-            1.0
-        );
 
-        let left = started + Duration::from_millis(200);
-        app.set_hovered_execution(None);
-        app.hover_changed_at = Some(left);
-        assert_eq!(app.execution_hover_progress_at(&id, left), 1.0);
+        let left = started + Duration::from_millis(80);
+        app.set_hovered_execution_at(None, left);
+        assert_eq!(app.execution_hover_progress_at(&id, left), 0.5);
         assert_eq!(
             app.execution_hover_progress_at(&id, left + Duration::from_millis(80)),
-            0.5
+            0.25
         );
         assert_eq!(
             app.execution_hover_progress_at(&id, left + Duration::from_millis(160)),
             0.0
         );
+    }
+
+    #[test]
+    fn hover_transitions_keep_multiple_cards_fading_during_rapid_a_to_b_to_c_moves() {
+        let (mut app, first) = app_with_execution_hitboxes();
+        let second = ExecutionId::Tool("call-2".to_owned());
+        let third = ExecutionId::Tool("call-3".to_owned());
+        let started = Instant::now();
+
+        app.set_hovered_execution_at(Some(first.clone()), started);
+        app.set_hovered_execution_at(Some(second.clone()), started + Duration::from_millis(80));
+        assert_eq!(
+            app.execution_hover_progress_at(&first, started + Duration::from_millis(80)),
+            0.5
+        );
+        assert_eq!(
+            app.execution_hover_progress_at(&second, started + Duration::from_millis(80)),
+            0.0
+        );
+
+        app.set_hovered_execution_at(Some(third.clone()), started + Duration::from_millis(120));
+        assert_eq!(
+            app.execution_hover_progress_at(&first, started + Duration::from_millis(120)),
+            0.375
+        );
+        assert_eq!(
+            app.execution_hover_progress_at(&second, started + Duration::from_millis(120)),
+            0.25
+        );
+        assert_eq!(
+            app.execution_hover_progress_at(&third, started + Duration::from_millis(120)),
+            0.0
+        );
+
+        assert_eq!(
+            app.execution_hover_progress_at(&first, started + Duration::from_millis(200)),
+            0.125
+        );
+        assert_eq!(
+            app.execution_hover_progress_at(&second, started + Duration::from_millis(200)),
+            0.125
+        );
+        assert_eq!(
+            app.execution_hover_progress_at(&third, started + Duration::from_millis(200)),
+            0.5
+        );
+    }
+
+    #[test]
+    fn completed_fade_out_transitions_are_cleaned_up_deterministically() {
+        let (mut app, id) = app_with_execution_hitboxes();
+        let started = Instant::now();
+        app.set_hovered_execution_at(Some(id.clone()), started);
+        app.set_hovered_execution_at(None, started + Duration::from_millis(160));
+
+        app.cleanup_execution_hover_transitions_at(started + Duration::from_millis(320));
+
+        assert!(!app.execution_hover_transitions.contains_key(&id));
+        assert_eq!(
+            app.execution_hover_progress_at(&id, started + Duration::from_millis(320)),
+            0.0
+        );
+    }
+
+    #[test]
+    fn return_bottom_button_wins_over_an_overlapping_execution_summary_for_click_and_hover() {
+        let (mut app, id) = app_with_execution_hitboxes();
+        app.scroll = 12;
+        app.set_return_bottom_button_hitbox(Some((4, 4, 12)));
+
+        app.update(AppEvent::Mouse(MouseAction::Move { column: 6, row: 4 }));
+        app.update(AppEvent::Mouse(MouseAction::LeftDown { column: 6, row: 4 }));
+
+        assert_eq!(app.scroll, 0);
+        assert!(!app.is_execution_expanded(&id));
+        assert!(app.hovered_execution.is_none());
+    }
+
+    #[test]
+    fn output_selection_uses_document_coordinates_and_continues_after_leaving_hitbox() {
+        let (mut app, id) = app_with_execution_hitboxes();
+        app.set_document_viewport(20, 11);
+        app.toggle_execution(id, 3);
+
+        app.update(AppEvent::Mouse(MouseAction::LeftDown { column: 5, row: 7 }));
+        app.update(AppEvent::Mouse(MouseAction::LeftDrag {
+            column: 8,
+            row: 15,
+        }));
+        app.update(AppEvent::Mouse(MouseAction::LeftUp { column: 9, row: 25 }));
+
+        assert_eq!(
+            app.text_selection,
+            Some(TextSelection {
+                anchor: TextPosition { row: 18, column: 5 },
+                focus: TextPosition { row: 30, column: 9 },
+                dragging: false,
+            })
+        );
+    }
+
+    #[test]
+    fn output_wheel_moves_three_rows_and_clamps_at_both_bounds() {
+        let (mut app, id) = app_with_execution_hitboxes();
+        app.toggle_execution(id.clone(), 3);
+        app.scroll = 5;
+
+        app.update(AppEvent::Mouse(MouseAction::ScrollDown {
+            column: 8,
+            row: 7,
+        }));
+        assert_eq!(app.execution_scroll(&id), 0);
+        app.update(AppEvent::Mouse(MouseAction::ScrollUp { column: 8, row: 7 }));
+        assert_eq!(app.execution_scroll(&id), 3);
+        app.execution_scrolls.insert(id.clone(), 11);
+        app.update(AppEvent::Mouse(MouseAction::ScrollUp { column: 8, row: 7 }));
+        assert_eq!(app.execution_scroll(&id), 12);
+        app.update(AppEvent::Mouse(MouseAction::ScrollDown {
+            column: 8,
+            row: 7,
+        }));
+        assert_eq!(app.execution_scroll(&id), 9);
+        assert_eq!(app.scroll, 5);
     }
 
     #[test]
@@ -4781,8 +4937,7 @@ mod tests {
         assert!(!app.execution_scrolls.contains_key(&id));
         assert!(app.execution_hitboxes.is_empty());
         assert!(app.hovered_execution.is_none());
-        assert!(app.previous_hovered_execution.is_none());
-        assert!(app.hover_changed_at.is_none());
+        assert!(app.execution_hover_transitions.is_empty());
         assert!(
             app.execution_output(&id)
                 .expect("resumed task output")
@@ -4826,8 +4981,7 @@ mod tests {
         assert!(app.persisted_execution_outputs.is_empty());
         assert!(app.execution_hitboxes.is_empty());
         assert!(app.hovered_execution.is_none());
-        assert!(app.previous_hovered_execution.is_none());
-        assert!(app.hover_changed_at.is_none());
+        assert!(app.execution_hover_transitions.is_empty());
     }
 
     #[test]
