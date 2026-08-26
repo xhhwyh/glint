@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -27,7 +25,10 @@ pub(super) struct ExecutionCardView<'a> {
     pub summary: &'a str,
     pub description: Option<&'a str>,
     pub status: String,
-    pub output: Cow<'a, str>,
+    /// Collapsed cards only need to know whether opening them can reveal output.
+    /// Keep the complete text out of this metadata projection so the normal
+    /// transcript frame does not clone or join large execution results.
+    pub has_output: bool,
     pub finished: bool,
     pub is_error: bool,
     pub streaming: bool,
@@ -58,7 +59,7 @@ pub(super) fn execution_card<'a>(
                 summary: message.tool_input.as_deref().unwrap_or(""),
                 description: message.tool_description.as_deref(),
                 status: tool_status(message),
-                output: app.execution_output_view(&id)?,
+                has_output: !message.content.is_empty(),
                 finished: message.tool_finished,
                 is_error: message.tool_is_error,
                 streaming: !message.tool_finished,
@@ -79,7 +80,10 @@ pub(super) fn execution_card<'a>(
                     .unwrap_or_else(|| transcript.description()),
                 description: Some(transcript.description()),
                 status: status.label().to_owned(),
-                output: app.execution_output_view(&id)?,
+                has_output: transcript
+                    .messages()
+                    .iter()
+                    .any(|message| !message.content.is_empty()),
                 finished: status.is_terminal(),
                 is_error: matches!(status, TaskStatus::Failed | TaskStatus::Cancelled),
                 streaming: status.is_running(),
@@ -91,6 +95,7 @@ pub(super) fn execution_card<'a>(
 
 pub(super) fn execution_card_lines(
     card: &ExecutionCardView<'_>,
+    output: Option<&str>,
     width: u16,
     expanded: bool,
     output_scroll: u16,
@@ -98,11 +103,7 @@ pub(super) fn execution_card_lines(
 ) -> ExecutionCardLines {
     let width = width.max(1) as usize;
     if !expanded {
-        let output_row_count = if card.output.is_empty() {
-            0
-        } else {
-            MAX_EXPANDED_OUTPUT_ROWS as usize
-        };
+        let output_row_count = usize::from(card.has_output) * MAX_EXPANDED_OUTPUT_ROWS as usize;
         let summary = card_summary(card, width, false, output_row_count, hover_fraction);
         return ExecutionCardLines {
             lines: vec![Line::from(""), Line::from(summary)],
@@ -112,7 +113,7 @@ pub(super) fn execution_card_lines(
         };
     }
 
-    let output_lines = wrap_text(&card.output, (width.saturating_sub(4)) as u16);
+    let output_lines = wrap_text(output.unwrap_or_default(), (width.saturating_sub(4)) as u16);
     let summary = card_summary(card, width, expanded, output_lines.len(), hover_fraction);
     let mut lines = vec![Line::from(""), Line::from(summary)];
     let mut regions = vec![None, Some(ExecutionRegion::Summary)];
@@ -264,14 +265,14 @@ mod tests {
         tasks::TaskStatus,
     };
 
-    fn bash_card_with_output(output: String) -> ExecutionCardView<'static> {
+    fn bash_card() -> ExecutionCardView<'static> {
         ExecutionCardView {
             id: ExecutionId::Tool("call-bash".to_owned()),
             name: "Bash",
             summary: "git remote update",
             description: None,
             status: "completed".to_owned(),
-            output: Cow::Owned(output),
+            has_output: true,
             finished: true,
             is_error: false,
             streaming: false,
@@ -280,13 +281,12 @@ mod tests {
 
     #[test]
     fn expanded_execution_output_is_capped_at_eight_rendered_rows() {
-        let card = bash_card_with_output(
-            (1..=20)
-                .map(|line| format!("line {line}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
-        let lines = execution_card_lines(&card, 80, true, 0, 0.0);
+        let card = bash_card();
+        let output = (1..=20)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = execution_card_lines(&card, Some(&output), 80, true, 0, 0.0);
 
         assert_eq!(lines.output_rows, 8);
         assert_eq!(lines.max_output_scroll, 12);
@@ -294,17 +294,18 @@ mod tests {
 
     #[test]
     fn execution_summary_has_no_border_or_disclosure_arrow() {
-        let card = bash_card_with_output("origin repository (fetch)".to_owned());
-        let rendered = execution_card_lines(&card, 100, false, 0, 0.0)
-            .lines
-            .into_iter()
-            .map(|line| {
-                line.spans
-                    .into_iter()
-                    .map(|span| span.content.into_owned())
-                    .collect::<String>()
-            })
-            .collect::<String>();
+        let card = bash_card();
+        let rendered =
+            execution_card_lines(&card, Some("origin repository (fetch)"), 100, false, 0, 0.0)
+                .lines
+                .into_iter()
+                .map(|line| {
+                    line.spans
+                        .into_iter()
+                        .map(|span| span.content.into_owned())
+                        .collect::<String>()
+                })
+                .collect::<String>();
 
         assert!(!rendered.contains('│'));
         assert!(!rendered.contains('╭'));
@@ -337,7 +338,11 @@ mod tests {
 
         let card = execution_card(&app, &app.messages[0]).expect("linked card");
         assert_eq!(card.id, ExecutionId::Task("task-1".to_owned()));
-        assert!(card.output.contains("found the parser"));
+        assert!(
+            app.execution_output_view(&card.id)
+                .expect("subagent output")
+                .contains("found the parser")
+        );
 
         let mut unlinked_app = App::test_empty();
         unlinked_app.messages.push(linked);
@@ -379,9 +384,9 @@ mod tests {
 
     #[test]
     fn collapsed_summary_uses_a_bounded_expansion_estimate_without_wrapping_output() {
-        let card = bash_card_with_output("0123456789abcdefghij".repeat(10_000));
-        let narrow = execution_card_lines(&card, 20, false, 0, 0.0);
-        let wide = execution_card_lines(&card, 40, false, 0, 0.0);
+        let card = bash_card();
+        let narrow = execution_card_lines(&card, None, 20, false, 0, 0.0);
+        let wide = execution_card_lines(&card, None, 40, false, 0, 0.0);
         let narrow_text = narrow
             .lines
             .iter()
@@ -417,13 +422,12 @@ mod tests {
 
     #[test]
     fn expanded_output_offset_is_measured_from_the_bottom() {
-        let card = bash_card_with_output(
-            (1..=20)
-                .map(|line| format!("line {line}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
-        let rendered = execution_card_lines(&card, 80, true, 3, 0.0)
+        let card = bash_card();
+        let output = (1..=20)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rendered = execution_card_lines(&card, Some(&output), 80, true, 3, 0.0)
             .lines
             .into_iter()
             .skip(2)
@@ -441,9 +445,9 @@ mod tests {
 
     #[test]
     fn hover_transition_brightens_the_summary_marker_without_changing_text_width() {
-        let card = bash_card_with_output("output".to_owned());
-        let resting = execution_card_lines(&card, 80, false, 0, 0.0);
-        let hovered = execution_card_lines(&card, 80, false, 0, 1.0);
+        let card = bash_card();
+        let resting = execution_card_lines(&card, Some("output"), 80, false, 0, 0.0);
+        let hovered = execution_card_lines(&card, Some("output"), 80, false, 0, 1.0);
 
         let resting_marker = &resting.lines[1].spans[0];
         let hovered_marker = &hovered.lines[1].spans[0];

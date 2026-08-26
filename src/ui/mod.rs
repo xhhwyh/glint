@@ -441,8 +441,13 @@ fn document(app: &App, width: u16) -> Document {
             let expanded = app.is_execution_expanded(&id);
             let output_scroll = app.execution_scroll(&id);
             let hover_progress = app.execution_hover_progress(&id);
+            // The normal collapsed projection deliberately carries only card
+            // metadata. Materialize the potentially large execution output
+            // exactly once, and only when the user has expanded this card.
+            let output = expanded.then(|| app.execution_output_view(&id)).flatten();
             let card_lines = execution::execution_card_lines(
                 &card,
+                output.as_deref(),
                 width,
                 expanded,
                 output_scroll,
@@ -453,7 +458,7 @@ fn document(app: &App, width: u16) -> Document {
                     expansion_rows: card_lines.output_rows,
                     max_output_scroll: card_lines.max_output_scroll,
                 }
-            } else if !card.output.is_empty() {
+            } else if card.has_output {
                 ExecutionExpansionMetrics {
                     expansion_rows: MAX_EXPANDED_OUTPUT_ROWS,
                     max_output_scroll: 0,

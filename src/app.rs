@@ -7,6 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use anyhow::{Context, Result, bail};
 
 use crate::{
@@ -94,6 +97,8 @@ pub struct App {
     turn_started_at: Option<Instant>,
     last_turn_duration: Option<Duration>,
     runtime: SessionRuntime,
+    #[cfg(test)]
+    execution_output_projection_count: Cell<usize>,
 }
 
 struct TrustedPersistedOutput {
@@ -555,6 +560,8 @@ impl App {
             turn_started_at: None,
             last_turn_duration: None,
             runtime,
+            #[cfg(test)]
+            execution_output_projection_count: Cell::new(0),
         })
     }
 
@@ -630,6 +637,7 @@ impl App {
                 std::env::temp_dir().join(format!("glint-app-test-{}.jsonl", uuid::Uuid::new_v4())),
                 "/workspace".to_owned(),
             ),
+            execution_output_projection_count: Cell::new(0),
         }
     }
 
@@ -749,10 +757,18 @@ impl App {
     }
 
     pub fn execution_output_view<'a>(&'a self, id: &ExecutionId) -> Option<Cow<'a, str>> {
+        #[cfg(test)]
+        self.execution_output_projection_count
+            .set(self.execution_output_projection_count.get() + 1);
         match id {
             ExecutionId::Tool(tool_call_id) => self.bash_execution_output_view(tool_call_id),
             ExecutionId::Task(task_id) => self.subagent_execution_output_view(task_id),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execution_output_projection_count(&self) -> usize {
+        self.execution_output_projection_count.get()
     }
 
     pub fn set_hovered_execution(&mut self, id: Option<ExecutionId>) {
@@ -4413,6 +4429,62 @@ mod tests {
             status: TaskStatus::Running,
             tool_use_count: 0,
         })
+    }
+
+    #[test]
+    fn collapsed_execution_cards_skip_bash_subagent_and_persisted_output_projection() {
+        let mut app = App::test_empty();
+        app.messages.push(finished_bash_message(
+            "inline-bash",
+            &"inline output ".repeat(20_000),
+        ));
+
+        let persisted_path = expected_artifact(&app, "persisted-bash", "Bash");
+        app.messages.push(finished_bash_message(
+            "persisted-bash",
+            &persisted_output_marker(&persisted_path),
+        ));
+        app.persisted_execution_outputs
+            .insert(persisted_path, "cached persisted output ".repeat(20_000));
+
+        app.messages.push(Message::tool_with_description(
+            "subagent-call",
+            "Subagent",
+            "inspect output",
+            None,
+        ));
+        app.subagent_transcripts.insert(
+            "task-1".to_owned(),
+            SubagentTranscript::from_snapshot(SubagentTranscriptSnapshot {
+                task_id: "task-1".to_owned(),
+                tool_call_id: "subagent-call".to_owned(),
+                description: "inspect output".to_owned(),
+                prompt: "inspect output".to_owned(),
+                messages: vec![Message::assistant("live subagent output ".repeat(20_000))],
+                activity: None,
+                status: TaskStatus::Running,
+                tool_use_count: 0,
+            }),
+        );
+
+        crate::ui::prepare_document(&app, 80, 24);
+
+        assert_eq!(app.execution_output_projection_count(), 0);
+    }
+
+    #[test]
+    fn expanded_execution_card_projects_its_current_output_once_per_prepared_document() {
+        let mut app = App::test_empty();
+        let id = ExecutionId::Tool("inline-bash".to_owned());
+        app.messages.push(finished_bash_message(
+            "inline-bash",
+            &"inline output ".repeat(20_000),
+        ));
+        app.expanded_executions.insert(id);
+
+        crate::ui::prepare_document(&app, 80, 24);
+
+        assert_eq!(app.execution_output_projection_count(), 1);
     }
 
     fn persisted_output_marker(path: &std::path::Path) -> String {
