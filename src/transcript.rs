@@ -19,6 +19,7 @@ use crate::{
     },
     message::Message,
     progress::{ProgressState, TodoUpdate},
+    subagent_transcript::SubagentTranscriptSnapshot,
 };
 
 const SCHEMA: u16 = 4;
@@ -164,6 +165,10 @@ pub enum EventMsg {
         status: String,
         summary: Option<String>,
         error: Option<String>,
+    },
+    SubagentPresentation {
+        task_id: String,
+        snapshot: serde_json::Value,
     },
     TodoUpdated {
         turn_id: Option<String>,
@@ -487,7 +492,7 @@ impl TranscriptStore {
                 TranscriptPayload::ResponseItem(ResponseItem::FunctionCallOutput {
                     call_id,
                     output,
-                    is_error: _,
+                    is_error,
                 }) => {
                     if let Some(message) = tool_indexes
                         .get(call_id.as_str())
@@ -495,6 +500,7 @@ impl TranscriptStore {
                     {
                         message.content = output.clone();
                         message.tool_finished = true;
+                        message.tool_is_error = *is_error;
                     }
                 }
                 TranscriptPayload::ResponseItem(ResponseItem::CompactBoundary { .. }) => {
@@ -555,6 +561,26 @@ impl TranscriptStore {
             }
         }
         state
+    }
+
+    pub fn ui_subagent_transcripts(&self) -> Vec<SubagentTranscriptSnapshot> {
+        let last_clear_index = self.entries.iter().rposition(|entry| {
+            matches!(
+                entry.payload,
+                TranscriptPayload::ResponseItem(ResponseItem::ClearBoundary)
+            )
+        });
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| last_clear_index.is_none_or(|clear| *index > clear))
+            .filter_map(|(_, entry)| match &entry.payload {
+                TranscriptPayload::EventMsg(EventMsg::SubagentPresentation {
+                    snapshot, ..
+                }) => serde_json::from_value(snapshot.clone()).ok(),
+                _ => None,
+            })
+            .collect()
     }
 
     pub fn append_user(&mut self, content: String) -> Result<()> {
@@ -702,6 +728,19 @@ impl TranscriptStore {
                 status,
                 summary,
                 error,
+            }),
+        )
+    }
+
+    pub fn append_subagent_presentation(
+        &mut self,
+        snapshot: &SubagentTranscriptSnapshot,
+    ) -> Result<()> {
+        self.append(
+            TranscriptEntryType::EventMsg,
+            TranscriptPayload::EventMsg(EventMsg::SubagentPresentation {
+                task_id: snapshot.task_id.clone(),
+                snapshot: serde_json::to_value(snapshot)?,
             }),
         )
     }
@@ -1238,11 +1277,60 @@ fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        message::Role, subagent_transcript::SubagentTranscriptSnapshot, tasks::TaskStatus,
+    };
+
+    fn completed_snapshot(task_id: &str, tool_call_id: &str) -> SubagentTranscriptSnapshot {
+        SubagentTranscriptSnapshot {
+            task_id: task_id.to_owned(),
+            tool_call_id: tool_call_id.to_owned(),
+            description: "inspect parser".to_owned(),
+            prompt: "check parser".to_owned(),
+            messages: vec![Message::new(Role::Assistant, "done")],
+            activity: Some("completed".to_owned()),
+            status: TaskStatus::Completed,
+            tool_use_count: 1,
+        }
+    }
 
     fn store() -> TranscriptStore {
         TranscriptStore::empty(
             std::env::temp_dir().join(format!("glint-transcript-test-{}.jsonl", new_id())),
         )
+    }
+
+    #[test]
+    fn completed_subagent_snapshot_restores_ui_without_model_history() {
+        let mut store = store();
+        let snapshot = completed_snapshot("a1", "call-subagent");
+        store.append_subagent_presentation(&snapshot).unwrap();
+
+        assert_eq!(store.ui_subagent_transcripts(), vec![snapshot]);
+        assert!(store.model_history().is_empty());
+    }
+
+    #[test]
+    fn subagent_presentations_skip_malformed_payloads_and_pre_clear_entries() {
+        let mut store = store();
+        store
+            .append_subagent_presentation(&completed_snapshot("old", "call-old"))
+            .unwrap();
+        store.append_clear_boundary().unwrap();
+        store
+            .append(
+                TranscriptEntryType::EventMsg,
+                TranscriptPayload::EventMsg(EventMsg::SubagentPresentation {
+                    task_id: "broken".to_owned(),
+                    snapshot: serde_json::json!({"task_id": 42}),
+                }),
+            )
+            .unwrap();
+        let current = completed_snapshot("new", "call-new");
+        store.append_subagent_presentation(&current).unwrap();
+
+        let loaded = TranscriptStore::load_path(store.path.clone()).expect("load transcript");
+        assert_eq!(loaded.ui_subagent_transcripts(), vec![current]);
     }
 
     fn assistant(content: &str) -> AssistantTranscript {

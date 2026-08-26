@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{Arc, mpsc::Receiver},
     time::{Duration, Instant},
@@ -31,6 +32,7 @@ use crate::{
         McpApprovalPolicy, McpConfig, McpOAuthConfig, McpServerConfig, McpTransportConfig,
         persist_mcp_server,
     },
+    subagent_transcript::SubagentTranscript,
     tasks::{
         self, SubagentRequest, SubagentStartResponse, SubagentSteering, TaskRequest, TaskSnapshot,
     },
@@ -47,6 +49,7 @@ use crate::config::{LlmConfig, LlmProviderConfig, LspConfig, ModelCatalog};
 pub struct App {
     pub should_quit: bool,
     pub messages: Vec<Message>,
+    pub subagent_transcripts: BTreeMap<String, SubagentTranscript>,
     pub input: InputState,
     pub status: AgentStatus,
     pub scroll: u16,
@@ -478,10 +481,21 @@ impl App {
             config.extensions.hooks.clone(),
         )?;
         let messages = runtime.ui_messages();
+        let subagent_transcripts = runtime
+            .ui_subagent_transcripts()
+            .into_iter()
+            .map(|snapshot| {
+                (
+                    snapshot.task_id.clone(),
+                    SubagentTranscript::from_snapshot(snapshot),
+                )
+            })
+            .collect();
         let usage = runtime.usage();
         Ok(Self {
             should_quit: false,
             messages,
+            subagent_transcripts,
             input: InputState::default(),
             status: AgentStatus::Idle,
             scroll: 0,
@@ -528,6 +542,7 @@ impl App {
         Self {
             should_quit: false,
             messages: Vec::new(),
+            subagent_transcripts: BTreeMap::new(),
             input: InputState::default(),
             status: AgentStatus::Idle,
             scroll: 0,
@@ -643,6 +658,8 @@ impl App {
     #[cfg(test)]
     pub(crate) fn test_start_subagent_task(&mut self, request: &SubagentRequest) {
         self.runtime.start_subagent_task(request, 0).unwrap();
+        self.subagent_transcripts
+            .insert(request.task_id.clone(), SubagentTranscript::new(request));
     }
 
     pub fn pinned_progress(&self) -> Option<&TodoUpdate> {
@@ -714,6 +731,9 @@ impl App {
                 } => {
                     let result = self.runtime.send_task_message(&task_id, message.clone());
                     if let Ok(task) = &result {
+                        if let Some(transcript) = self.subagent_transcripts.get_mut(&task.id) {
+                            transcript.append_steering(message.clone());
+                        }
                         if let Some(tab) = task
                             .terminal_tab
                             .and_then(|terminal_tab| self.terminal_tabs.get_mut(terminal_tab))
@@ -791,6 +811,8 @@ impl App {
 
         let mut tab = TerminalTab::new_subagent(subagent_terminal_title(&task));
         tab.append_subagent_message(Message::user(request.prompt.clone()));
+        self.subagent_transcripts
+            .insert(task.id.clone(), SubagentTranscript::new(&request));
         self.terminal_tabs.push(tab);
         self.active_terminal_tab = terminal_tab;
         self.terminal_visible = true;
@@ -847,17 +869,27 @@ impl App {
         for event in self.runtime.poll_subagent_events() {
             match event {
                 SubagentRuntimeEvent::Agent {
+                    task_id,
                     terminal_tab,
                     event,
-                } => self.update_subagent_tab_event(terminal_tab, event),
-                SubagentRuntimeEvent::Finished { terminal_tab, task } => {
-                    self.finish_subagent_result(terminal_tab, task);
+                } => {
+                    if let Some(transcript) = self.subagent_transcripts.get_mut(&task_id) {
+                        transcript.apply(&event);
+                    }
+                    self.update_subagent_tab_event(terminal_tab, &event);
+                }
+                SubagentRuntimeEvent::Finished {
+                    task_id,
+                    terminal_tab,
+                    task,
+                } => {
+                    self.finish_subagent_result(&task_id, terminal_tab, task);
                 }
             }
         }
     }
 
-    fn update_subagent_tab_event(&mut self, terminal_tab: usize, event: AgentEvent) {
+    fn update_subagent_tab_event(&mut self, terminal_tab: usize, event: &AgentEvent) {
         let Some(tab) = self.terminal_tabs.get_mut(terminal_tab) else {
             return;
         };
@@ -868,7 +900,7 @@ impl App {
             }
             AgentEvent::AssistantDelta(delta) => {
                 tab.set_subagent_activity(None);
-                tab.append_subagent_assistant_delta(&delta);
+                tab.append_subagent_assistant_delta(delta);
             }
             AgentEvent::AssistantTurn { .. } => {}
             AgentEvent::ToolStarted {
@@ -880,29 +912,31 @@ impl App {
                 tab.set_subagent_activity(Some(format!("Running {name}: {input_summary}")));
                 tab.remove_empty_subagent_assistant_tail();
                 tab.append_subagent_message(Message::tool_with_description(
-                    id,
-                    name,
-                    input_summary,
-                    input_description,
+                    id.clone(),
+                    name.clone(),
+                    input_summary.clone(),
+                    input_description.clone(),
                 ));
             }
             AgentEvent::ToolFinished {
                 id,
                 name,
                 output,
+                is_error,
                 output_summary,
-                ..
             } => {
                 tab.set_subagent_activity(Some(format!("Finished {name}: {output_summary}")));
                 if name == "Read" {
-                    if let Some(message) = tab.subagent_tool_message_mut(&id) {
+                    if let Some(message) = tab.subagent_tool_message_mut(id) {
                         message.tool_finished = true;
+                        message.tool_is_error = *is_error;
                     }
                     return;
                 }
-                if let Some(message) = tab.subagent_tool_message_mut(&id) {
-                    message.content = output;
+                if let Some(message) = tab.subagent_tool_message_mut(id) {
+                    message.content = output.clone();
                     message.tool_finished = true;
+                    message.tool_is_error = *is_error;
                 }
             }
             AgentEvent::ToolApprovalRequested(request) => {
@@ -922,13 +956,18 @@ impl App {
             AgentEvent::Failed(error) => {
                 tab.set_subagent_activity(None);
                 tab.remove_empty_subagent_assistant_tail();
-                tab.append_subagent_assistant_delta(&error);
-                tab.finish_subagent(TerminalStatus::Error(error));
+                tab.append_subagent_assistant_delta(error);
+                tab.finish_subagent(TerminalStatus::Error(error.clone()));
             }
         }
     }
 
-    fn finish_subagent_result(&mut self, terminal_tab: usize, task: TaskSnapshot) {
+    fn finish_subagent_result(&mut self, task_id: &str, terminal_tab: usize, task: TaskSnapshot) {
+        if let Some(transcript) = self.subagent_transcripts.get_mut(task_id) {
+            transcript.finish(&task);
+            let snapshot = transcript.snapshot();
+            self.runtime.append_subagent_presentation(&snapshot).ok();
+        }
         if let Some(tab) = self.terminal_tabs.get_mut(terminal_tab) {
             let status = match task.status {
                 tasks::TaskStatus::Completed => TerminalStatus::Idle,
@@ -2614,6 +2653,16 @@ impl App {
     fn apply_loaded_transcript(&mut self, loaded: LoadedTranscript) {
         self.messages = loaded.messages;
         self.usage = loaded.usage;
+        self.subagent_transcripts = loaded
+            .subagent_transcripts
+            .into_iter()
+            .map(|snapshot| {
+                (
+                    snapshot.task_id.clone(),
+                    SubagentTranscript::from_snapshot(snapshot),
+                )
+            })
+            .collect();
         self.scroll = 0;
         self.approval = None;
     }
@@ -3980,12 +4029,104 @@ fn home_relative_path(path: &Path) -> String {
 mod tests {
     use std::fs;
 
-    use crate::{agent::should_auto_compact, commands::SLASH_COMMANDS, plugins::PluginsConfig};
+    use crate::{
+        agent::should_auto_compact,
+        commands::SLASH_COMMANDS,
+        plugins::PluginsConfig,
+        subagent_transcript::SubagentTranscriptSnapshot,
+        tasks::{SubagentBackend, TaskStatus},
+    };
 
     use super::*;
 
     fn app() -> App {
         App::test_empty()
+    }
+
+    fn subagent_request() -> SubagentRequest {
+        SubagentRequest {
+            task_id: "a1".to_owned(),
+            tool_call_id: "call-subagent".to_owned(),
+            description: "inspect parser".to_owned(),
+            prompt: "check parser".to_owned(),
+            agent: None,
+            backend: SubagentBackend::Codex,
+            cwd: "/workspace".to_owned(),
+        }
+    }
+
+    fn subagent_snapshot() -> SubagentTranscriptSnapshot {
+        SubagentTranscriptSnapshot {
+            task_id: "a1".to_owned(),
+            tool_call_id: "call-subagent".to_owned(),
+            description: "inspect parser".to_owned(),
+            prompt: "check parser".to_owned(),
+            messages: vec![Message::assistant("done")],
+            activity: Some("completed".to_owned()),
+            status: TaskStatus::Completed,
+            tool_use_count: 1,
+        }
+    }
+
+    #[test]
+    fn loaded_transcript_rebuilds_subagent_transcripts_by_task_id() {
+        let mut app = app();
+        app.apply_loaded_transcript(LoadedTranscript {
+            messages: Vec::new(),
+            usage: ConversationUsage::default(),
+            subagent_transcripts: vec![subagent_snapshot()],
+        });
+
+        let transcript = app.subagent_transcripts.get("a1").expect("transcript");
+        assert_eq!(transcript.tool_call_id(), "call-subagent");
+    }
+
+    #[test]
+    fn starting_subagent_task_creates_live_transcript() {
+        let mut app = app();
+        app.test_start_subagent_task(&subagent_request());
+
+        assert!(app.subagent_transcripts.contains_key("a1"));
+    }
+
+    #[test]
+    fn subagent_runtime_updates_and_persists_transcript_by_task_id() {
+        let mut app = app();
+        let request = subagent_request();
+        app.test_start_subagent_task(&request);
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+        let (control_tx, _control_rx) = std::sync::mpsc::channel();
+        app.runtime.attach_subagent_run(
+            request.task_id.clone(),
+            0,
+            event_rx,
+            outcome_rx,
+            control_tx,
+            Arc::new(SubagentSteering::default()),
+        );
+
+        event_tx.send(AgentEvent::Started).unwrap();
+        event_tx
+            .send(AgentEvent::AssistantDelta("checking".to_owned()))
+            .unwrap();
+        app.drain_subagent_events();
+        assert!(
+            app.subagent_transcripts["a1"].messages()[1]
+                .content
+                .contains("checking")
+        );
+
+        outcome_tx
+            .send(tasks::SubagentOutcome::completed("done"))
+            .unwrap();
+        app.drain_subagent_events();
+
+        assert_eq!(
+            app.subagent_transcripts["a1"].status(),
+            TaskStatus::Completed
+        );
+        assert_eq!(app.runtime.ui_subagent_transcripts().len(), 1);
     }
 
     #[test]

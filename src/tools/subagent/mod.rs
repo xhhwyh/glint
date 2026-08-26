@@ -77,6 +77,7 @@ pub(super) fn subagent(call: &ToolCall, task_requests: Option<&Sender<TaskReques
     let task_id = next_task_id();
     let request = SubagentRequest {
         task_id: task_id.clone(),
+        tool_call_id: call.id.clone(),
         description: description.to_owned(),
         prompt: prompt.to_owned(),
         agent: string_arg(call, "agent").map(str::to_owned),
@@ -209,6 +210,7 @@ mod tests {
             };
             assert_eq!(request.description, "inspect parser");
             assert_eq!(request.prompt, "look at parser");
+            assert_eq!(request.tool_call_id, "call");
             response
                 .send(crate::tasks::SubagentStartResponse::started(
                     request.task_id,

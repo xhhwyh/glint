@@ -8,6 +8,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use serde::{Deserialize, Serialize};
+
 pub const MAX_RUNNING_SUBAGENTS: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,7 +17,7 @@ pub enum TaskKind {
     Subagent,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum TaskStatus {
     Queued,
     Running,
@@ -67,6 +69,7 @@ impl SubagentBackend {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubagentRequest {
     pub task_id: String,
+    pub tool_call_id: String,
     pub description: String,
     pub prompt: String,
     pub agent: Option<String>,
@@ -464,6 +467,7 @@ mod tests {
     fn request(id: &str) -> SubagentRequest {
         SubagentRequest {
             task_id: id.to_owned(),
+            tool_call_id: "call-subagent".to_owned(),
             description: "inspect parser".to_owned(),
             prompt: "check the parser".to_owned(),
             agent: None,

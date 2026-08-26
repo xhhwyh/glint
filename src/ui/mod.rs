@@ -900,6 +900,7 @@ mod tests {
         let mut app = crate::app::App::test_empty();
         app.test_start_subagent_task(&SubagentRequest {
             task_id: "a1".to_owned(),
+            tool_call_id: "call-subagent".to_owned(),
             description: "Inspect parser".to_owned(),
             prompt: "Inspect the parser".to_owned(),
             agent: None,

@@ -1,6 +1,8 @@
+use serde::{Deserialize, Serialize};
+
 use crate::progress::TodoUpdate;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum Role {
     User,
     Assistant,
@@ -8,7 +10,7 @@ pub enum Role {
     Progress,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct Message {
     pub role: Role,
     pub content: String,
@@ -17,6 +19,8 @@ pub struct Message {
     pub tool_input: Option<String>,
     pub tool_description: Option<String>,
     pub tool_finished: bool,
+    #[serde(default)]
+    pub tool_is_error: bool,
     pub progress: Option<TodoUpdate>,
 }
 
@@ -30,6 +34,7 @@ impl Message {
             tool_input: None,
             tool_description: None,
             tool_finished: false,
+            tool_is_error: false,
             progress: None,
         }
     }
@@ -56,6 +61,7 @@ impl Message {
             tool_input: Some(input.into()),
             tool_description: description,
             tool_finished: false,
+            tool_is_error: false,
             progress: None,
         }
     }
@@ -69,6 +75,7 @@ impl Message {
             tool_input: None,
             tool_description: None,
             tool_finished: true,
+            tool_is_error: false,
             progress: Some(update),
         }
     }

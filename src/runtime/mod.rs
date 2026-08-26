@@ -27,6 +27,7 @@ use crate::{
         lsp::LspManager,
         mcp::{McpConfig, McpElicitation, McpElicitationRequest, McpManager, McpServerStatus},
     },
+    subagent_transcript::SubagentTranscriptSnapshot,
     tasks::{
         self, SubagentOutcome, SubagentRequest, SubagentSteering, TaskManager, TaskRequest,
         TaskSnapshot, TaskWaitResponse,
@@ -125,6 +126,7 @@ pub enum RuntimeEvent {
 pub struct LoadedTranscript {
     pub messages: Vec<Message>,
     pub usage: ConversationUsage,
+    pub subagent_transcripts: Vec<SubagentTranscriptSnapshot>,
 }
 
 pub struct CompactFinished {
@@ -150,10 +152,12 @@ pub struct AssistantRecord {
 
 pub enum SubagentRuntimeEvent {
     Agent {
+        task_id: String,
         terminal_tab: usize,
         event: AgentEvent,
     },
     Finished {
+        task_id: String,
         terminal_tab: usize,
         task: TaskSnapshot,
     },
@@ -259,6 +263,10 @@ impl SessionRuntime {
         self.transcript.ui_messages()
     }
 
+    pub fn ui_subagent_transcripts(&self) -> Vec<SubagentTranscriptSnapshot> {
+        self.transcript.ui_subagent_transcripts()
+    }
+
     pub fn usage(&self) -> ConversationUsage {
         usage_from_transcript(&self.transcript)
     }
@@ -333,9 +341,14 @@ impl SessionRuntime {
         let transcript = TranscriptStore::load_path(path)?;
         let messages = transcript.ui_messages();
         let usage = usage_from_transcript(&transcript);
+        let subagent_transcripts = transcript.ui_subagent_transcripts();
         self.transcript = transcript;
         self.reset_session_state();
-        Ok(LoadedTranscript { messages, usage })
+        Ok(LoadedTranscript {
+            messages,
+            usage,
+            subagent_transcripts,
+        })
     }
 
     pub fn create_new_session(&mut self) -> Result<LoadedTranscript> {
@@ -365,6 +378,7 @@ impl SessionRuntime {
         LoadedTranscript {
             messages: self.transcript.ui_messages(),
             usage: usage_from_transcript(&self.transcript),
+            subagent_transcripts: self.transcript.ui_subagent_transcripts(),
         }
     }
 
@@ -505,6 +519,7 @@ impl SessionRuntime {
                     );
                 }
                 runtime_events.push(SubagentRuntimeEvent::Agent {
+                    task_id: run.task_id.clone(),
                     terminal_tab: run.terminal_tab,
                     event,
                 });
@@ -523,6 +538,7 @@ impl SessionRuntime {
             let run = self.running_subagents.remove(index);
             if let Some(task) = self.finish_subagent_task(&run.task_id, outcome) {
                 runtime_events.push(SubagentRuntimeEvent::Finished {
+                    task_id: run.task_id,
                     terminal_tab: run.terminal_tab,
                     task,
                 });
@@ -653,6 +669,13 @@ impl SessionRuntime {
             .append_hidden_user(tasks::task_model_context_message(&task))
             .ok();
         Some(task)
+    }
+
+    pub fn append_subagent_presentation(
+        &mut self,
+        snapshot: &SubagentTranscriptSnapshot,
+    ) -> Result<()> {
+        self.transcript.append_subagent_presentation(snapshot)
     }
 
     pub fn terminal_tab_has_running_task(&self, terminal_tab: usize) -> bool {
@@ -1112,12 +1135,37 @@ mod tests {
     fn subagent_request() -> SubagentRequest {
         SubagentRequest {
             task_id: "a1".to_owned(),
+            tool_call_id: "call-subagent".to_owned(),
             description: "inspect parser".to_owned(),
             prompt: "look at parser".to_owned(),
             agent: None,
             backend: SubagentBackend::Codex,
             cwd: "/workspace".to_owned(),
         }
+    }
+
+    #[test]
+    fn subagent_runtime_events_carry_task_id() {
+        let mut runtime = runtime();
+        let request = subagent_request();
+        runtime.start_subagent_task(&request, 0).unwrap();
+        let (event_tx, event_rx) = mpsc::channel();
+        let (_outcome_tx, outcome_rx) = mpsc::channel();
+        let (control_tx, _control_rx) = mpsc::channel();
+        runtime.attach_subagent_run(
+            request.task_id.clone(),
+            0,
+            event_rx,
+            outcome_rx,
+            control_tx,
+            Arc::new(SubagentSteering::default()),
+        );
+        event_tx.send(AgentEvent::Started).unwrap();
+
+        assert!(matches!(
+            runtime.poll_subagent_events().as_slice(),
+            [SubagentRuntimeEvent::Agent { task_id, .. }] if task_id == "a1"
+        ));
     }
 
     #[test]
@@ -1195,8 +1243,8 @@ mod tests {
         let events = runtime.poll_subagent_events();
         assert!(matches!(
             events.as_slice(),
-            [SubagentRuntimeEvent::Finished { task, .. }]
-                if task.status == tasks::TaskStatus::Cancelled
+            [SubagentRuntimeEvent::Finished { task_id, task, .. }]
+                if task_id == "a1" && task.status == tasks::TaskStatus::Cancelled
         ));
     }
 

@@ -13,6 +13,7 @@ mod query;
 mod runtime;
 mod services;
 mod settings;
+mod subagent_transcript;
 mod tasks;
 mod terminal;
 mod tools;
