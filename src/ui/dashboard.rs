@@ -10,7 +10,6 @@ use super::{
     format::context_usage_label,
     layout::{box_bottom, box_top_spans, truncate_end_to_width},
     star,
-    terminal::terminal_status_label,
     theme::*,
 };
 
@@ -195,14 +194,12 @@ fn project_info_box(app: &App, width: usize) -> Vec<Vec<Span<'static>>> {
         .unwrap_or(0);
     let context = context_usage_label(context_tokens, app.config.llm.context_window);
     let tokens = app.usage.total_tokens.to_string();
-    let terminal = terminal_status_label(app).trim().to_owned();
 
     vec![
         mini_box_top("PROJECT", width),
         metric_row("CWD", &app.current_dir, width),
         metric_row("CONTEXT", &context, width),
         metric_row("TOKENS", &tokens, width),
-        metric_row("TERMINAL", &terminal, width),
         mini_box_bottom(width),
     ]
 }

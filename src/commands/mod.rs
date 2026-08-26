@@ -24,14 +24,13 @@ pub enum SlashCommandKind {
     Compact,
     Model,
     Resume,
-    Terminal,
     Mcp,
     Plugins,
     PluginPrompt(usize),
     ReloadPlugins,
 }
 
-pub const SLASH_COMMANDS: [BuiltinSlashCommand; 12] = [
+pub const SLASH_COMMANDS: [BuiltinSlashCommand; 11] = [
     BuiltinSlashCommand {
         name: "/archive",
         description: "Archive this session",
@@ -87,11 +86,6 @@ pub const SLASH_COMMANDS: [BuiltinSlashCommand; 12] = [
         description: "Open runtime, usage, and workspace statistics",
         kind: SlashCommandKind::Status,
     },
-    BuiltinSlashCommand {
-        name: "/terminal",
-        description: "Toggle the visible terminal",
-        kind: SlashCommandKind::Terminal,
-    },
 ];
 
 pub fn matching_slash_commands(query: &str, plugins: &[PluginCommand]) -> Vec<SlashCommand> {
@@ -142,14 +136,12 @@ mod tests {
     }
 
     #[test]
-    fn terminal_command_describes_only_the_visible_terminal() {
-        let terminal = SLASH_COMMANDS
-            .iter()
-            .find(|command| command.name == "/terminal")
-            .expect("terminal command is registered");
-
-        assert_eq!(terminal.description, "Toggle the visible terminal");
-        assert!(!terminal.description.contains("terminal-backed shell tool"));
+    fn slash_commands_do_not_include_terminal() {
+        assert!(
+            !SLASH_COMMANDS
+                .iter()
+                .any(|command| command.name == "/terminal")
+        );
     }
 
     #[test]

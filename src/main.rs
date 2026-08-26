@@ -16,7 +16,6 @@ mod services;
 mod settings;
 mod subagent_transcript;
 mod tasks;
-mod terminal;
 mod tools;
 mod transcript;
 mod ui;
@@ -97,42 +96,20 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
 
     while !app.should_quit {
         let size = terminal.size()?;
-        let terminal_height = ui::terminal_height_for_app(&app, size.height);
-        let document_height = size.height.saturating_sub(terminal_height);
-        let terminal_top_row = size.height.saturating_sub(terminal_height);
-        app.set_terminal_top_row(terminal_top_row);
-        if terminal_height > 0 {
-            let terminal_content_width = ui::terminal_content_width(size.width);
-            app.resize_terminal(terminal_height.saturating_sub(2), terminal_content_width);
-            app.set_terminal_content_geometry(
-                terminal_height.saturating_sub(2),
-                ui::terminal_content_x_offset(size.width),
-                terminal_content_width,
-            );
-        } else {
-            app.set_terminal_content_geometry(0, 0, 1);
-        }
-        app.update_terminal();
         app.update_tasks();
         app.set_document_viewport(
-            ui::document_viewport_height(&app, size.width, document_height),
-            ui::document_scroll_top(&app, size.width, document_height),
+            ui::document_viewport_height(&app, size.width, size.height),
+            ui::document_scroll_top(&app, size.width, size.height),
         );
-        let execution_hitboxes = ui::execution_hitboxes(&app, size.width, document_height);
+        let execution_hitboxes = ui::execution_hitboxes(&app, size.width, size.height);
         app.set_execution_hitboxes(execution_hitboxes);
         let (input_top_row, input_rows, input_content_width) =
-            ui::composer_hitbox(&app, size.width, document_height);
+            ui::composer_hitbox(&app, size.width, size.height);
         app.set_input_hitbox(input_top_row, input_rows, input_content_width);
         app.set_return_bottom_button_hitbox(ui::return_bottom_button_hitbox(
             &app,
             size.width,
-            document_height,
-        ));
-        app.set_terminal_tab_hitbox(ui::terminal_tab_hitbox(
-            &app,
-            terminal_top_row,
-            size.width,
-            terminal_height,
+            size.height,
         ));
         app.set_mcp_detail_max_scroll(ui::mcp_detail_max_scroll(&app, size.width, size.height));
         app.set_plugins_detail_max_scroll(ui::plugins_detail_max_scroll(
@@ -149,8 +126,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
             match term_event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     let input = KeyInput::from(key);
-                    if input.action == KeyAction::Quit && !app.should_defer_key_to_terminal(&input)
-                    {
+                    if input.action == KeyAction::Quit {
                         if let Some(text) = app.selected_input_text() {
                             match copy_selection_to_clipboard(terminal, &text) {
                                 Ok(()) => app.finish_input_selection_copy(),
@@ -192,7 +168,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         }
 
         app.update_agent_events();
-        app.update_terminal();
         app.update_tasks();
     }
 

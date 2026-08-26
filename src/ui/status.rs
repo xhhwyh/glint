@@ -18,7 +18,6 @@ use super::{
         cached_suffix, context_usage_label, duration_label, now, parse_price_number, unit_suffix,
     },
     layout::{pad_to_width, truncate_end_to_width, wrap_text},
-    terminal::terminal_status_label,
     theme::*,
 };
 
@@ -117,7 +116,6 @@ fn status_general_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         .providers
         .iter()
         .find(|provider| provider.name == app.config.llm.provider);
-    let terminal_status = terminal_status_label(app).trim().to_owned();
     let edit_permission = if app.edit_always_allowed() {
         "edit auto-approved"
     } else {
@@ -130,8 +128,6 @@ fn status_general_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             entries: vec![
                 ("State", format!("{:?}", app.status)),
                 ("Workspace", app.current_dir.clone()),
-                ("Terminal", terminal_status),
-                ("Shell tool", "Bash".to_owned()),
                 ("Permissions", edit_permission.to_owned()),
             ],
         },
@@ -833,6 +829,33 @@ mod tests {
     fn calendar_month_labels_use_three_letter_names() {
         assert_eq!(month_abbrev(6), "Jun");
         assert_eq!(month_abbrev(7), "Jul");
+    }
+
+    #[test]
+    fn general_and_task_status_lines_have_no_terminal_labels() {
+        let app = App::test_empty();
+        let general = status_general_lines(&app, 100)
+            .iter()
+            .map(line_text)
+            .collect::<String>();
+        let tasks = status_task_lines(
+            &app,
+            &StatusView {
+                tab: StatusTab::Tasks,
+                stats: WorkspaceUsageStats::default(),
+                error: None,
+                selected_task: 0,
+            },
+            100,
+            20,
+        )
+        .iter()
+        .map(line_text)
+        .collect::<String>();
+
+        assert!(!general.contains("Terminal"));
+        assert!(!general.contains("Shell tool"));
+        assert!(!tasks.contains("terminal-tab"));
     }
 
     #[test]

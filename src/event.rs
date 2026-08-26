@@ -63,10 +63,6 @@ pub enum MouseAction {
 pub enum KeyAction {
     Quit,
     ForceQuit,
-    ToggleTerminalFocus,
-    NewTerminalTab,
-    CloseTerminalTab,
-    SelectTerminalTab(usize),
     Submit,
     Newline,
     Char(char),
@@ -88,7 +84,6 @@ pub enum KeyAction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyInput {
     pub action: KeyAction,
-    pub terminal_input: Option<Vec<u8>>,
 }
 
 impl From<KeyEvent> for KeyInput {
@@ -101,20 +96,6 @@ impl From<KeyEvent> for KeyInput {
             KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyAction::Cut,
             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 KeyAction::CancelConversationPermission
-            }
-            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                KeyAction::ToggleTerminalFocus
-            }
-            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::ALT) => {
-                KeyAction::NewTerminalTab
-            }
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => {
-                KeyAction::CloseTerminalTab
-            }
-            KeyCode::Char(char)
-                if key.modifiers.contains(KeyModifiers::ALT) && matches!(char, '1'..='9') =>
-            {
-                KeyAction::SelectTerminalTab(terminal_tab_index(char))
             }
             KeyCode::Char(char) => KeyAction::Char(char),
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => KeyAction::Newline,
@@ -132,67 +113,7 @@ impl From<KeyEvent> for KeyInput {
             _ => KeyAction::None,
         };
 
-        Self {
-            action,
-            terminal_input: terminal_input_bytes(key),
-        }
-    }
-}
-
-fn terminal_tab_index(char: char) -> usize {
-    char.to_digit(10).unwrap_or(1).saturating_sub(1) as usize
-}
-
-fn terminal_input_bytes(key: KeyEvent) -> Option<Vec<u8>> {
-    let bytes = match key.code {
-        KeyCode::Backspace => vec![0x7f],
-        KeyCode::Enter => b"\r".to_vec(),
-        KeyCode::Left => escape_sequence(b"\x1b[D", key.modifiers),
-        KeyCode::Right => escape_sequence(b"\x1b[C", key.modifiers),
-        KeyCode::Up => escape_sequence(b"\x1b[A", key.modifiers),
-        KeyCode::Down => escape_sequence(b"\x1b[B", key.modifiers),
-        KeyCode::Home => escape_sequence(b"\x1b[H", key.modifiers),
-        KeyCode::End => escape_sequence(b"\x1b[F", key.modifiers),
-        KeyCode::PageUp => escape_sequence(b"\x1b[5~", key.modifiers),
-        KeyCode::PageDown => escape_sequence(b"\x1b[6~", key.modifiers),
-        KeyCode::Delete => escape_sequence(b"\x1b[3~", key.modifiers),
-        KeyCode::Tab => b"\t".to_vec(),
-        KeyCode::Esc => b"\x1b".to_vec(),
-        KeyCode::Char(char) if key.modifiers.contains(KeyModifiers::CONTROL) => control_char(char)?,
-        KeyCode::Char(char) => char_bytes(char, key.modifiers),
-        _ => return None,
-    };
-
-    Some(bytes)
-}
-
-fn char_bytes(char: char, modifiers: KeyModifiers) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    if modifiers.contains(KeyModifiers::ALT) {
-        bytes.push(0x1b);
-    }
-    let mut encoded = [0; 4];
-    bytes.extend_from_slice(char.encode_utf8(&mut encoded).as_bytes());
-    bytes
-}
-
-fn escape_sequence(sequence: &[u8], modifiers: KeyModifiers) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    if modifiers.contains(KeyModifiers::ALT) {
-        bytes.push(0x1b);
-    }
-    bytes.extend_from_slice(sequence);
-    bytes
-}
-
-fn control_char(char: char) -> Option<Vec<u8>> {
-    let lower = char.to_ascii_lowercase();
-    if lower.is_ascii_lowercase() {
-        Some(vec![lower as u8 - b'a' + 1])
-    } else if char == ' ' {
-        Some(vec![0])
-    } else {
-        None
+        Self { action }
     }
 }
 
@@ -235,31 +156,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn alt_n_creates_terminal_tab() {
-        let input = KeyInput::from(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT));
+    fn former_terminal_shortcuts_are_regular_chat_input() {
+        let ctrl_t = KeyInput::from(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        let alt_n = KeyInput::from(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT));
 
-        assert_eq!(input.action, KeyAction::NewTerminalTab);
-    }
-
-    #[test]
-    fn alt_d_closes_terminal_tab() {
-        let input = KeyInput::from(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT));
-
-        assert_eq!(input.action, KeyAction::CloseTerminalTab);
-    }
-
-    #[test]
-    fn alt_number_selects_terminal_tab_index() {
-        let input = KeyInput::from(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT));
-
-        assert_eq!(input.action, KeyAction::SelectTerminalTab(2));
-    }
-
-    #[test]
-    fn alt_zero_does_not_select_terminal_tab() {
-        let input = KeyInput::from(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::ALT));
-
-        assert_eq!(input.action, KeyAction::Char('0'));
+        assert_eq!(ctrl_t.action, KeyAction::Char('t'));
+        assert_eq!(alt_n.action, KeyAction::Char('n'));
     }
 
     #[test]
@@ -270,11 +172,10 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_keeps_terminal_interrupt_bytes() {
+    fn ctrl_c_keeps_quit_semantics() {
         let input = KeyInput::from(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
 
         assert_eq!(input.action, KeyAction::Quit);
-        assert_eq!(input.terminal_input.as_deref(), Some(&[0x03][..]));
     }
 
     #[test]
@@ -285,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_arrows_drive_terminal_tab_switcher() {
+    fn ctrl_arrows_keep_navigation_actions() {
         let up = KeyInput::from(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
         let down = KeyInput::from(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
 
