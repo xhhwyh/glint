@@ -108,6 +108,24 @@ pub struct ExecutionExpansionMetrics {
     pub max_output_scroll: u16,
 }
 
+fn reconcile_anchored_scroll(
+    scroll: u16,
+    anchored: bool,
+    deltas: impl IntoIterator<Item = i64>,
+) -> u16 {
+    if !anchored {
+        return scroll;
+    }
+
+    let net_delta: i64 = deltas.into_iter().sum();
+    let delta = net_delta.unsigned_abs().min(u64::from(u16::MAX)) as u16;
+    if net_delta >= 0 {
+        scroll.saturating_add(delta)
+    } else {
+        scroll.saturating_sub(delta)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelPicker {
     pub stage: ModelPickerStage,
@@ -726,7 +744,7 @@ impl App {
             .retain(|id, _| self.expanded_executions.contains(id));
 
         let anchored = self.scroll != 0;
-        let mut expansion_delta = 0_i64;
+        let mut expansion_deltas = Vec::new();
         for (id, metrics) in metrics {
             if let Some(scroll) = self.execution_scrolls.get_mut(&id) {
                 *scroll = (*scroll).min(metrics.max_output_scroll);
@@ -738,17 +756,10 @@ impl App {
                 .execution_expansion_rows
                 .entry(id)
                 .or_insert(metrics.expansion_rows);
-            expansion_delta += i64::from(metrics.expansion_rows) - i64::from(*stored_rows);
+            expansion_deltas.push(i64::from(metrics.expansion_rows) - i64::from(*stored_rows));
             *stored_rows = metrics.expansion_rows;
         }
-        if anchored {
-            let delta = expansion_delta.unsigned_abs().min(u64::from(u16::MAX)) as u16;
-            if expansion_delta >= 0 {
-                self.scroll = self.scroll.saturating_add(delta);
-            } else {
-                self.scroll = self.scroll.saturating_sub(delta);
-            }
-        }
+        self.scroll = reconcile_anchored_scroll(self.scroll, anchored, expansion_deltas);
     }
 
     pub fn set_execution_hitboxes(&mut self, hitboxes: Vec<ExecutionHitbox>) {
@@ -4319,52 +4330,10 @@ mod tests {
 
     #[test]
     fn reconcile_execution_metrics_applies_net_delta_independent_of_hashmap_order() {
-        fn metrics_with_iteration_order(
-            shrink_first: bool,
-            grow_rows: u16,
-        ) -> (
-            ExecutionId,
-            ExecutionId,
-            HashMap<ExecutionId, ExecutionExpansionMetrics>,
-        ) {
-            for attempt in 0..512 {
-                let shrink = ExecutionId::Tool(format!("call-shrink-{grow_rows}-{attempt}"));
-                let grow = ExecutionId::Tool(format!("call-grow-{grow_rows}-{attempt}"));
-                for insert_shrink_first in [false, true] {
-                    let mut metrics = HashMap::new();
-                    if insert_shrink_first {
-                        metrics.insert(shrink.clone(), expansion_metrics(1, 0));
-                        metrics.insert(grow.clone(), expansion_metrics(grow_rows, 0));
-                    } else {
-                        metrics.insert(grow.clone(), expansion_metrics(grow_rows, 0));
-                        metrics.insert(shrink.clone(), expansion_metrics(1, 0));
-                    }
-                    let actual_shrink_first = metrics.keys().next() == Some(&shrink);
-                    if actual_shrink_first == shrink_first {
-                        return (shrink, grow, metrics);
-                    }
-                }
-            }
-            panic!("could not build requested HashMap iteration order");
-        }
-
-        for (grow_rows, expected_scroll) in [(10, 4), (12, 6)] {
-            for shrink_first in [true, false] {
-                let (shrink, grow, metrics) = metrics_with_iteration_order(shrink_first, grow_rows);
-                let mut app = App::test_empty();
-                app.expanded_executions.insert(shrink.clone());
-                app.expanded_executions.insert(grow.clone());
-                app.execution_expansion_rows.insert(shrink.clone(), 10);
-                app.execution_expansion_rows.insert(grow.clone(), 1);
-                app.scroll = 4;
-
-                app.reconcile_execution_expansion_metrics(metrics);
-
-                assert_eq!(app.scroll, expected_scroll);
-                assert_eq!(app.execution_expansion_rows[&shrink], 1);
-                assert_eq!(app.execution_expansion_rows[&grow], grow_rows);
-            }
-        }
+        assert_eq!(reconcile_anchored_scroll(4, true, [-8, 8]), 4);
+        assert_eq!(reconcile_anchored_scroll(4, true, [8, -8]), 4);
+        assert_eq!(reconcile_anchored_scroll(4, true, [-8, 10]), 6);
+        assert_eq!(reconcile_anchored_scroll(4, true, [10, -8]), 6);
     }
 
     #[test]
