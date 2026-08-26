@@ -28,8 +28,8 @@ use crate::{
         mcp::{McpConfig, McpElicitation, McpElicitationRequest, McpManager, McpServerStatus},
     },
     tasks::{
-        self, SubagentOutcome, SubagentRequest, SubagentSteering, TaskManager, TaskSnapshot,
-        TaskWaitResponse,
+        self, SubagentOutcome, SubagentRequest, SubagentSteering, TaskManager, TaskRequest,
+        TaskSnapshot, TaskWaitResponse,
     },
     terminal::TerminalRequest,
     tools::{DynamicTool, ReadFileState, ShellToolMode},
@@ -182,6 +182,8 @@ pub struct SessionRuntime {
     agent_control_tx: Option<mpsc::Sender<AgentControl>>,
     terminal_request_tx: Sender<TerminalRequest>,
     terminal_requests: Receiver<TerminalRequest>,
+    task_request_tx: Sender<TaskRequest>,
+    task_requests: Receiver<TaskRequest>,
     lsp_manager: LspManager,
     mcp_manager: McpManager,
     hook_runner: HookRunner,
@@ -222,6 +224,7 @@ impl SessionRuntime {
     ) -> Self {
         let (agent_tx, agent_events) = mpsc::channel();
         let (terminal_request_tx, terminal_requests) = mpsc::channel();
+        let (task_request_tx, task_requests) = mpsc::channel();
         let lsp_manager = LspManager::new(lsp_config, PathBuf::from(&transcript_cwd));
         let mcp_manager = McpManager::new(mcp_config, PathBuf::from(&transcript_cwd));
         let hook_runner = HookRunner::new(hooks);
@@ -234,6 +237,8 @@ impl SessionRuntime {
             agent_control_tx: None,
             terminal_request_tx,
             terminal_requests,
+            task_request_tx,
+            task_requests,
             lsp_manager,
             mcp_manager,
             hook_runner,
@@ -377,6 +382,10 @@ impl SessionRuntime {
         self.terminal_requests.try_recv().ok()
     }
 
+    pub fn try_recv_task_request(&self) -> Option<TaskRequest> {
+        self.task_requests.try_recv().ok()
+    }
+
     pub fn try_recv_mcp_elicitation(&mut self) -> Option<ApprovalRequest> {
         let elicitation = self.mcp_manager.try_recv_elicitation()?;
         let id = elicitation.id;
@@ -419,6 +428,10 @@ impl SessionRuntime {
 
     pub fn terminal_request_sender(&self) -> Sender<TerminalRequest> {
         self.terminal_request_tx.clone()
+    }
+
+    pub fn task_request_sender(&self) -> Sender<TaskRequest> {
+        self.task_request_tx.clone()
     }
 
     pub fn lsp_manager(&self) -> LspManager {
@@ -911,6 +924,7 @@ impl SessionRuntime {
                 current_user_message: prompt.clone(),
                 tool_results_dir: self.transcript.tool_results_dir(),
                 terminal_requests: self.terminal_request_tx.clone(),
+                task_requests: self.task_request_tx.clone(),
                 shell_tool_mode: config.shell_tool_mode,
                 read_file_state: self.read_file_state.clone(),
                 lsp_manager: self.lsp_manager.clone(),
@@ -1086,7 +1100,7 @@ fn percent(value: u64, total: u64) -> u8 {
 mod tests {
     use super::*;
     use crate::progress::TodoUpdate;
-    use crate::tasks::SubagentBackend;
+    use crate::tasks::{SubagentBackend, TaskRequest};
 
     fn runtime() -> SessionRuntime {
         SessionRuntime::test_empty(
@@ -1104,6 +1118,21 @@ mod tests {
             backend: SubagentBackend::Codex,
             cwd: "/workspace".to_owned(),
         }
+    }
+
+    #[test]
+    fn task_request_channel_carries_list_requests() {
+        let runtime = runtime();
+        let sender = runtime.task_request_sender();
+        let (response, receiver) = std::sync::mpsc::channel();
+
+        sender.send(TaskRequest::List { response }).unwrap();
+
+        assert!(matches!(
+            runtime.try_recv_task_request(),
+            Some(TaskRequest::List { .. })
+        ));
+        drop(receiver);
     }
 
     #[test]

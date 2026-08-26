@@ -31,7 +31,9 @@ use crate::{
         McpApprovalPolicy, McpConfig, McpOAuthConfig, McpServerConfig, McpTransportConfig,
         persist_mcp_server,
     },
-    tasks::{self, SubagentRequest, SubagentStartResponse, SubagentSteering, TaskSnapshot},
+    tasks::{
+        self, SubagentRequest, SubagentStartResponse, SubagentSteering, TaskRequest, TaskSnapshot,
+    },
     terminal::{
         TerminalMouseScroll, TerminalRequest, TerminalRunResult, TerminalStatus, TerminalTab,
     },
@@ -675,20 +677,30 @@ impl App {
                             .ok();
                     }
                 }
-                TerminalRequest::StartSubagent { request, response } => {
+                TerminalRequest::CancelActive => {
+                    for tab in &mut self.terminal_tabs {
+                        tab.cancel_active();
+                    }
+                }
+            }
+        }
+
+        while let Some(request) = self.runtime.try_recv_task_request() {
+            match request {
+                TaskRequest::StartSubagent { request, response } => {
                     self.start_subagent_terminal(request, response);
                 }
-                TerminalRequest::ListTasks { response } => {
+                TaskRequest::List { response } => {
                     response.send(self.runtime.task_snapshots()).ok();
                 }
-                TerminalRequest::WaitTasks {
+                TaskRequest::Wait {
                     task_ids,
                     timeout,
                     response,
                 } => {
                     self.runtime.register_task_wait(task_ids, timeout, response);
                 }
-                TerminalRequest::SendTaskMessage {
+                TaskRequest::Send {
                     task_id,
                     message,
                     response,
@@ -705,17 +717,12 @@ impl App {
                     }
                     response.send(result).ok();
                 }
-                TerminalRequest::CancelTask { task_id, response } => {
+                TaskRequest::Cancel { task_id, response } => {
                     let result = self.runtime.cancel_task(&task_id);
                     if result.is_ok() {
                         self.run_notice = Some(format!("Cancelling task {task_id}."));
                     }
                     response.send(result).ok();
-                }
-                TerminalRequest::CancelActive => {
-                    for tab in &mut self.terminal_tabs {
-                        tab.cancel_active();
-                    }
                 }
             }
         }
@@ -809,6 +816,7 @@ impl App {
                 current_user_message: request.prompt,
                 tool_results_dir: self.runtime.tool_results_dir(),
                 terminal_requests: self.runtime.terminal_request_sender(),
+                task_requests: self.runtime.task_request_sender(),
                 shell_tool_mode: ShellToolMode::TerminalRun,
                 read_file_state: self.runtime.read_file_state(),
                 lsp_manager: self.runtime.lsp_manager(),

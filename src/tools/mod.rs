@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 
 use crate::agent::provider::{ToolCall, ToolResult, ToolSpec};
 use crate::services::lsp::LspManager;
+use crate::tasks::TaskRequest;
 use crate::terminal::TerminalRequest;
 
 use bash::BashTool;
@@ -49,6 +50,7 @@ pub(crate) fn sanitize_tool_name(value: &str) -> String {
 #[derive(Clone)]
 pub struct ToolRegistry {
     terminal_requests: Option<Sender<TerminalRequest>>,
+    task_requests: Option<Sender<TaskRequest>>,
     lsp_manager: Option<LspManager>,
     shell_tool_mode: ShellToolMode,
     read_file_state: ReadFileState,
@@ -87,6 +89,7 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             terminal_requests: None,
+            task_requests: None,
             lsp_manager: None,
             shell_tool_mode: ShellToolMode::Bash,
             read_file_state: ReadFileState::new(),
@@ -97,39 +100,41 @@ impl ToolRegistry {
 
     #[cfg(test)]
     pub fn with_terminal_requests(terminal_requests: Sender<TerminalRequest>) -> Self {
-        Self {
-            terminal_requests: Some(terminal_requests),
-            lsp_manager: None,
-            shell_tool_mode: ShellToolMode::TerminalRun,
-            read_file_state: ReadFileState::new(),
-            dynamic_tools: Arc::new(BTreeMap::new()),
-            subagent: false,
-        }
+        Self::with_shell_tool(ShellToolMode::TerminalRun, Some(terminal_requests), None)
     }
 
     pub fn with_shell_tool(
         shell_tool_mode: ShellToolMode,
         terminal_requests: Option<Sender<TerminalRequest>>,
+        task_requests: Option<Sender<TaskRequest>>,
     ) -> Self {
+        let mut registry = Self::with_task_requests(task_requests);
+        registry.terminal_requests = terminal_requests;
+        registry.shell_tool_mode = shell_tool_mode;
+        registry
+    }
+
+    pub fn with_task_requests(task_requests: Option<Sender<TaskRequest>>) -> Self {
         Self {
-            terminal_requests,
+            terminal_requests: None,
+            task_requests,
             lsp_manager: None,
-            shell_tool_mode,
+            shell_tool_mode: ShellToolMode::Bash,
             read_file_state: ReadFileState::new(),
             dynamic_tools: Arc::new(BTreeMap::new()),
             subagent: false,
         }
     }
 
-    pub fn for_subagent(terminal_requests: Option<Sender<TerminalRequest>>) -> Self {
-        Self {
-            terminal_requests,
-            lsp_manager: None,
-            shell_tool_mode: ShellToolMode::TerminalRun,
-            read_file_state: ReadFileState::new(),
-            dynamic_tools: Arc::new(BTreeMap::new()),
-            subagent: true,
-        }
+    pub fn for_subagent(task_requests: Option<Sender<TaskRequest>>) -> Self {
+        let mut registry = Self::with_task_requests(task_requests);
+        registry.subagent = true;
+        registry
+    }
+
+    pub fn with_terminal_channel(mut self, terminal_requests: Sender<TerminalRequest>) -> Self {
+        self.terminal_requests = Some(terminal_requests);
+        self
     }
 
     pub fn with_lsp_manager(mut self, lsp_manager: LspManager) -> Self {
@@ -192,7 +197,7 @@ impl ToolRegistry {
             if self.subagent {
                 return error(call, "Nested Subagent is not registered.".to_owned());
             }
-            return subagent::subagent(call, self.terminal_requests.as_ref());
+            return subagent::subagent(call, self.task_requests.as_ref());
         }
         if matches!(
             call.name.as_str(),
@@ -204,7 +209,7 @@ impl ToolRegistry {
                     "Task control is not registered inside subagents.".to_owned(),
                 );
             }
-            return task_control::execute(call, self.terminal_requests.as_ref(), is_cancelled);
+            return task_control::execute(call, self.task_requests.as_ref(), is_cancelled);
         }
         if call.name == "Read" {
             return read::read(call, &self.read_file_state);
@@ -273,7 +278,7 @@ impl ToolRegistry {
             if self.subagent {
                 return error(call, "Nested Subagent is not registered.".to_owned());
             }
-            return subagent::subagent(call, self.terminal_requests.as_ref());
+            return subagent::subagent(call, self.task_requests.as_ref());
         }
         if matches!(
             call.name.as_str(),
@@ -285,7 +290,7 @@ impl ToolRegistry {
                     "Task control is not registered inside subagents.".to_owned(),
                 );
             }
-            return task_control::execute(call, self.terminal_requests.as_ref(), is_cancelled);
+            return task_control::execute(call, self.task_requests.as_ref(), is_cancelled);
         }
         if call.name == "Read" {
             return read::read(call, &self.read_file_state);
@@ -739,6 +744,7 @@ mod tests {
     };
     use crate::{
         agent::provider::{ToolCall, ToolResult, ToolSpec},
+        tasks::TaskRequest,
         terminal::{TerminalRequest, TerminalRunResult},
     };
 
@@ -864,9 +870,29 @@ mod tests {
     }
 
     #[test]
+    fn task_request_channel_routes_task_controls_without_terminal_requests() {
+        let (task_tx, task_rx) = mpsc::channel();
+        let registry = ToolRegistry::with_task_requests(Some(task_tx));
+        let call = ToolCall {
+            id: "tasks".to_owned(),
+            name: "TaskList".to_owned(),
+            arguments: json!({}),
+        };
+        let worker_call = call.clone();
+        let worker = thread::spawn(move || registry.execute_approved(&worker_call));
+
+        let TaskRequest::List { response } = task_rx.recv().expect("task request") else {
+            panic!("expected task list request");
+        };
+        response.send(Vec::new()).unwrap();
+
+        assert!(!worker.join().unwrap().is_error);
+    }
+
+    #[test]
     fn subagent_registry_exposes_limited_tool_surface() {
-        let (terminal_tx, _terminal_rx) = mpsc::channel();
-        let registry = ToolRegistry::for_subagent(Some(terminal_tx));
+        let (task_tx, _task_rx) = mpsc::channel();
+        let registry = ToolRegistry::for_subagent(Some(task_tx));
         let names = registry
             .specs()
             .into_iter()

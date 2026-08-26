@@ -31,7 +31,7 @@ use crate::{
     services::lsp::LspManager,
     services::tool_results::ToolResultBudget,
     settings::ProjectSettings,
-    tasks::SubagentSteering,
+    tasks::{SubagentSteering, TaskRequest},
     terminal::TerminalRequest,
     tools::{DynamicTool, ReadFileState, ShellToolMode, ToolRegistry},
 };
@@ -50,6 +50,7 @@ pub struct AgentRunInput {
     pub current_user_message: String,
     pub tool_results_dir: PathBuf,
     pub terminal_requests: Sender<TerminalRequest>,
+    pub task_requests: Sender<TaskRequest>,
     pub shell_tool_mode: ShellToolMode,
     pub read_file_state: ReadFileState,
     pub lsp_manager: LspManager,
@@ -86,6 +87,7 @@ pub fn spawn_agent_loop(
         let registry = ToolRegistry::with_shell_tool(
             input.shell_tool_mode,
             Some(input.terminal_requests.clone()),
+            Some(input.task_requests.clone()),
         )
         .with_lsp_manager(input.lsp_manager.clone())
         .with_read_file_state(input.read_file_state.clone())
@@ -120,7 +122,8 @@ pub fn spawn_subagent_loop(
 ) {
     thread::spawn(move || {
         let mut provider = OpenAiProvider::new(input.llm.clone());
-        let registry = ToolRegistry::for_subagent(Some(input.terminal_requests.clone()))
+        let registry = ToolRegistry::for_subagent(Some(input.task_requests.clone()))
+            .with_terminal_channel(input.terminal_requests.clone())
             .with_lsp_manager(input.lsp_manager.clone())
             .with_read_file_state(input.read_file_state.clone())
             .with_dynamic_tools(input.dynamic_tools.clone());
@@ -912,6 +915,7 @@ mod tests {
 
     fn input() -> AgentRunInput {
         let (terminal_requests, _terminal_rx) = mpsc::channel();
+        let (task_requests, _task_rx) = mpsc::channel();
         AgentRunInput {
             llm: LlmConfig {
                 provider: "test".to_owned(),
@@ -947,6 +951,7 @@ mod tests {
             current_user_message: "hello".to_owned(),
             tool_results_dir: std::env::temp_dir(),
             terminal_requests,
+            task_requests,
             shell_tool_mode: ShellToolMode::Bash,
             read_file_state: ReadFileState::new(),
             lsp_manager: LspManager::new(LspConfig::default(), PathBuf::from("/workspace")),

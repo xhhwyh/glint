@@ -3,8 +3,9 @@ use std::{
     sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
+        mpsc::Sender,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 pub const MAX_RUNNING_SUBAGENTS: usize = 2;
@@ -153,6 +154,30 @@ impl SubagentOutcome {
 pub struct TaskWaitResponse {
     pub tasks: Vec<TaskSnapshot>,
     pub timed_out: bool,
+}
+
+pub enum TaskRequest {
+    StartSubagent {
+        request: SubagentRequest,
+        response: Sender<SubagentStartResponse>,
+    },
+    List {
+        response: Sender<Vec<TaskSnapshot>>,
+    },
+    Wait {
+        task_ids: Vec<String>,
+        timeout: Duration,
+        response: Sender<Result<TaskWaitResponse, String>>,
+    },
+    Send {
+        task_id: String,
+        message: String,
+        response: Sender<Result<TaskSnapshot, String>>,
+    },
+    Cancel {
+        task_id: String,
+        response: Sender<Result<TaskSnapshot, String>>,
+    },
 }
 
 #[derive(Default)]

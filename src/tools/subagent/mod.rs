@@ -6,8 +6,7 @@ use std::{
 
 use crate::{
     agent::provider::{ToolCall, ToolResult},
-    tasks::{SubagentBackend, SubagentRequest, next_task_id},
-    terminal::TerminalRequest,
+    tasks::{SubagentBackend, SubagentRequest, TaskRequest, next_task_id},
 };
 
 mod description;
@@ -56,10 +55,7 @@ impl ToolBehavior for SubagentTool {
     }
 }
 
-pub(super) fn subagent(
-    call: &ToolCall,
-    terminal_requests: Option<&Sender<TerminalRequest>>,
-) -> ToolResult {
+pub(super) fn subagent(call: &ToolCall, task_requests: Option<&Sender<TaskRequest>>) -> ToolResult {
     let Some(description) = string_arg(call, "description") else {
         return missing_arg(call, "description");
     };
@@ -74,8 +70,8 @@ pub(super) fn subagent(
         Ok(cwd) => cwd,
         Err(message) => return error(call, message),
     };
-    let Some(terminal_requests) = terminal_requests else {
-        return error(call, "Subagent terminal runtime is unavailable.".to_owned());
+    let Some(task_requests) = task_requests else {
+        return error(call, "Subagent task runtime is unavailable.".to_owned());
     };
 
     let task_id = next_task_id();
@@ -89,14 +85,14 @@ pub(super) fn subagent(
     };
     let task_id = request.task_id.clone();
     let (response_tx, response_rx) = mpsc::channel();
-    if terminal_requests
-        .send(TerminalRequest::StartSubagent {
+    if task_requests
+        .send(TaskRequest::StartSubagent {
             request,
             response: response_tx,
         })
         .is_err()
     {
-        return error(call, "Subagent terminal runtime is unavailable.".to_owned());
+        return error(call, "Subagent task runtime is unavailable.".to_owned());
     }
 
     match response_rx.recv_timeout(START_RESPONSE_TIMEOUT) {
@@ -118,7 +114,7 @@ pub(super) fn subagent(
             format!("Timed out starting Codex subagent {task_id}."),
         ),
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            error(call, "Subagent terminal runtime stopped.".to_owned())
+            error(call, "Subagent task runtime stopped.".to_owned())
         }
     }
 }
@@ -194,8 +190,8 @@ mod tests {
     }
 
     #[test]
-    fn starts_subagent_via_terminal_request() {
-        let (terminal_tx, terminal_rx) = mpsc::channel();
+    fn starts_subagent_via_task_request() {
+        let (task_tx, task_rx) = mpsc::channel();
         let cwd = std::env::current_dir().unwrap();
         let call = ToolCall {
             id: "call".to_owned(),
@@ -207,8 +203,7 @@ mod tests {
             }),
         };
         let worker = std::thread::spawn(move || {
-            let TerminalRequest::StartSubagent { request, response } =
-                terminal_rx.recv().expect("request")
+            let TaskRequest::StartSubagent { request, response } = task_rx.recv().expect("request")
             else {
                 panic!("expected start subagent request");
             };
@@ -222,7 +217,7 @@ mod tests {
                 .unwrap();
         });
 
-        let result = subagent(&call, Some(&terminal_tx));
+        let result = subagent(&call, Some(&task_tx));
         worker.join().unwrap();
 
         assert!(!result.is_error);

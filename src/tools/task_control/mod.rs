@@ -7,8 +7,7 @@ use serde_json::{Value, json};
 
 use crate::{
     agent::provider::{ToolCall, ToolResult},
-    tasks::{TaskKind, TaskSnapshot, TaskWaitResponse},
-    terminal::TerminalRequest,
+    tasks::{TaskKind, TaskRequest, TaskSnapshot, TaskWaitResponse},
 };
 
 use super::{
@@ -150,31 +149,28 @@ impl ToolBehavior for TaskCancelTool {
 
 pub(super) fn execute(
     call: &ToolCall,
-    terminal_requests: Option<&Sender<TerminalRequest>>,
+    task_requests: Option<&Sender<TaskRequest>>,
     is_cancelled: &mut dyn FnMut() -> bool,
 ) -> ToolResult {
-    let Some(terminal_requests) = terminal_requests else {
+    let Some(task_requests) = task_requests else {
         return error(call, "Task runtime is unavailable.".to_owned());
     };
     match call.name.as_str() {
-        "TaskList" => list_tasks(call, terminal_requests, is_cancelled),
-        "TaskWait" => wait_tasks(call, terminal_requests, is_cancelled),
-        "TaskSend" => send_task_message(call, terminal_requests, is_cancelled),
-        "TaskCancel" => cancel_task(call, terminal_requests, is_cancelled),
+        "TaskList" => list_tasks(call, task_requests, is_cancelled),
+        "TaskWait" => wait_tasks(call, task_requests, is_cancelled),
+        "TaskSend" => send_task_message(call, task_requests, is_cancelled),
+        "TaskCancel" => cancel_task(call, task_requests, is_cancelled),
         _ => error(call, format!("Unknown task control tool: {}", call.name)),
     }
 }
 
 fn list_tasks(
     call: &ToolCall,
-    terminal_requests: &Sender<TerminalRequest>,
+    task_requests: &Sender<TaskRequest>,
     is_cancelled: &mut dyn FnMut() -> bool,
 ) -> ToolResult {
     let (response, receiver) = mpsc::channel();
-    if terminal_requests
-        .send(TerminalRequest::ListTasks { response })
-        .is_err()
-    {
+    if task_requests.send(TaskRequest::List { response }).is_err() {
         return error(call, "Task runtime is unavailable.".to_owned());
     }
     match receive_until(&receiver, CONTROL_RESPONSE_TIMEOUT, is_cancelled) {
@@ -185,7 +181,7 @@ fn list_tasks(
 
 fn wait_tasks(
     call: &ToolCall,
-    terminal_requests: &Sender<TerminalRequest>,
+    task_requests: &Sender<TaskRequest>,
     is_cancelled: &mut dyn FnMut() -> bool,
 ) -> ToolResult {
     let task_ids = match task_ids(call) {
@@ -198,8 +194,8 @@ fn wait_tasks(
     };
     let timeout = Duration::from_millis(timeout_ms);
     let (response, receiver) = mpsc::channel();
-    if terminal_requests
-        .send(TerminalRequest::WaitTasks {
+    if task_requests
+        .send(TaskRequest::Wait {
             task_ids,
             timeout,
             response,
@@ -216,7 +212,7 @@ fn wait_tasks(
 
 fn send_task_message(
     call: &ToolCall,
-    terminal_requests: &Sender<TerminalRequest>,
+    task_requests: &Sender<TaskRequest>,
     is_cancelled: &mut dyn FnMut() -> bool,
 ) -> ToolResult {
     let Some(task_id) = string_arg(call, "task_id") else {
@@ -229,8 +225,8 @@ fn send_task_message(
         return error(call, "message must not be empty".to_owned());
     }
     let (response, receiver) = mpsc::channel();
-    if terminal_requests
-        .send(TerminalRequest::SendTaskMessage {
+    if task_requests
+        .send(TaskRequest::Send {
             task_id: task_id.to_owned(),
             message: message.to_owned(),
             response,
@@ -250,15 +246,15 @@ fn send_task_message(
 
 fn cancel_task(
     call: &ToolCall,
-    terminal_requests: &Sender<TerminalRequest>,
+    task_requests: &Sender<TaskRequest>,
     is_cancelled: &mut dyn FnMut() -> bool,
 ) -> ToolResult {
     let Some(task_id) = string_arg(call, "task_id") else {
         return missing_arg(call, "task_id");
     };
     let (response, receiver) = mpsc::channel();
-    if terminal_requests
-        .send(TerminalRequest::CancelTask {
+    if task_requests
+        .send(TaskRequest::Cancel {
             task_id: task_id.to_owned(),
             response,
         })
@@ -365,7 +361,7 @@ fn task_json(task: &TaskSnapshot) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks::{SubagentBackend, TaskStatus};
+    use crate::tasks::{SubagentBackend, TaskRequest, TaskStatus};
 
     fn call(name: &str, arguments: Value) -> ToolCall {
         ToolCall {
@@ -396,17 +392,17 @@ mod tests {
 
     #[test]
     fn task_wait_returns_structured_result() {
-        let (terminal_tx, terminal_rx) = mpsc::channel();
+        let (task_tx, task_rx) = mpsc::channel();
         let tool_call = call("TaskWait", json!({"task_ids": ["a1"], "timeout_ms": 1000}));
         let worker_call = tool_call.clone();
         let worker =
-            std::thread::spawn(move || execute(&worker_call, Some(&terminal_tx), &mut || false));
+            std::thread::spawn(move || execute(&worker_call, Some(&task_tx), &mut || false));
 
-        let TerminalRequest::WaitTasks {
+        let TaskRequest::Wait {
             task_ids,
             timeout,
             response,
-        } = terminal_rx.recv().unwrap()
+        } = task_rx.recv().unwrap()
         else {
             panic!("expected task wait request");
         };
@@ -430,9 +426,9 @@ mod tests {
     #[test]
     fn task_wait_rejects_empty_task_ids() {
         let tool_call = call("TaskWait", json!({"task_ids": []}));
-        let (terminal_tx, _terminal_rx) = mpsc::channel();
+        let (task_tx, _task_rx) = mpsc::channel();
 
-        let result = execute(&tool_call, Some(&terminal_tx), &mut || false);
+        let result = execute(&tool_call, Some(&task_tx), &mut || false);
 
         assert!(result.is_error);
         assert!(result.content.contains("at least one task"));
