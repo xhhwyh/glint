@@ -335,6 +335,7 @@ impl PreparedDocument {
                 end_row: (row - scroll as usize) as u16,
                 start_column: 0,
                 end_column: self.width,
+                expandable: metrics.expandable,
                 expansion_rows: metrics.expansion_rows,
                 max_output_scroll: if region == ExecutionRegion::Output {
                     metrics.max_output_scroll
@@ -462,6 +463,7 @@ fn document(app: &App, width: u16) -> Document {
                 0
             };
             let expansion_metrics = ExecutionExpansionMetrics {
+                expandable: card_lines.expandable,
                 expansion_rows,
                 max_output_scroll: card_lines.max_output_scroll,
             };
@@ -1021,6 +1023,7 @@ mod tests {
             .iter()
             .find(|hitbox| hitbox.id == id && hitbox.region == ExecutionRegion::Summary)
             .expect("summary hitbox");
+        assert!(!summary.expandable);
         assert_eq!(summary.expansion_rows, 0);
         assert!(
             collapsed
@@ -1047,6 +1050,60 @@ mod tests {
             .find(|hitbox| hitbox.id == id && hitbox.region == ExecutionRegion::Output)
             .expect("output hitbox");
         assert!(output.end_row - output.start_row <= MAX_EXPANDED_OUTPUT_ROWS);
+    }
+
+    #[test]
+    fn long_execution_with_zero_height_delta_can_expand_and_collapse_from_summary() {
+        let mut app = App::test_empty();
+        let id = ExecutionId::Tool("call-bash".to_owned());
+        app.messages.push(finished_bash_message(
+            "call-bash",
+            "git log",
+            &(1..=20)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+
+        let collapsed_hitboxes = execution_hitboxes(&app, 80, 30);
+        let collapsed_summary = collapsed_hitboxes
+            .iter()
+            .find(|hitbox| hitbox.id == id && hitbox.region == ExecutionRegion::Summary)
+            .expect("collapsed summary hitbox");
+        assert!(collapsed_summary.expandable);
+        assert_eq!(collapsed_summary.expansion_rows, 0);
+        let collapsed_summary_row = collapsed_summary.start_row;
+        app.set_execution_hitboxes(collapsed_hitboxes);
+
+        app.update(AppEvent::Mouse(crate::event::MouseAction::LeftDown {
+            column: 5,
+            row: collapsed_summary_row,
+        }));
+
+        assert!(app.is_execution_expanded(&id));
+        assert_eq!(
+            app.take_execution_repaint_request(),
+            Some(crate::app::ExecutionRepaintRequest::Full)
+        );
+
+        let expanded_hitboxes = execution_hitboxes(&app, 80, 30);
+        let expanded_summary_row = expanded_hitboxes
+            .iter()
+            .find(|hitbox| hitbox.id == id && hitbox.region == ExecutionRegion::Summary)
+            .expect("expanded summary hitbox")
+            .start_row;
+        app.set_execution_hitboxes(expanded_hitboxes);
+
+        app.update(AppEvent::Mouse(crate::event::MouseAction::LeftDown {
+            column: 5,
+            row: expanded_summary_row,
+        }));
+
+        assert!(!app.is_execution_expanded(&id));
+        assert_eq!(
+            app.take_execution_repaint_request(),
+            Some(crate::app::ExecutionRepaintRequest::Full)
+        );
     }
 
     #[test]

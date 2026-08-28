@@ -112,6 +112,7 @@ struct TrustedPersistedOutput {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ExecutionExpansionMetrics {
+    pub expandable: bool,
     pub expansion_rows: u16,
     pub max_output_scroll: u16,
 }
@@ -2982,7 +2983,7 @@ impl App {
             MouseAction::LeftDown { column, row }
                 if self
                     .execution_hitbox_at(column, row, ExecutionRegion::Summary)
-                    .is_some_and(|hitbox| hitbox.expansion_rows > 0) =>
+                    .is_some_and(|hitbox| hitbox.expandable) =>
             {
                 let hitbox = self
                     .execution_hitbox_at(column, row, ExecutionRegion::Summary)
@@ -4202,6 +4203,7 @@ mod tests {
                 end_row: 5,
                 start_column: 0,
                 end_column: 80,
+                expandable: true,
                 expansion_rows: 3,
                 max_output_scroll: 0,
             },
@@ -4212,6 +4214,7 @@ mod tests {
                 end_row: 10,
                 start_column: 0,
                 end_column: 80,
+                expandable: true,
                 expansion_rows: 3,
                 max_output_scroll: 12,
             },
@@ -4221,6 +4224,7 @@ mod tests {
 
     fn expansion_metrics(expansion_rows: u16, max_output_scroll: u16) -> ExecutionExpansionMetrics {
         ExecutionExpansionMetrics {
+            expandable: true,
             expansion_rows,
             max_output_scroll,
         }
@@ -4249,6 +4253,7 @@ mod tests {
     #[test]
     fn summary_click_does_not_expand_when_complete_preview_is_visible() {
         let (mut app, id) = app_with_execution_hitboxes();
+        app.execution_hitboxes[0].expandable = false;
         app.execution_hitboxes[0].expansion_rows = 0;
 
         app.update(AppEvent::Mouse(MouseAction::Move { column: 5, row: 4 }));
@@ -4498,6 +4503,7 @@ mod tests {
             end_row: 6,
             start_column: 0,
             end_column: 80,
+            expandable: true,
             expansion_rows: 6,
             max_output_scroll: 3,
         }]);
@@ -4522,6 +4528,7 @@ mod tests {
             end_row: 1,
             start_column: 0,
             end_column: 80,
+            expandable: true,
             expansion_rows: 8,
             max_output_scroll: 0,
         }]);
@@ -4545,6 +4552,7 @@ mod tests {
             end_row: 2,
             start_column: 0,
             end_column: 80,
+            expandable: true,
             expansion_rows: 2,
             max_output_scroll: 3,
         }]);
@@ -5114,6 +5122,7 @@ mod tests {
             end_row: 8,
             start_column: 0,
             end_column: 100,
+            expandable: true,
             expansion_rows: 8,
             max_output_scroll: 12,
         }]);
@@ -5294,6 +5303,7 @@ mod tests {
             end_row: 6,
             start_column: 0,
             end_column: 80,
+            expandable: true,
             expansion_rows: 6,
             max_output_scroll: 3,
         }]);
@@ -5358,6 +5368,7 @@ mod tests {
             end_row: 1,
             start_column: 0,
             end_column: 80,
+            expandable: true,
             expansion_rows: 6,
             max_output_scroll: 2,
         });

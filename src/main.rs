@@ -379,6 +379,7 @@ mod tests {
             end_row: 5,
             start_column: 0,
             end_column: 80,
+            expandable: true,
             expansion_rows: 3,
             max_output_scroll: 12,
         }]);
@@ -386,6 +387,10 @@ mod tests {
         assert_eq!(take_terminal_repaint(&mut app), TerminalRepaint::Full);
 
         app.scroll_execution(&id, 3);
+
+        assert_eq!(take_terminal_repaint(&mut app), TerminalRepaint::Full);
+
+        app.scroll_execution(&id, -3);
 
         assert_eq!(take_terminal_repaint(&mut app), TerminalRepaint::Full);
     }

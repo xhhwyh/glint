@@ -147,6 +147,7 @@ pub struct ExecutionHitbox {
     pub end_row: u16,
     pub start_column: u16,
     pub end_column: u16,
+    pub expandable: bool,
     pub expansion_rows: u16,
     pub max_output_scroll: u16,
 }
