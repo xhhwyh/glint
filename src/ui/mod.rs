@@ -931,11 +931,12 @@ mod tests {
     fn assert_buffer_occurrences(
         terminal: &mut Terminal<TestBackend>,
         app: &App,
-        expected: usize,
+        expected_fetch: usize,
+        expected_push: usize,
         frame: &str,
     ) {
         let buffer = render_execution_frame(terminal, app).concat();
-        for marker in ["(fetch)", "(push)"] {
+        for (marker, expected) in [("(fetch)", expected_fetch), ("(push)", expected_push)] {
             assert_eq!(
                 buffer.matches(marker).count(),
                 expected,
@@ -959,7 +960,7 @@ mod tests {
             "git remote -v && git log -1 --format='%h %ci %s'",
             "origin\thttps://github.com/xhhwyh/glint.git (fetch)\norigin\thttps://github.com/xhhwyh/glint.git (push)\n186bba1 2026-08-12 11:44:19 +0800 merge: integrate subagent task control",
         ));
-        app.toggle_execution(id.clone(), 8);
+        app.toggle_execution(id.clone(), MAX_EXPANDED_OUTPUT_ROWS);
         let mut narrow_terminal = Terminal::new(TestBackend::new(25, 28)).expect("test terminal");
         let hitboxes = execution_hitboxes(&app, 25, 28);
         let max_output_scroll = hitboxes
@@ -968,14 +969,14 @@ mod tests {
             .map(|hitbox| hitbox.max_output_scroll)
             .max()
             .expect("execution hitbox");
-        assert_eq!(max_output_scroll, 2);
+        assert_eq!(max_output_scroll, 3);
         assert!(
             max_output_scroll > 0,
             "narrow TestBackend fixture must expose internal output scrolling"
         );
         app.set_execution_hitboxes(hitboxes);
 
-        for (output_scroll, document_scroll) in (0..=max_output_scroll).zip([0, 1, 0]) {
+        for (output_scroll, document_scroll) in (0..=max_output_scroll).zip([0, 1, 0, 1]) {
             while app.execution_scroll(&id) < output_scroll {
                 app.scroll_execution(&id, 1);
             }
@@ -983,6 +984,7 @@ mod tests {
             assert_buffer_occurrences(
                 &mut narrow_terminal,
                 &app,
+                usize::from(output_scroll > 0),
                 1,
                 &format!("narrow expanded output {output_scroll}, document {document_scroll}"),
             );
@@ -995,12 +997,13 @@ mod tests {
                 &mut wide_terminal,
                 &app,
                 1,
+                1,
                 &format!("wide expanded document {document_scroll}"),
             );
         }
 
-        app.toggle_execution(id, 8);
-        assert_buffer_occurrences(&mut narrow_terminal, &app, 0, "narrow collapsed");
+        app.toggle_execution(id, MAX_EXPANDED_OUTPUT_ROWS);
+        assert_buffer_occurrences(&mut narrow_terminal, &app, 0, 0, "narrow collapsed");
     }
 
     #[test]
@@ -1043,7 +1046,7 @@ mod tests {
             .iter()
             .find(|hitbox| hitbox.id == id && hitbox.region == ExecutionRegion::Output)
             .expect("output hitbox");
-        assert!(output.end_row - output.start_row <= 8);
+        assert!(output.end_row - output.start_row <= MAX_EXPANDED_OUTPUT_ROWS);
     }
 
     #[test]
@@ -1058,20 +1061,23 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n"),
         ));
-        app.toggle_execution(id.clone(), 8);
+        app.toggle_execution(id.clone(), MAX_EXPANDED_OUTPUT_ROWS);
         app.scroll = 0;
 
-        let viewport_height = document_viewport_height(&app, 80, 14);
-        let hitboxes = execution_hitboxes(&app, 80, 14);
+        let viewport_height = document_viewport_height(&app, 80, 13);
+        let hitboxes = execution_hitboxes(&app, 80, 13);
 
         assert!(
             hitboxes
                 .iter()
                 .all(|hitbox| hitbox.end_row <= viewport_height)
         );
-        assert!(hitboxes.iter().any(|hitbox| {
-            hitbox.id == id && hitbox.region == ExecutionRegion::Output && hitbox.start_row == 0
-        }));
+        assert!(
+            hitboxes.iter().any(|hitbox| {
+                hitbox.id == id && hitbox.region == ExecutionRegion::Output && hitbox.start_row == 0
+            }),
+            "expected output hitbox clipped at viewport top: {hitboxes:?}"
+        );
     }
 
     #[test]

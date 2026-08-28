@@ -24,7 +24,6 @@ mod ui;
 
 use std::{
     io::{self, Write},
-    ops::Range,
     time::Duration,
 };
 
@@ -85,7 +84,6 @@ where
 enum TerminalRepaint {
     Diff,
     Full,
-    Rows(Range<u16>),
 }
 
 fn draw_synchronized_with_repaint<W, F, E>(
@@ -111,7 +109,6 @@ where
                 .try_draw(|frame| render(frame).map_err(Into::into))
                 .map(|_| ())
         }),
-        TerminalRepaint::Rows(rows) => repaint_rows(terminal, rows, &mut render),
     };
     let end_result = terminal
         .backend_mut()
@@ -123,41 +120,6 @@ where
         (Ok(_), Err(end_error)) => Err(end_error),
         (Ok(()), Ok(())) => Ok(()),
     }
-}
-
-fn repaint_rows<W, F, E>(
-    terminal: &mut Terminal<CrosstermBackend<W>>,
-    rows: Range<u16>,
-    render: &mut F,
-) -> io::Result<()>
-where
-    W: Write,
-    F: FnMut(&mut ratatui::Frame) -> Result<(), E>,
-    E: Into<io::Error>,
-{
-    use crossterm::{QueueableCommand, cursor::MoveTo, terminal::ClearType};
-
-    let area = terminal.current_buffer_mut().area;
-    let rows = rows.start.min(area.bottom())..rows.end.min(area.bottom());
-    for row in rows.clone() {
-        terminal.backend_mut().queue(MoveTo(area.x, row))?;
-        terminal
-            .backend_mut()
-            .queue(crossterm::terminal::Clear(ClearType::CurrentLine))?;
-    }
-    terminal.try_draw(|frame| {
-        render(frame).map_err(Into::into)?;
-        for row in rows.clone() {
-            frame.render_widget(
-                ratatui::widgets::Clear,
-                ratatui::layout::Rect::new(area.x, row, area.width, 1),
-            );
-        }
-        io::Result::Ok(())
-    })?;
-    terminal
-        .try_draw(|frame| render(frame).map_err(Into::into))
-        .map(|_| ())
 }
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) -> Result<()> {
@@ -229,10 +191,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
 fn take_terminal_repaint(app: &mut App) -> TerminalRepaint {
     match app.take_execution_repaint_request() {
         Some(ExecutionRepaintRequest::Full) => TerminalRepaint::Full,
-        Some(ExecutionRepaintRequest::Output(id)) => app
-            .execution_output_rows(&id)
-            .map(TerminalRepaint::Rows)
-            .unwrap_or(TerminalRepaint::Full),
         None => TerminalRepaint::Diff,
     }
 }
@@ -379,39 +337,6 @@ mod tests {
     }
 
     #[test]
-    fn row_repaint_clears_and_reemits_unchanged_content() {
-        let writer = RecordingWriter::default();
-        let backend = CrosstermBackend::new(writer.clone());
-        let mut terminal = Terminal::with_options(
-            backend,
-            ratatui::TerminalOptions {
-                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 20, 4)),
-            },
-        )
-        .unwrap();
-        let render = |frame: &mut ratatui::Frame| {
-            frame.render_widget(
-                ratatui::widgets::Paragraph::new("stale text"),
-                ratatui::layout::Rect::new(0, 1, 20, 1),
-            );
-            io::Result::Ok(())
-        };
-
-        draw_synchronized(&mut terminal, render).unwrap();
-        writer.clear();
-        draw_synchronized_with_repaint(&mut terminal, TerminalRepaint::Rows(1..2), render).unwrap();
-
-        let output = writer.output();
-        assert!(output.contains("\x1b[2K"), "target row was not cleared");
-        assert!(
-            output.contains("stale") && output.contains("text"),
-            "unchanged row content was not re-emitted after clearing"
-        );
-        assert!(output.contains("\x1b[?2026h"));
-        assert!(output.contains("\x1b[?2026l"));
-    }
-
-    #[test]
     fn full_repaint_reemits_unchanged_content() {
         let writer = RecordingWriter::default();
         let backend = CrosstermBackend::new(writer.clone());
@@ -444,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_output_repaint_targets_current_output_rows() {
+    fn execution_output_scroll_requests_a_full_terminal_repaint() {
         let mut app = App::test_empty();
         let id = crate::execution::ExecutionId::Tool("call-1".to_owned());
         app.set_execution_hitboxes(vec![crate::execution::ExecutionHitbox {
@@ -462,6 +387,6 @@ mod tests {
 
         app.scroll_execution(&id, 3);
 
-        assert_eq!(take_terminal_repaint(&mut app), TerminalRepaint::Rows(2..5));
+        assert_eq!(take_terminal_repaint(&mut app), TerminalRepaint::Full);
     }
 }

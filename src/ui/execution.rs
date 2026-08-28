@@ -367,16 +367,21 @@ mod tests {
     }
 
     #[test]
-    fn expanded_execution_output_is_capped_at_eight_rendered_rows() {
-        let card = bash_card();
+    fn expanding_long_execution_output_keeps_the_card_height_stable() {
+        let mut card = bash_card();
         let output = (1..=20)
             .map(|line| format!("line {line}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let lines = execution_card_lines(&card, Some(&output), 80, true, 0, 0.0);
+        card.preview = ExecutionOutputPreview::from_text(&output);
 
-        assert_eq!(lines.output_rows, 8);
-        assert_eq!(lines.max_output_scroll, 12);
+        let collapsed = execution_card_lines(&card, None, 80, false, 0, 0.0);
+        let expanded = execution_card_lines(&card, Some(&output), 80, true, 0, 0.0);
+
+        assert_eq!(collapsed.preview_rows, 7);
+        assert_eq!(expanded.output_rows, collapsed.preview_rows);
+        assert_eq!(expanded.lines.len(), collapsed.lines.len());
+        assert_eq!(expanded.max_output_scroll, 13);
     }
 
     #[test]
@@ -578,7 +583,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(rendered.first().map(String::as_str), Some("    line 10"));
+        assert_eq!(rendered.first().map(String::as_str), Some("    line 11"));
         assert_eq!(rendered.last().map(String::as_str), Some("    line 17"));
     }
 

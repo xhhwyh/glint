@@ -1,8 +1,8 @@
 use std::{path::PathBuf, time::Duration};
 
-pub const MAX_EXPANDED_OUTPUT_ROWS: u16 = 8;
 pub const COLLAPSED_PREVIEW_EDGE_LINES: usize = 3;
 pub const MAX_COLLAPSED_PREVIEW_ROWS: u16 = 7;
+pub const MAX_EXPANDED_OUTPUT_ROWS: u16 = MAX_COLLAPSED_PREVIEW_ROWS;
 pub const MAX_OUTPUT_PREVIEW_LINE_CHARS: usize = 4_096;
 const COMPLETE_PREVIEW_LINE_LIMIT: usize = MAX_COLLAPSED_PREVIEW_ROWS as usize;
 pub const HOVER_TRANSITION: Duration = Duration::from_millis(160);

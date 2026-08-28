@@ -119,7 +119,6 @@ pub struct ExecutionExpansionMetrics {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionRepaintRequest {
     Full,
-    Output(ExecutionId),
 }
 
 fn reconcile_anchored_scroll(
@@ -734,33 +733,13 @@ impl App {
         } else {
             scroll.saturating_add(delta as u16).min(max_output_scroll)
         };
-        if *scroll != previous
-            && !matches!(
-                self.execution_repaint_request,
-                Some(ExecutionRepaintRequest::Full)
-            )
-        {
-            self.execution_repaint_request = Some(ExecutionRepaintRequest::Output(id.clone()));
+        if *scroll != previous {
+            self.execution_repaint_request = Some(ExecutionRepaintRequest::Full);
         }
     }
 
     pub fn take_execution_repaint_request(&mut self) -> Option<ExecutionRepaintRequest> {
         self.execution_repaint_request.take()
-    }
-
-    pub fn execution_output_rows(&self, id: &ExecutionId) -> Option<std::ops::Range<u16>> {
-        let mut hitboxes = self
-            .execution_hitboxes
-            .iter()
-            .filter(|hitbox| &hitbox.id == id && hitbox.region == ExecutionRegion::Output);
-        let first = hitboxes.next()?;
-        let mut start = first.start_row;
-        let mut end = first.end_row;
-        for hitbox in hitboxes {
-            start = start.min(hitbox.start_row);
-            end = end.max(hitbox.end_row);
-        }
-        Some(start..end)
     }
 
     pub fn reconcile_execution_expansion_metrics(
@@ -4296,7 +4275,7 @@ mod tests {
         assert_eq!(app.scroll, 5);
         assert_eq!(
             app.take_execution_repaint_request(),
-            Some(ExecutionRepaintRequest::Output(id))
+            Some(ExecutionRepaintRequest::Full)
         );
     }
 
