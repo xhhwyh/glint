@@ -69,6 +69,7 @@ pub struct App {
     persisted_execution_outputs: HashMap<PathBuf, String>,
     #[allow(dead_code)]
     execution_hitboxes: Vec<ExecutionHitbox>,
+    execution_repaint_request: Option<ExecutionRepaintRequest>,
     #[allow(dead_code)]
     hovered_execution: Option<ExecutionId>,
     #[allow(dead_code)]
@@ -111,6 +112,12 @@ struct TrustedPersistedOutput {
 pub struct ExecutionExpansionMetrics {
     pub expansion_rows: u16,
     pub max_output_scroll: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExecutionRepaintRequest {
+    Full,
+    Output(ExecutionId),
 }
 
 fn reconcile_anchored_scroll(
@@ -534,6 +541,7 @@ impl App {
             execution_expansion_rows: HashMap::new(),
             persisted_execution_outputs: HashMap::new(),
             execution_hitboxes: Vec::new(),
+            execution_repaint_request: None,
             hovered_execution: None,
             execution_hover_transitions: HashMap::new(),
             usage,
@@ -579,6 +587,7 @@ impl App {
             execution_expansion_rows: HashMap::new(),
             persisted_execution_outputs: HashMap::new(),
             execution_hitboxes: Vec::new(),
+            execution_repaint_request: None,
             hovered_execution: None,
             execution_hover_transitions: HashMap::new(),
             usage: ConversationUsage::default(),
@@ -673,6 +682,7 @@ impl App {
     }
 
     pub fn toggle_execution(&mut self, id: ExecutionId, expansion_rows: u16) {
+        self.execution_repaint_request = Some(ExecutionRepaintRequest::Full);
         if self.expanded_executions.remove(&id) {
             let expansion_rows = self
                 .execution_expansion_rows
@@ -712,11 +722,39 @@ impl App {
         };
 
         let scroll = self.execution_scrolls.entry(id.clone()).or_default();
+        let previous = *scroll;
         *scroll = if delta.is_negative() {
             scroll.saturating_sub(delta.unsigned_abs())
         } else {
             scroll.saturating_add(delta as u16).min(max_output_scroll)
         };
+        if *scroll != previous
+            && !matches!(
+                self.execution_repaint_request,
+                Some(ExecutionRepaintRequest::Full)
+            )
+        {
+            self.execution_repaint_request = Some(ExecutionRepaintRequest::Output(id.clone()));
+        }
+    }
+
+    pub fn take_execution_repaint_request(&mut self) -> Option<ExecutionRepaintRequest> {
+        self.execution_repaint_request.take()
+    }
+
+    pub fn execution_output_rows(&self, id: &ExecutionId) -> Option<std::ops::Range<u16>> {
+        let mut hitboxes = self
+            .execution_hitboxes
+            .iter()
+            .filter(|hitbox| &hitbox.id == id && hitbox.region == ExecutionRegion::Output);
+        let first = hitboxes.next()?;
+        let mut start = first.start_row;
+        let mut end = first.end_row;
+        for hitbox in hitboxes {
+            start = start.min(hitbox.start_row);
+            end = end.max(hitbox.end_row);
+        }
+        Some(start..end)
     }
 
     pub fn reconcile_execution_expansion_metrics(
@@ -4039,12 +4077,37 @@ mod tests {
     fn wheel_over_output_scrolls_only_the_card() {
         let (mut app, id) = app_with_execution_hitboxes();
         app.toggle_execution(id.clone(), 3);
+        assert_eq!(
+            app.take_execution_repaint_request(),
+            Some(ExecutionRepaintRequest::Full)
+        );
         app.scroll = 5;
 
         app.update(AppEvent::Mouse(MouseAction::ScrollUp { column: 8, row: 7 }));
 
         assert_eq!(app.execution_scroll(&id), 3);
         assert_eq!(app.scroll, 5);
+        assert_eq!(
+            app.take_execution_repaint_request(),
+            Some(ExecutionRepaintRequest::Output(id))
+        );
+    }
+
+    #[test]
+    fn output_wheel_at_scroll_limit_does_not_request_repaint() {
+        let (mut app, id) = app_with_execution_hitboxes();
+        app.toggle_execution(id, 3);
+        assert_eq!(
+            app.take_execution_repaint_request(),
+            Some(ExecutionRepaintRequest::Full)
+        );
+
+        app.update(AppEvent::Mouse(MouseAction::ScrollDown {
+            column: 8,
+            row: 7,
+        }));
+
+        assert_eq!(app.take_execution_repaint_request(), None);
     }
 
     #[test]
