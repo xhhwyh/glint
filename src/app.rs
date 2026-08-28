@@ -26,7 +26,8 @@ use crate::{
         PluginsMouseAction, PluginsMouseTab, ResumeMouseAction,
     },
     execution::{
-        ExecutionHitbox, ExecutionId, ExecutionOutputSource, ExecutionRegion, HOVER_TRANSITION,
+        ExecutionHitbox, ExecutionId, ExecutionOutputPreview, ExecutionOutputSource,
+        ExecutionRegion, HOVER_TRANSITION, MAX_OUTPUT_PREVIEW_LINE_CHARS,
         replace_persisted_output_marker,
     },
     input::InputState,
@@ -67,6 +68,7 @@ pub struct App {
     execution_expansion_rows: HashMap<ExecutionId, u16>,
     #[allow(dead_code)]
     persisted_execution_outputs: HashMap<PathBuf, String>,
+    persisted_execution_previews: HashMap<PathBuf, ExecutionOutputPreview>,
     #[allow(dead_code)]
     execution_hitboxes: Vec<ExecutionHitbox>,
     execution_repaint_request: Option<ExecutionRepaintRequest>,
@@ -529,7 +531,7 @@ impl App {
         let subagent_transcripts =
             subagent_transcripts_by_task_id(runtime.ui_subagent_transcripts());
         let usage = runtime.usage();
-        Ok(Self {
+        let mut app = Self {
             should_quit: false,
             messages,
             subagent_transcripts,
@@ -540,6 +542,7 @@ impl App {
             execution_scrolls: HashMap::new(),
             execution_expansion_rows: HashMap::new(),
             persisted_execution_outputs: HashMap::new(),
+            persisted_execution_previews: HashMap::new(),
             execution_hitboxes: Vec::new(),
             execution_repaint_request: None,
             hovered_execution: None,
@@ -570,7 +573,9 @@ impl App {
             runtime,
             #[cfg(test)]
             execution_output_projection_count: Cell::new(0),
-        })
+        };
+        app.preload_all_execution_previews();
+        Ok(app)
     }
 
     #[cfg(test)]
@@ -586,6 +591,7 @@ impl App {
             execution_scrolls: HashMap::new(),
             execution_expansion_rows: HashMap::new(),
             persisted_execution_outputs: HashMap::new(),
+            persisted_execution_previews: HashMap::new(),
             execution_hitboxes: Vec::new(),
             execution_repaint_request: None,
             hovered_execution: None,
@@ -804,6 +810,45 @@ impl App {
         }
     }
 
+    pub fn execution_output_preview(&self, id: &ExecutionId) -> Option<ExecutionOutputPreview> {
+        match id {
+            ExecutionId::Tool(tool_call_id) => {
+                let message = self.messages.iter().rev().find(|message| {
+                    message.role == Role::Tool
+                        && message.tool_name.as_deref() == Some("Bash")
+                        && message.tool_call_id.as_deref() == Some(tool_call_id)
+                })?;
+                Some(self.message_output_preview(message))
+            }
+            ExecutionId::Task(task_id) => {
+                let messages = self.subagent_transcripts.get(task_id)?.messages();
+                let mut preview = ExecutionOutputPreview::default();
+                let mut has_entry = false;
+
+                for message in messages {
+                    let mut entry = self.message_output_preview(message);
+                    if entry.total_lines() == 0 {
+                        continue;
+                    }
+                    let label = match message.role {
+                        Role::User => "User",
+                        Role::Assistant => "Assistant",
+                        Role::Tool => message.tool_name.as_deref().unwrap_or("Tool"),
+                        Role::Progress => "Progress",
+                    };
+                    entry.prefix_first_line(&format!("{label}: "));
+                    if has_entry {
+                        preview.push_line("");
+                    }
+                    preview.append(&entry);
+                    has_entry = true;
+                }
+
+                Some(preview)
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn execution_output_projection_count(&self) -> usize {
         self.execution_output_projection_count.get()
@@ -910,9 +955,91 @@ impl App {
         }
     }
 
+    fn message_output_preview(&self, message: &Message) -> ExecutionOutputPreview {
+        if message.role != Role::Tool {
+            return ExecutionOutputPreview::from_text(&message.content);
+        }
+
+        match self.trusted_persisted_output_path(message) {
+            None => ExecutionOutputPreview::from_text(&message.content),
+            Some(Ok(artifact)) => self
+                .persisted_execution_previews
+                .get(&artifact.path)
+                .cloned()
+                .unwrap_or_else(|| {
+                    ExecutionOutputPreview::from_text(&replace_persisted_output_marker(
+                        &message.content,
+                        "",
+                    ))
+                }),
+            Some(Err(reason)) => ExecutionOutputPreview::from_text(&reason),
+        }
+    }
+
     fn preload_expanded_execution(&mut self, id: &ExecutionId) {
         if self.is_execution_expanded(id) {
             self.preload_execution_output(id);
+        }
+    }
+
+    fn preload_execution_preview(&mut self, id: &ExecutionId) {
+        let outputs = match id {
+            ExecutionId::Tool(tool_call_id) => self
+                .messages
+                .iter()
+                .rev()
+                .find(|message| {
+                    message.role == Role::Tool
+                        && message.tool_name.as_deref() == Some("Bash")
+                        && message.tool_call_id.as_deref() == Some(tool_call_id)
+                })
+                .map(|message| vec![message.clone()])
+                .unwrap_or_default(),
+            ExecutionId::Task(task_id) => self
+                .subagent_transcripts
+                .get(task_id)
+                .map(|transcript| {
+                    transcript
+                        .messages()
+                        .iter()
+                        .filter(|message| message.role == Role::Tool)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+        self.preload_persisted_execution_previews(outputs);
+    }
+
+    fn preload_all_execution_previews(&mut self) {
+        let outputs = self
+            .messages
+            .iter()
+            .chain(
+                self.subagent_transcripts
+                    .values()
+                    .flat_map(|transcript| transcript.messages()),
+            )
+            .filter(|message| message.role == Role::Tool)
+            .cloned()
+            .collect::<Vec<_>>();
+        self.preload_persisted_execution_previews(outputs);
+    }
+
+    fn preload_persisted_execution_previews(&mut self, outputs: Vec<Message>) {
+        for message in outputs {
+            if let Some(Ok(artifact)) = self.trusted_persisted_output_path(&message) {
+                self.persisted_execution_previews
+                    .entry(artifact.path)
+                    .or_insert_with(|| {
+                        read_trusted_persisted_output_preview(&artifact.root, &artifact.filename)
+                            .unwrap_or_else(|error| {
+                                ExecutionOutputPreview::from_text(&format!(
+                                    "Could not read trusted persisted output: {error}"
+                                ))
+                            })
+                    });
+            }
         }
     }
 
@@ -1139,8 +1266,12 @@ impl App {
         for event in self.runtime.poll_subagent_events() {
             match event {
                 SubagentRuntimeEvent::Agent { task_id, event } => {
+                    let output_changed = matches!(&event, AgentEvent::ToolFinished { .. });
                     if let Some(transcript) = self.subagent_transcripts.get_mut(&task_id) {
                         transcript.apply(&event);
+                    }
+                    if output_changed {
+                        self.preload_execution_preview(&ExecutionId::Task(task_id.clone()));
                     }
                     self.preload_expanded_execution(&ExecutionId::Task(task_id.clone()));
                 }
@@ -2647,6 +2778,7 @@ impl App {
         self.messages = loaded.messages;
         self.usage = loaded.usage;
         self.subagent_transcripts = subagent_transcripts_by_task_id(loaded.subagent_transcripts);
+        self.preload_all_execution_previews();
         self.scroll = 0;
         self.approval = None;
     }
@@ -2656,6 +2788,7 @@ impl App {
         self.execution_scrolls.clear();
         self.execution_expansion_rows.clear();
         self.persisted_execution_outputs.clear();
+        self.persisted_execution_previews.clear();
         self.execution_hitboxes.clear();
         self.hovered_execution = None;
         self.execution_hover_transitions.clear();
@@ -2870,7 +3003,7 @@ impl App {
             MouseAction::LeftDown { column, row }
                 if self
                     .execution_hitbox_at(column, row, ExecutionRegion::Summary)
-                    .is_some() =>
+                    .is_some_and(|hitbox| hitbox.expansion_rows > 0) =>
             {
                 let hitbox = self
                     .execution_hitbox_at(column, row, ExecutionRegion::Summary)
@@ -2936,7 +3069,7 @@ impl App {
             MouseAction::ScrollUp { column, row }
                 if self
                     .execution_hitbox_at(column, row, ExecutionRegion::Output)
-                    .is_some() =>
+                    .is_some_and(|hitbox| hitbox.max_output_scroll > 0) =>
             {
                 let id = self
                     .execution_hitbox_at(column, row, ExecutionRegion::Output)
@@ -2948,7 +3081,7 @@ impl App {
             MouseAction::ScrollDown { column, row }
                 if self
                     .execution_hitbox_at(column, row, ExecutionRegion::Output)
-                    .is_some() =>
+                    .is_some_and(|hitbox| hitbox.max_output_scroll > 0) =>
             {
                 let id = self
                     .execution_hitbox_at(column, row, ExecutionRegion::Output)
@@ -3504,6 +3637,7 @@ impl App {
                     message.tool_finished = true;
                     message.tool_is_error = is_error;
                 }
+                self.preload_execution_preview(&ExecutionId::Tool(id.clone()));
                 self.preload_expanded_execution(&ExecutionId::Tool(id));
             }
             AgentEvent::ToolApprovalRequested(request) => {
@@ -3845,10 +3979,10 @@ fn home_relative_path(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-fn read_trusted_persisted_output(
+fn open_trusted_persisted_output(
     root: &Path,
     filename: &std::ffi::OsStr,
-) -> std::io::Result<String> {
+) -> std::io::Result<std::fs::File> {
     #[cfg(not(unix))]
     {
         let _ = (root, filename);
@@ -3862,7 +3996,7 @@ fn read_trusted_persisted_output(
         use std::{
             ffi::CString,
             fs::File,
-            io::{Error, ErrorKind, Read},
+            io::{Error, ErrorKind},
             mem::MaybeUninit,
             os::{
                 fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
@@ -3973,11 +4107,71 @@ fn read_trusted_persisted_output(
         if !fstat_regular(file_fd.as_raw_fd())? {
             return Err(Error::other("artifact is not a regular file"));
         }
-        let mut file = unsafe { File::from_raw_fd(file_fd.into_raw_fd()) };
-        let mut output = String::new();
-        file.read_to_string(&mut output)?;
-        Ok(output)
+        Ok(unsafe { File::from_raw_fd(file_fd.into_raw_fd()) })
     }
+}
+
+fn read_trusted_persisted_output(
+    root: &Path,
+    filename: &std::ffi::OsStr,
+) -> std::io::Result<String> {
+    use std::io::Read;
+
+    let mut file = open_trusted_persisted_output(root, filename)?;
+    let mut output = String::new();
+    file.read_to_string(&mut output)?;
+    Ok(output)
+}
+
+fn read_trusted_persisted_output_preview(
+    root: &Path,
+    filename: &std::ffi::OsStr,
+) -> std::io::Result<ExecutionOutputPreview> {
+    use std::io::Read;
+
+    const READ_BUFFER_BYTES: usize = 8 * 1_024;
+    const MAX_RETAINED_LINE_BYTES: usize = MAX_OUTPUT_PREVIEW_LINE_CHARS * 4;
+
+    fn push_buffered_line(
+        preview: &mut ExecutionOutputPreview,
+        line: &mut Vec<u8>,
+        truncated: bool,
+    ) {
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        let invalid_utf8 = std::str::from_utf8(line).is_err();
+        let text = String::from_utf8_lossy(line).into_owned();
+        preview.push_line_with_truncation(text, truncated || invalid_utf8);
+        line.clear();
+    }
+
+    let mut file = open_trusted_persisted_output(root, filename)?;
+    let mut preview = ExecutionOutputPreview::default();
+    let mut buffer = [0_u8; READ_BUFFER_BYTES];
+    let mut line = Vec::with_capacity(MAX_RETAINED_LINE_BYTES);
+    let mut line_truncated = false;
+
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        for &byte in &buffer[..read] {
+            if byte == b'\n' {
+                push_buffered_line(&mut preview, &mut line, line_truncated);
+                line_truncated = false;
+            } else if line.len() < MAX_RETAINED_LINE_BYTES {
+                line.push(byte);
+            } else {
+                line_truncated = true;
+            }
+        }
+    }
+    if !line.is_empty() || line_truncated {
+        push_buffered_line(&mut preview, &mut line, line_truncated);
+    }
+    Ok(preview)
 }
 
 #[cfg(test)]
@@ -4071,6 +4265,19 @@ mod tests {
             })
         );
         assert!(app.is_execution_expanded(&id));
+    }
+
+    #[test]
+    fn summary_click_does_not_expand_when_complete_preview_is_visible() {
+        let (mut app, id) = app_with_execution_hitboxes();
+        app.execution_hitboxes[0].expansion_rows = 0;
+
+        app.update(AppEvent::Mouse(MouseAction::Move { column: 5, row: 4 }));
+        assert_eq!(app.hovered_execution.as_ref(), Some(&id));
+
+        app.update(AppEvent::Mouse(MouseAction::LeftDown { column: 5, row: 4 }));
+
+        assert!(!app.is_execution_expanded(&id));
     }
 
     #[test]
@@ -4256,6 +4463,17 @@ mod tests {
         }));
         assert_eq!(app.execution_scroll(&id), 9);
         assert_eq!(app.scroll, 5);
+    }
+
+    #[test]
+    fn wheel_over_non_scrollable_preview_scrolls_the_transcript() {
+        let (mut app, _) = app_with_execution_hitboxes();
+        app.execution_hitboxes[1].max_output_scroll = 0;
+        app.scroll = 5;
+
+        app.update(AppEvent::Mouse(MouseAction::ScrollUp { column: 8, row: 7 }));
+
+        assert_eq!(app.scroll, 8);
     }
 
     #[test]
@@ -4495,7 +4713,89 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_execution_cards_skip_bash_subagent_and_persisted_output_projection() {
+    fn execution_output_preview_projects_inline_bash_without_full_output_projection() {
+        let mut app = App::test_empty();
+        let id = ExecutionId::Tool("inline-bash".to_owned());
+        app.messages.push(finished_bash_message(
+            "inline-bash",
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8",
+        ));
+
+        let preview = app.execution_output_preview(&id).expect("inline preview");
+
+        assert_eq!(preview.total_lines(), 8);
+        assert_eq!(
+            &preview.leading_lines()[..3],
+            ["line 1", "line 2", "line 3"]
+        );
+        assert_eq!(preview.trailing_lines(), ["line 6", "line 7", "line 8"]);
+        assert_eq!(app.execution_output_projection_count(), 0);
+    }
+
+    #[test]
+    fn execution_output_preview_composes_subagent_entries_without_joining_full_transcript() {
+        let mut app = App::test_empty();
+        let id = ExecutionId::Task("a1".to_owned());
+        app.subagent_transcripts.insert(
+            "a1".to_owned(),
+            task_transcript(vec![
+                Message::assistant("a1\na2\na3\na4"),
+                Message::assistant("b1\nb2\nb3\nb4"),
+            ]),
+        );
+
+        let preview = app.execution_output_preview(&id).expect("subagent preview");
+
+        assert_eq!(preview.total_lines(), 9);
+        assert_eq!(&preview.leading_lines()[..3], ["Assistant: a1", "a2", "a3"]);
+        assert_eq!(preview.trailing_lines(), ["b2", "b3", "b4"]);
+        assert_eq!(app.execution_output_projection_count(), 0);
+    }
+
+    #[test]
+    fn execution_output_preview_reads_persisted_tail_without_caching_full_output() {
+        let mut app = App::test_empty();
+        let id = ExecutionId::Tool("persisted-bash".to_owned());
+        let persisted_path = expected_artifact(&app, "persisted-bash", "Bash");
+        fs::create_dir_all(persisted_path.parent().expect("artifact parent"))
+            .expect("create artifact parent");
+        fs::write(
+            &persisted_path,
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8",
+        )
+        .expect("write persisted output");
+        app.update_agent(AgentEvent::ToolStarted {
+            id: "persisted-bash".to_owned(),
+            name: "Bash".to_owned(),
+            input_summary: "generate output".to_owned(),
+            input_description: None,
+        });
+        app.update_agent(AgentEvent::ToolFinished {
+            id: "persisted-bash".to_owned(),
+            name: "Bash".to_owned(),
+            output: persisted_output_marker(&persisted_path),
+            is_error: false,
+            output_summary: "generated output".to_owned(),
+        });
+
+        let preview = app
+            .execution_output_preview(&id)
+            .expect("persisted preview");
+
+        assert_eq!(preview.total_lines(), 8);
+        assert_eq!(
+            &preview.leading_lines()[..3],
+            ["line 1", "line 2", "line 3"]
+        );
+        assert_eq!(preview.trailing_lines(), ["line 6", "line 7", "line 8"]);
+        assert!(app.persisted_execution_outputs.is_empty());
+        assert_eq!(app.execution_output_projection_count(), 0);
+
+        fs::remove_file(persisted_path).ok();
+    }
+
+    #[test]
+    fn collapsed_execution_cards_skip_full_output_projection() {
         let mut app = App::test_empty();
         app.messages.push(finished_bash_message(
             "inline-bash",

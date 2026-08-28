@@ -441,9 +441,8 @@ fn document(app: &App, width: u16) -> Document {
             let expanded = app.is_execution_expanded(&id);
             let output_scroll = app.execution_scroll(&id);
             let hover_progress = app.execution_hover_progress(&id);
-            // The normal collapsed projection deliberately carries only card
-            // metadata. Materialize the potentially large execution output
-            // exactly once, and only when the user has expanded this card.
+            // Collapsed cards carry a bounded head/tail preview. Materialize
+            // the complete execution output only when the card is expanded.
             let output = expanded.then(|| app.execution_output_view(&id)).flatten();
             let card_lines = execution::execution_card_lines(
                 &card,
@@ -453,21 +452,18 @@ fn document(app: &App, width: u16) -> Document {
                 output_scroll,
                 hover_progress,
             );
-            let expansion_metrics = if expanded {
-                ExecutionExpansionMetrics {
-                    expansion_rows: card_lines.output_rows,
-                    max_output_scroll: card_lines.max_output_scroll,
-                }
-            } else if card.has_output {
-                ExecutionExpansionMetrics {
-                    expansion_rows: MAX_EXPANDED_OUTPUT_ROWS,
-                    max_output_scroll: 0,
-                }
+            let expansion_rows = if expanded {
+                card_lines
+                    .output_rows
+                    .saturating_sub(card_lines.preview_rows)
+            } else if card_lines.expandable {
+                MAX_EXPANDED_OUTPUT_ROWS.saturating_sub(card_lines.preview_rows)
             } else {
-                ExecutionExpansionMetrics {
-                    expansion_rows: 0,
-                    max_output_scroll: 0,
-                }
+                0
+            };
+            let expansion_metrics = ExecutionExpansionMetrics {
+                expansion_rows,
+                max_output_scroll: card_lines.max_output_scroll,
             };
             execution_metrics.insert(id.clone(), expansion_metrics);
             line_meta.extend(
@@ -1022,11 +1018,11 @@ mod tests {
             .iter()
             .find(|hitbox| hitbox.id == id && hitbox.region == ExecutionRegion::Summary)
             .expect("summary hitbox");
-        assert_eq!(summary.expansion_rows, MAX_EXPANDED_OUTPUT_ROWS);
+        assert_eq!(summary.expansion_rows, 0);
         assert!(
             collapsed
                 .iter()
-                .all(|hitbox| hitbox.region != ExecutionRegion::Output)
+                .any(|hitbox| hitbox.region == ExecutionRegion::Output)
         );
 
         app.toggle_execution(id.clone(), 8);
@@ -1108,8 +1104,8 @@ mod tests {
 
         assert!(!visible_hitboxes.iter().any(|hitbox| hitbox.id == first));
         assert!(visible_hitboxes.iter().any(|hitbox| hitbox.id == second));
-        assert_eq!(metrics[&first].expansion_rows, 1);
-        assert_eq!(metrics[&second].expansion_rows, 1);
+        assert_eq!(metrics[&first].expansion_rows, 0);
+        assert_eq!(metrics[&second].expansion_rows, 0);
     }
 
     #[test]
@@ -1126,10 +1122,10 @@ mod tests {
 
         let prepared = prepare_document(&app, 80, 20);
         let metrics = prepared.execution_expansion_metrics(&app);
-        assert_eq!(metrics[&id].expansion_rows, 1);
+        assert_eq!(metrics[&id].expansion_rows, 0);
 
         app.reconcile_execution_expansion_metrics(metrics);
-        assert_eq!(app.scroll, 6);
+        assert_eq!(app.scroll, 5);
         assert_eq!(
             prepared.execution_hitboxes(&app),
             execution_hitboxes(&app, 80, 20)
@@ -1172,7 +1168,7 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_persisted_bash_hitbox_uses_capped_anchor_metrics_at_all_widths() {
+    fn collapsed_persisted_bash_hitbox_accounts_for_its_preview_row() {
         let mut app = App::test_empty();
         let id = ExecutionId::Tool("call-bash".to_owned());
         app.messages.push(finished_bash_message(
@@ -1186,16 +1182,18 @@ mod tests {
                 .into_iter()
                 .find(|hitbox| hitbox.id == id && hitbox.region == ExecutionRegion::Summary)
                 .expect("summary hitbox");
-            assert_eq!(
-                hitbox.expansion_rows,
-                crate::execution::MAX_EXPANDED_OUTPUT_ROWS
-            );
+            let expected_rows = if width == 20 {
+                crate::execution::MAX_EXPANDED_OUTPUT_ROWS - 1
+            } else {
+                0
+            };
+            assert_eq!(hitbox.expansion_rows, expected_rows);
             assert_eq!(hitbox.max_output_scroll, 0);
         }
     }
 
     #[test]
-    fn collapsed_persisted_subagent_hitbox_uses_capped_anchor_metrics() {
+    fn collapsed_persisted_subagent_hitbox_accounts_for_its_preview_row() {
         let mut app = App::test_empty();
         let id = ExecutionId::Task("task-1".to_owned());
         app.messages.push(Message::tool_with_description(
@@ -1229,7 +1227,7 @@ mod tests {
                 .expect("summary hitbox");
             assert_eq!(
                 hitbox.expansion_rows,
-                crate::execution::MAX_EXPANDED_OUTPUT_ROWS
+                crate::execution::MAX_EXPANDED_OUTPUT_ROWS - 1
             );
             assert_eq!(hitbox.max_output_scroll, 0);
         }

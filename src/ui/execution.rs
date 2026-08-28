@@ -6,7 +6,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     app::App,
-    execution::{ExecutionId, ExecutionRegion, MAX_EXPANDED_OUTPUT_ROWS},
+    execution::{ExecutionId, ExecutionOutputPreview, ExecutionRegion, MAX_EXPANDED_OUTPUT_ROWS},
     message::{Message, Role},
     tasks::TaskStatus,
 };
@@ -25,10 +25,7 @@ pub(super) struct ExecutionCardView<'a> {
     pub summary: &'a str,
     pub description: Option<&'a str>,
     pub status: String,
-    /// Collapsed cards only need to know whether opening them can reveal output.
-    /// Keep the complete text out of this metadata projection so the normal
-    /// transcript frame does not clone or join large execution results.
-    pub has_output: bool,
+    pub preview: ExecutionOutputPreview,
     pub finished: bool,
     pub is_error: bool,
     pub streaming: bool,
@@ -38,6 +35,8 @@ pub(super) struct ExecutionCardLines {
     pub lines: Vec<Line<'static>>,
     pub regions: Vec<Option<ExecutionRegion>>,
     pub output_rows: u16,
+    pub preview_rows: u16,
+    pub expandable: bool,
     pub max_output_scroll: u16,
 }
 
@@ -59,7 +58,7 @@ pub(super) fn execution_card<'a>(
                 summary: message.tool_input.as_deref().unwrap_or(""),
                 description: message.tool_description.as_deref(),
                 status: tool_status(message),
-                has_output: !message.content.is_empty(),
+                preview: app.execution_output_preview(&id).unwrap_or_default(),
                 finished: message.tool_finished,
                 is_error: message.tool_is_error,
                 streaming: !message.tool_finished,
@@ -80,10 +79,7 @@ pub(super) fn execution_card<'a>(
                     .unwrap_or_else(|| transcript.description()),
                 description: Some(transcript.description()),
                 status: status.label().to_owned(),
-                has_output: transcript
-                    .messages()
-                    .iter()
-                    .any(|message| !message.content.is_empty()),
+                preview: app.execution_output_preview(&id).unwrap_or_default(),
                 finished: status.is_terminal(),
                 is_error: matches!(status, TaskStatus::Failed | TaskStatus::Cancelled),
                 streaming: status.is_running(),
@@ -102,19 +98,50 @@ pub(super) fn execution_card_lines(
     hover_fraction: f32,
 ) -> ExecutionCardLines {
     let width = width.max(1) as usize;
+    let preview = collapsed_preview(&card.preview, width.saturating_sub(4));
     if !expanded {
-        let output_row_count = usize::from(card.has_output) * MAX_EXPANDED_OUTPUT_ROWS as usize;
-        let summary = card_summary(card, width, false, output_row_count, hover_fraction);
+        let summary = card_summary(
+            card,
+            width,
+            false,
+            card.preview.total_lines(),
+            preview.expandable,
+            hover_fraction,
+        );
+        let preview_rows = preview.rows.len().min(u16::MAX as usize) as u16;
+        let mut lines = vec![Line::from(""), Line::from(summary)];
+        let mut regions = vec![None, Some(ExecutionRegion::Summary)];
+        for row in preview.rows {
+            let color = if row.omission {
+                MUTED_TEXT_COLOR
+            } else {
+                EXECUTION_OUTPUT_COLOR
+            };
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(row.text, Style::default().fg(color)),
+            ]));
+            regions.push(Some(ExecutionRegion::Output));
+        }
         return ExecutionCardLines {
-            lines: vec![Line::from(""), Line::from(summary)],
-            regions: vec![None, Some(ExecutionRegion::Summary)],
+            lines,
+            regions,
             output_rows: 0,
+            preview_rows,
+            expandable: preview.expandable,
             max_output_scroll: 0,
         };
     }
 
     let output_lines = wrap_text(output.unwrap_or_default(), (width.saturating_sub(4)) as u16);
-    let summary = card_summary(card, width, expanded, output_lines.len(), hover_fraction);
+    let summary = card_summary(
+        card,
+        width,
+        expanded,
+        card.preview.total_lines(),
+        true,
+        hover_fraction,
+    );
     let mut lines = vec![Line::from(""), Line::from(summary)];
     let mut regions = vec![None, Some(ExecutionRegion::Summary)];
 
@@ -135,7 +162,65 @@ pub(super) fn execution_card_lines(
         lines,
         regions,
         output_rows,
+        preview_rows: preview.rows.len().min(u16::MAX as usize) as u16,
+        expandable: preview.expandable,
         max_output_scroll,
+    }
+}
+
+struct CollapsedPreviewRow {
+    text: String,
+    omission: bool,
+}
+
+struct CollapsedPreview {
+    rows: Vec<CollapsedPreviewRow>,
+    expandable: bool,
+}
+
+fn collapsed_preview(preview: &ExecutionOutputPreview, width: usize) -> CollapsedPreview {
+    fn push_output(
+        rows: &mut Vec<CollapsedPreviewRow>,
+        truncated: &mut bool,
+        line: &str,
+        width: usize,
+    ) {
+        let rendered = truncate_end_to_width(line, width);
+        *truncated |= rendered != line;
+        rows.push(CollapsedPreviewRow {
+            text: rendered,
+            omission: false,
+        });
+    }
+
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut truncated = false;
+
+    if preview.is_abridged() {
+        for line in preview
+            .leading_lines()
+            .iter()
+            .take(crate::execution::COLLAPSED_PREVIEW_EDGE_LINES)
+        {
+            push_output(&mut rows, &mut truncated, line, width);
+        }
+        rows.push(CollapsedPreviewRow {
+            text: truncate_end_to_width(&format!("... +{} lines", preview.omitted_lines()), width),
+            omission: true,
+        });
+        for line in preview.trailing_lines() {
+            push_output(&mut rows, &mut truncated, line, width);
+        }
+    } else {
+        for line in preview.leading_lines() {
+            push_output(&mut rows, &mut truncated, line, width);
+        }
+    }
+
+    CollapsedPreview {
+        rows,
+        expandable: preview.is_abridged() || preview.has_truncated_content() || truncated,
     }
 }
 
@@ -162,6 +247,7 @@ fn card_summary(
     width: usize,
     expanded: bool,
     output_row_count: usize,
+    expandable: bool,
     hover_fraction: f32,
 ) -> Vec<Span<'static>> {
     let details = if card.summary.trim().is_empty() {
@@ -175,19 +261,20 @@ fn card_summary(
         "pending".to_owned()
     };
     let hint = if expanded {
-        "click to collapse"
+        Some("click to collapse")
+    } else if expandable {
+        Some("click to expand")
     } else {
-        "click to expand"
+        None
     };
     let prefix = format!("  ◇ {} ", card.name);
-    let output_hint = if expanded {
-        format!(" · {output_row_count} lines")
-    } else if output_row_count == 0 {
+    let output_hint = if output_row_count == 0 {
         String::new()
     } else {
-        format!(" · preview up to {output_row_count} rows")
+        format!(" · {output_row_count} lines")
     };
-    let suffix = format!(" · {status}{output_hint} · {hint}");
+    let hint_suffix = hint.map(|hint| format!(" · {hint}")).unwrap_or_default();
+    let suffix = format!(" · {status}{output_hint}{hint_suffix}");
     let available = width.saturating_sub(prefix.width() + suffix.width());
     let details = truncate_end_to_width(details, available);
     let background = interpolate_color(BG_COLOR, Color::Rgb(8, 47, 73), hover_fraction);
@@ -227,7 +314,7 @@ fn card_summary(
         Span::styled(details, detail_style),
         Span::styled(format!(" · {status}"), status_style),
         Span::styled(output_hint, muted_style),
-        Span::styled(format!(" · {hint}"), muted_style),
+        Span::styled(hint_suffix, muted_style),
     ]
 }
 
@@ -272,7 +359,7 @@ mod tests {
             summary: "git remote update",
             description: None,
             status: "completed".to_owned(),
-            has_output: true,
+            preview: ExecutionOutputPreview::from_text("output"),
             finished: true,
             is_error: false,
             streaming: false,
@@ -383,11 +470,12 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_summary_uses_a_bounded_expansion_estimate_without_wrapping_output() {
-        let card = bash_card();
-        let narrow = execution_card_lines(&card, None, 20, false, 0, 0.0);
-        let wide = execution_card_lines(&card, None, 40, false, 0, 0.0);
-        let narrow_text = narrow
+    fn collapsed_short_execution_output_shows_every_line_without_expand_hint() {
+        let mut card = bash_card();
+        card.preview = ExecutionOutputPreview::from_text("line 1\nline 2\nline 3");
+
+        let rendered = execution_card_lines(&card, None, 80, false, 0, 0.0);
+        let rendered_text = rendered
             .lines
             .iter()
             .map(|line| {
@@ -396,8 +484,26 @@ mod tests {
                     .map(|span| span.content.as_ref())
                     .collect::<String>()
             })
-            .collect::<String>();
-        let wide_text = wide
+            .collect::<Vec<_>>();
+
+        assert!(rendered_text.iter().any(|line| line == "    line 1"));
+        assert!(rendered_text.iter().any(|line| line == "    line 2"));
+        assert!(rendered_text.iter().any(|line| line == "    line 3"));
+        assert!(!rendered_text.concat().contains("click to expand"));
+        assert!(!rendered_text.concat().contains("preview up to"));
+        assert!(rendered_text[1].ends_with(" · completed · 3 lines"));
+        assert!(!rendered.expandable);
+    }
+
+    #[test]
+    fn collapsed_long_execution_output_shows_three_lines_from_each_end() {
+        let mut card = bash_card();
+        card.preview = ExecutionOutputPreview::from_text(
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8",
+        );
+
+        let rendered = execution_card_lines(&card, None, 80, false, 0, 0.0);
+        let rendered_text = rendered
             .lines
             .iter()
             .map(|line| {
@@ -406,10 +512,43 @@ mod tests {
                     .map(|span| span.content.as_ref())
                     .collect::<String>()
             })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            &rendered_text[2..],
+            [
+                "    line 1",
+                "    line 2",
+                "    line 3",
+                "    ... +2 lines",
+                "    line 6",
+                "    line 7",
+                "    line 8",
+            ]
+        );
+        assert!(rendered_text.concat().contains("click to expand"));
+        assert!(!rendered_text.concat().contains("preview up to"));
+        assert!(!rendered_text[1].contains(" ·  · "));
+        assert!(rendered.expandable);
+    }
+
+    #[test]
+    fn collapsed_short_output_remains_expandable_when_a_line_is_truncated() {
+        let mut card = bash_card();
+        card.preview = ExecutionOutputPreview::from_text(
+            "a single terminal output line that is wider than the collapsed card",
+        );
+
+        let rendered = execution_card_lines(&card, None, 30, false, 0, 0.0);
+        let rendered_text = rendered
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert!(narrow_text.contains("preview up to 8 rows"));
-        assert!(wide_text.contains("preview up to 8 rows"));
+        assert!(rendered_text.contains("click to expand"));
+        assert!(rendered.expandable);
     }
 
     #[test]
