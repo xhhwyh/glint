@@ -6,6 +6,8 @@ mod config;
 mod context;
 mod event;
 mod execution;
+#[cfg(test)]
+mod http_proxy_tests;
 mod input;
 mod message;
 mod plugins;

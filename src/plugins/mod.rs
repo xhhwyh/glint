@@ -972,10 +972,11 @@ fn load_marketplace_with_mode(
         )
     } else if is_remote_marketplace_file(source) {
         report_progress(format!("http: downloading marketplace {source}"));
-        let content = ureq::get(source)
-            .call()
+        let content = reqwest::blocking::get(source)
             .with_context(|| format!("failed to download plugin marketplace '{source}'"))?
-            .into_string()
+            .error_for_status()
+            .with_context(|| format!("failed to download plugin marketplace '{source}'"))?
+            .text()
             .with_context(|| format!("failed to read plugin marketplace '{source}'"))?;
         (content, None)
     } else {

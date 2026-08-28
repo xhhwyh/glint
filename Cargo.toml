@@ -11,7 +11,7 @@ http = "1"
 libc = "0.2"
 pulldown-cmark = "0.12"
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "system-proxy"] }
 rmcp = { version = "1.8", default-features = false, features = [
     "auth",
     "base64",
@@ -33,6 +33,5 @@ tokio = { version = "1", features = [
     "sync",
     "time",
 ] }
-ureq = { version = "2", features = ["json"] }
 unicode-width = "0.1"
 uuid = { version = "1", default-features = false, features = ["v4"] }

@@ -1,6 +1,7 @@
 use std::io::{BufRead, BufReader};
 
 use anyhow::{Context, Result, bail};
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -18,17 +19,21 @@ const MAX_STREAM_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
 
 pub struct OpenAiProvider {
     config: LlmConfig,
+    client: Client,
 }
 
 impl OpenAiProvider {
     pub fn new(config: LlmConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            client: Client::new(),
+        }
     }
 }
 
 impl ModelProvider for OpenAiProvider {
     fn complete(&mut self, request: ModelRequest) -> Result<ModelResponse> {
-        complete_chat(&self.config, request)
+        complete_chat(&self.client, &self.config, request)
     }
 
     fn stream(
@@ -36,7 +41,7 @@ impl ModelProvider for OpenAiProvider {
         request: ModelRequest,
         on_delta: &mut dyn FnMut(String),
     ) -> Result<ModelResponse> {
-        stream_chat(&self.config, request, on_delta)
+        stream_chat(&self.client, &self.config, request, on_delta)
     }
 }
 
@@ -199,7 +204,11 @@ struct ResponseMessage {
     tool_calls: Option<Vec<ChatToolCall>>,
 }
 
-fn complete_chat(config: &LlmConfig, request: ModelRequest) -> Result<ModelResponse> {
+fn complete_chat(
+    client: &Client,
+    config: &LlmConfig,
+    request: ModelRequest,
+) -> Result<ModelResponse> {
     let request = ChatRequest {
         model: config.model.clone(),
         messages: request
@@ -216,12 +225,15 @@ fn complete_chat(config: &LlmConfig, request: ModelRequest) -> Result<ModelRespo
         tools: chat_tools(request.tools),
     };
 
-    let response: ChatResponse = ureq::post(&format!("{}/chat/completions", config.base_url))
-        .set("Authorization", &format!("Bearer {}", config.api_key))
-        .set("Content-Type", "application/json")
-        .send_json(serde_json::to_value(request)?)
+    let response: ChatResponse = client
+        .post(format!("{}/chat/completions", config.base_url))
+        .bearer_auth(&config.api_key)
+        .json(&request)
+        .send()
         .context("request failed")?
-        .into_json()
+        .error_for_status()
+        .context("request failed")?
+        .json()
         .context("invalid response")?;
 
     let choice = response
@@ -234,6 +246,7 @@ fn complete_chat(config: &LlmConfig, request: ModelRequest) -> Result<ModelRespo
 }
 
 fn stream_chat(
+    client: &Client,
     config: &LlmConfig,
     request: ModelRequest,
     on_delta: &mut dyn FnMut(String),
@@ -256,14 +269,17 @@ fn stream_chat(
         tools: chat_tools(request.tools),
     };
 
-    let response = ureq::post(&format!("{}/chat/completions", config.base_url))
-        .set("Authorization", &format!("Bearer {}", config.api_key))
-        .set("Content-Type", "application/json")
-        .send_json(serde_json::to_value(request)?)
+    let response = client
+        .post(format!("{}/chat/completions", config.base_url))
+        .bearer_auth(&config.api_key)
+        .json(&request)
+        .send()
+        .context("request failed")?
+        .error_for_status()
         .context("request failed")?;
 
     let mut state = StreamingState::default();
-    for line in BufReader::new(response.into_reader()).lines() {
+    for line in BufReader::new(response).lines() {
         let line = line.context("failed to read streaming response")?;
         let Some(payload) = line
             .strip_prefix("data:")
