@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -133,7 +135,8 @@ pub(super) fn execution_card_lines(
         };
     }
 
-    let output_lines = wrap_text(output.unwrap_or_default(), (width.saturating_sub(4)) as u16);
+    let output = normalize_execution_output(output.unwrap_or_default());
+    let output_lines = wrap_text(&output, (width.saturating_sub(4)) as u16);
     let summary = card_summary(
         card,
         width,
@@ -185,7 +188,8 @@ fn collapsed_preview(preview: &ExecutionOutputPreview, width: usize) -> Collapse
         line: &str,
         width: usize,
     ) {
-        let rendered = truncate_end_to_width(line, width);
+        let line = normalize_execution_output(line);
+        let rendered = truncate_end_to_width(&line, width);
         *truncated |= rendered != line;
         rows.push(CollapsedPreviewRow {
             text: rendered,
@@ -221,6 +225,14 @@ fn collapsed_preview(preview: &ExecutionOutputPreview, width: usize) -> Collapse
     CollapsedPreview {
         rows,
         expandable: preview.is_abridged() || preview.has_truncated_content() || truncated,
+    }
+}
+
+fn normalize_execution_output(text: &str) -> Cow<'_, str> {
+    if text.contains('\t') {
+        Cow::Owned(text.replace('\t', "    "))
+    } else {
+        Cow::Borrowed(text)
     }
 }
 
@@ -498,6 +510,31 @@ mod tests {
         assert!(!rendered_text.concat().contains("preview up to"));
         assert!(rendered_text[1].ends_with(" · completed · 3 lines"));
         assert!(!rendered.expandable);
+    }
+
+    #[test]
+    fn expanded_execution_output_tabs_are_projected_as_four_spaces() {
+        let card = bash_card();
+
+        let rendered = execution_card_lines(
+            &card,
+            Some("origin\thttps://github.com/xhhwyh/glint.git (fetch)"),
+            100,
+            true,
+            0,
+            0.0,
+        );
+        let output = rendered.lines[2]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(
+            output,
+            "    origin    https://github.com/xhhwyh/glint.git (fetch)"
+        );
+        assert!(!output.contains('\t'));
     }
 
     #[test]

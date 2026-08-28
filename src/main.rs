@@ -41,6 +41,8 @@ use crossterm::{
 use event::{AppEvent, KeyAction, KeyInput, MouseAction};
 use ratatui::{Terminal, backend::CrosstermBackend};
 
+const MAX_TERMINAL_EVENTS_PER_FRAME: usize = 64;
+
 fn main() -> Result<()> {
     let config = Config::load()?;
 
@@ -137,47 +139,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
         })?;
 
         if term_event::poll(Duration::from_millis(40))? {
-            match term_event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    let input = KeyInput::from(key);
-                    if input.action == KeyAction::Quit {
-                        if let Some(text) = app.selected_input_text() {
-                            match copy_selection_to_clipboard(terminal, &text) {
-                                Ok(()) => app.finish_input_selection_copy(),
-                                Err(error) => app.fail_selection_copy(&format!("{error:#}")),
-                            }
-                        } else if let Some(text) = ui::selected_text(&app, size.width) {
-                            match copy_selection_to_clipboard(terminal, &text) {
-                                Ok(()) => app.finish_selection_copy(),
-                                Err(error) => app.fail_selection_copy(&format!("{error:#}")),
-                            }
-                        } else {
-                            app.request_quit();
-                        }
-                    } else if input.action == KeyAction::Cut {
-                        if let Some(text) = app.selected_input_text() {
-                            match copy_selection_to_clipboard(terminal, &text) {
-                                Ok(()) => app.finish_input_selection_cut(),
-                                Err(error) => app.fail_selection_copy(&format!("{error:#}")),
-                            }
-                        } else {
-                            app.update(AppEvent::Key(input));
-                        }
-                    } else {
-                        app.update(AppEvent::Key(input));
-                    }
+            let events = terminal_event_batch(term_event::read()?, || {
+                if term_event::poll(Duration::ZERO)? {
+                    term_event::read().map(Some)
+                } else {
+                    Ok(None)
                 }
-                Event::Mouse(mouse) => {
-                    let mouse = MouseAction::from(mouse);
-                    if let Some(action) =
-                        ui::extension_mouse_action(&app, mouse, size.width, size.height)
-                    {
-                        app.update(AppEvent::ExtensionMouse(action));
-                    } else {
-                        app.update(AppEvent::Mouse(mouse));
-                    }
-                }
-                _ => {}
+            })?;
+            for event in events {
+                handle_terminal_event(terminal, &mut app, event, size.width, size.height);
             }
         }
 
@@ -186,6 +156,70 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) ->
     }
 
     Ok(())
+}
+
+fn terminal_event_batch<T>(
+    first: T,
+    mut read_queued: impl FnMut() -> io::Result<Option<T>>,
+) -> io::Result<Vec<T>> {
+    let mut events = Vec::with_capacity(MAX_TERMINAL_EVENTS_PER_FRAME);
+    events.push(first);
+    while events.len() < MAX_TERMINAL_EVENTS_PER_FRAME {
+        let Some(event) = read_queued()? else {
+            break;
+        };
+        events.push(event);
+    }
+    Ok(events)
+}
+
+fn handle_terminal_event(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    event: Event,
+    width: u16,
+    height: u16,
+) {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            let input = KeyInput::from(key);
+            if input.action == KeyAction::Quit {
+                if let Some(text) = app.selected_input_text() {
+                    match copy_selection_to_clipboard(terminal, &text) {
+                        Ok(()) => app.finish_input_selection_copy(),
+                        Err(error) => app.fail_selection_copy(&format!("{error:#}")),
+                    }
+                } else if let Some(text) = ui::selected_text(app, width) {
+                    match copy_selection_to_clipboard(terminal, &text) {
+                        Ok(()) => app.finish_selection_copy(),
+                        Err(error) => app.fail_selection_copy(&format!("{error:#}")),
+                    }
+                } else {
+                    app.request_quit();
+                }
+            } else if input.action == KeyAction::Cut {
+                if let Some(text) = app.selected_input_text() {
+                    match copy_selection_to_clipboard(terminal, &text) {
+                        Ok(()) => app.finish_input_selection_cut(),
+                        Err(error) => app.fail_selection_copy(&format!("{error:#}")),
+                    }
+                } else {
+                    app.update(AppEvent::Key(input));
+                }
+            } else {
+                app.update(AppEvent::Key(input));
+            }
+        }
+        Event::Mouse(mouse) => {
+            let mouse = MouseAction::from(mouse);
+            if let Some(action) = ui::extension_mouse_action(app, mouse, width, height) {
+                app.update(AppEvent::ExtensionMouse(action));
+            } else {
+                app.update(AppEvent::Mouse(mouse));
+            }
+        }
+        _ => {}
+    }
 }
 
 fn take_terminal_repaint(app: &mut App) -> TerminalRepaint {
@@ -256,6 +290,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     #[derive(Clone, Default)]
     struct RecordingWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -292,6 +327,27 @@ mod tests {
     #[test]
     fn osc52_sequence_wraps_base64_payload() {
         assert_eq!(osc52_sequence("hi"), "\x1b]52;c;aGk=\x07");
+    }
+
+    #[test]
+    fn terminal_event_batch_preserves_fifo_order() {
+        let mut queued = VecDeque::from([2, 3, 4]);
+
+        let batch = terminal_event_batch(1, || Ok(queued.pop_front())).unwrap();
+
+        assert_eq!(batch, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn terminal_event_batch_is_bounded_per_frame() {
+        let mut queued = VecDeque::from_iter(1..=MAX_TERMINAL_EVENTS_PER_FRAME + 4);
+
+        let batch = terminal_event_batch(0, || Ok(queued.pop_front())).unwrap();
+
+        assert_eq!(batch.len(), MAX_TERMINAL_EVENTS_PER_FRAME);
+        assert_eq!(batch[0], 0);
+        assert_eq!(batch[MAX_TERMINAL_EVENTS_PER_FRAME - 1], 63);
+        assert_eq!(queued.front(), Some(&64));
     }
 
     #[test]

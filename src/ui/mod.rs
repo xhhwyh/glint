@@ -948,6 +948,41 @@ mod tests {
     }
 
     #[test]
+    fn execution_output_tabs_do_not_reach_ratatui_buffer() {
+        let mut app = App::test_empty();
+        app.messages.push(finished_bash_message(
+            "call-git-remote",
+            "git remote -v",
+            "origin\thttps://github.com/xhhwyh/glint.git (fetch)",
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).expect("test terminal");
+
+        render_execution_frame(&mut terminal, &app);
+
+        let symbols = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            !symbols.contains('\t'),
+            "literal tabs can move the real terminal cursor outside Ratatui's width model"
+        );
+        assert!(
+            buffer_rows(&terminal)
+                .iter()
+                .any(|row| row.contains("origin    https://github.com/xhhwyh/glint.git (fetch)")),
+            "execution output did not expand the tab to four spaces"
+        );
+        assert!(
+            app.messages[0].content.contains('\t'),
+            "rendering must not mutate the persisted tool result"
+        );
+    }
+
+    #[test]
     fn git_remote_output_survives_main_and_internal_scroll_without_stale_collapsed_rows() {
         let mut app = App::test_empty();
         let id = ExecutionId::Tool("call-git-remote".to_owned());
