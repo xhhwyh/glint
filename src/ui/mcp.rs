@@ -398,7 +398,10 @@ fn render_selected_server(
                     Style::default().fg(MUTED_TEXT_COLOR),
                 )),
                 Line::from(Span::styled(
-                    "The server will be saved to config.yaml and activated immediately.",
+                    format!(
+                        "The server will be saved to {} and activated immediately.",
+                        app.config.config_path.display()
+                    ),
                     Style::default().fg(MUTED_TEXT_COLOR),
                 )),
             ]
@@ -525,7 +528,10 @@ fn server_detail_lines(
         append_transport_lines(&mut lines, &config.transport);
         if !config.enabled {
             lines.push(Line::from(Span::styled(
-                "  Enable this server in config.yaml or in the plugin that contributes it.",
+                format!(
+                    "  Enable this server in {} or in the plugin that contributes it.",
+                    app.config.config_path.display()
+                ),
                 Style::default().fg(WARNING_COLOR),
             )));
         }
@@ -1273,7 +1279,7 @@ fn approval_color(approval: McpApprovalPolicy) -> Color {
 
 fn server_origin(app: &App, name: &str) -> String {
     if app.config.base_mcp.servers.contains_key(name) {
-        "config.yaml".to_owned()
+        app.config.config_path.display().to_string()
     } else if let Some((plugin, _)) = name.split_once(':') {
         format!("plugin {plugin}")
     } else {

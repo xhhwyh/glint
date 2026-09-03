@@ -1,4 +1,8 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -8,8 +12,11 @@ use crate::{
     services::mcp::McpConfig,
 };
 
+const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
+
 #[derive(Clone)]
 pub struct Config {
+    pub(crate) config_path: PathBuf,
     pub llm: LlmConfig,
     pub lsp: LspConfig,
     pub mcp: McpConfig,
@@ -161,6 +168,138 @@ enum FileModelConfig {
     Details(Box<FileModelDetails>),
 }
 
+struct ConfigPathInput {
+    explicit: Option<PathBuf>,
+    glint_config: Option<PathBuf>,
+    xdg_config_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    cwd: PathBuf,
+}
+
+struct InitConfigPathInput {
+    explicit: Option<PathBuf>,
+    glint_config: Option<PathBuf>,
+    xdg_config_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+}
+
+impl InitConfigPathInput {
+    fn from_process(explicit: Option<&Path>) -> Self {
+        Self {
+            explicit: explicit.map(Path::to_path_buf),
+            glint_config: non_empty_env_path("GLINT_CONFIG"),
+            xdg_config_home: non_empty_env_path("XDG_CONFIG_HOME"),
+            home: non_empty_env_path("HOME"),
+        }
+    }
+}
+
+impl ConfigPathInput {
+    fn from_process(explicit: Option<&Path>, cwd: PathBuf) -> Self {
+        Self {
+            explicit: explicit.map(Path::to_path_buf),
+            glint_config: non_empty_env_path("GLINT_CONFIG"),
+            xdg_config_home: non_empty_env_path("XDG_CONFIG_HOME"),
+            home: non_empty_env_path("HOME"),
+            cwd,
+        }
+    }
+}
+
+fn resolve_config_path(input: &ConfigPathInput) -> Result<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = &input.explicit {
+        candidates.push(path.clone());
+    }
+    if let Some(path) = &input.glint_config {
+        candidates.push(path.clone());
+    }
+    candidates.push(input.cwd.join(".glint/config.yaml"));
+    if let Some(path) = user_config_path(input) {
+        candidates.push(path);
+    }
+    candidates.push(input.cwd.join("config.yaml"));
+
+    if let Some(path) = candidates.iter().find(|path| path.is_file()) {
+        return Ok(path.clone());
+    }
+
+    let attempted = candidates
+        .iter()
+        .map(|path| format!("  - {}", path.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    bail!(
+        "could not find a Glint configuration; tried:\n{attempted}\nrun `glint init` to create one"
+    )
+}
+
+fn user_config_path(input: &ConfigPathInput) -> Option<PathBuf> {
+    input
+        .xdg_config_home
+        .as_ref()
+        .map(|path| path.join("glint/config.yaml"))
+        .or_else(|| {
+            input
+                .home
+                .as_ref()
+                .map(|path| path.join(".config/glint/config.yaml"))
+        })
+}
+
+fn non_empty_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn resolve_init_config_path(input: &InitConfigPathInput) -> Result<PathBuf> {
+    input
+        .explicit
+        .clone()
+        .or_else(|| input.glint_config.clone())
+        .or_else(|| {
+            input
+                .xdg_config_home
+                .as_ref()
+                .map(|path| path.join("glint/config.yaml"))
+        })
+        .or_else(|| {
+            input
+                .home
+                .as_ref()
+                .map(|path| path.join(".config/glint/config.yaml"))
+        })
+        .context("could not determine a user configuration path; pass `--config PATH`")
+}
+
+pub fn init_config(explicit_path: Option<&Path>) -> Result<PathBuf> {
+    let input = InitConfigPathInput::from_process(explicit_path);
+    let destination = resolve_init_config_path(&input)?;
+
+    let parent = destination
+        .parent()
+        .context("configuration path does not have a parent directory")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+        .with_context(|| {
+            if destination.exists() {
+                format!("configuration already exists at {}", destination.display())
+            } else {
+                format!("failed to create {}", destination.display())
+            }
+        })?;
+    file.write_all(include_bytes!("../config.example.yaml"))
+        .with_context(|| format!("failed to write {}", destination.display()))?;
+    file.flush()
+        .with_context(|| format!("failed to flush {}", destination.display()))?;
+    Ok(destination)
+}
+
 #[derive(Deserialize)]
 struct FileModelDetails {
     name: String,
@@ -183,23 +322,32 @@ struct FileModelDetails {
 }
 
 impl Config {
-    pub fn load() -> Result<Self> {
-        let file = std::fs::read_to_string("config.yaml").context("failed to read config.yaml")?;
-        let config: FileConfig =
-            serde_yaml::from_str(&file).context("failed to parse config.yaml")?;
-        let base_system_prompt = std::fs::read_to_string("prompts/system.md")
-            .context("failed to read prompts/system.md")?;
+    pub fn load(explicit_path: Option<&Path>) -> Result<Self> {
+        let workspace = std::env::current_dir().context("failed to resolve current directory")?;
+        let input = ConfigPathInput::from_process(explicit_path, workspace.clone());
+        let config_path = resolve_config_path(&input)?;
+        Self::load_from_path(&config_path, &workspace, |api_key_env| {
+            std::env::var(api_key_env).ok()
+        })
+    }
+
+    fn load_from_path(
+        config_path: &Path,
+        workspace: &Path,
+        api_key: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
+        let file = std::fs::read_to_string(config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?;
+        let config: FileConfig = serde_yaml::from_str(&file)
+            .with_context(|| format!("failed to parse {}", config_path.display()))?;
+        let base_system_prompt = DEFAULT_SYSTEM_PROMPT.to_owned();
 
         let model_catalog = config.llm.model_catalog();
         let base_lsp = config.lsp_config();
         let base_mcp = config.mcp.clone();
         let plugins = config.plugins.clone();
-        let plugin_result = PluginManager::load(
-            &plugins,
-            base_mcp.clone(),
-            base_lsp.clone(),
-            &std::env::current_dir().context("failed to resolve current directory")?,
-        )?;
+        let plugin_result =
+            PluginManager::load(&plugins, base_mcp.clone(), base_lsp.clone(), workspace)?;
         let extension_prompt = plugin_result.catalog.system_prompt_fragment();
         let system_prompt = if extension_prompt.is_empty() {
             base_system_prompt.clone()
@@ -207,9 +355,8 @@ impl Config {
             format!("{base_system_prompt}\n\n{extension_prompt}")
         };
         Ok(Self {
-            llm: config
-                .llm
-                .into_runtime_config(|api_key_env| std::env::var(api_key_env).ok())?,
+            config_path: config_path.to_path_buf(),
+            llm: config.llm.into_runtime_config(api_key)?,
             lsp: plugin_result.lsp,
             mcp: plugin_result.mcp,
             extensions: plugin_result.catalog,
@@ -504,6 +651,155 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resolve_config_path_honors_documented_precedence() {
+        let root = temp_dir("config-precedence");
+        let cwd = root.join("workspace");
+        let xdg = root.join("xdg");
+        let home = root.join("home");
+        let explicit = root.join("explicit.yaml");
+        let from_env = root.join("environment.yaml");
+        let project = cwd.join(".glint/config.yaml");
+        let user = xdg.join("glint/config.yaml");
+        let legacy = cwd.join("config.yaml");
+
+        for path in [&explicit, &from_env, &project, &user, &legacy] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "config").unwrap();
+        }
+
+        let mut input = ConfigPathInput {
+            explicit: Some(explicit.clone()),
+            glint_config: Some(from_env.clone()),
+            xdg_config_home: Some(xdg),
+            home: Some(home),
+            cwd,
+        };
+
+        assert_eq!(resolve_config_path(&input).unwrap(), explicit);
+        input.explicit = None;
+        assert_eq!(resolve_config_path(&input).unwrap(), from_env);
+        input.glint_config = None;
+        assert_eq!(resolve_config_path(&input).unwrap(), project);
+        std::fs::remove_file(&project).unwrap();
+        assert_eq!(resolve_config_path(&input).unwrap(), user);
+        std::fs::remove_file(&user).unwrap();
+        assert_eq!(resolve_config_path(&input).unwrap(), legacy);
+    }
+
+    #[test]
+    fn resolve_config_path_falls_back_to_home_when_xdg_is_unset() {
+        let root = temp_dir("config-home");
+        let home = root.join("home");
+        let expected = home.join(".config/glint/config.yaml");
+        std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
+        std::fs::write(&expected, "config").unwrap();
+
+        let input = ConfigPathInput {
+            explicit: None,
+            glint_config: None,
+            xdg_config_home: None,
+            home: Some(home),
+            cwd: root.join("workspace"),
+        };
+
+        assert_eq!(resolve_config_path(&input).unwrap(), expected);
+    }
+
+    #[test]
+    fn resolve_config_path_reports_attempts_and_init_hint() {
+        let root = temp_dir("config-missing");
+        let cwd = root.join("workspace");
+        let input = ConfigPathInput {
+            explicit: None,
+            glint_config: None,
+            xdg_config_home: None,
+            home: Some(root.join("home")),
+            cwd: cwd.clone(),
+        };
+
+        let error = resolve_config_path(&input).unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(message.contains("could not find a Glint configuration"));
+        assert!(message.contains(&cwd.join(".glint/config.yaml").display().to_string()));
+        assert!(message.contains("glint init"));
+    }
+
+    #[test]
+    fn load_from_path_uses_explicit_file_and_embedded_system_prompt() {
+        let root = temp_dir("explicit-load");
+        let workspace = root.join("workspace");
+        let config_path = root.join("selected.yaml");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            &config_path,
+            r#"
+            llm:
+              provider: test
+              model: test-model
+              temperature: 0.7
+              max_tokens: 8196
+              providers:
+                test:
+                  base_url: https://example.com/v1
+                  models:
+                    - test-model
+                  api_key_env: TEST_API_KEY
+            "#,
+        )
+        .unwrap();
+
+        let config = Config::load_from_path(&config_path, &workspace, fake_api_key).unwrap();
+
+        assert_eq!(config.config_path, config_path);
+        assert_eq!(config.llm.provider, "test");
+        assert_eq!(config.system_prompt, include_str!("../prompts/system.md"));
+    }
+
+    #[test]
+    fn resolve_init_config_path_honors_documented_precedence() {
+        let root = temp_dir("init-precedence");
+        let explicit = root.join("explicit.yaml");
+        let from_env = root.join("environment.yaml");
+        let xdg = root.join("xdg");
+        let home = root.join("home");
+        let mut input = InitConfigPathInput {
+            explicit: Some(explicit.clone()),
+            glint_config: Some(from_env.clone()),
+            xdg_config_home: Some(xdg.clone()),
+            home: Some(home.clone()),
+        };
+
+        assert_eq!(resolve_init_config_path(&input).unwrap(), explicit);
+        input.explicit = None;
+        assert_eq!(resolve_init_config_path(&input).unwrap(), from_env);
+        input.glint_config = None;
+        assert_eq!(
+            resolve_init_config_path(&input).unwrap(),
+            xdg.join("glint/config.yaml")
+        );
+        input.xdg_config_home = None;
+        assert_eq!(
+            resolve_init_config_path(&input).unwrap(),
+            home.join(".config/glint/config.yaml")
+        );
+    }
+
+    #[test]
+    fn resolve_init_config_path_requires_an_explicit_or_user_location() {
+        let input = InitConfigPathInput {
+            explicit: None,
+            glint_config: None,
+            xdg_config_home: None,
+            home: None,
+        };
+
+        let error = resolve_init_config_path(&input).unwrap_err();
+
+        assert!(format!("{error:#}").contains("pass `--config PATH`"));
+    }
+
+    #[test]
     fn resolves_selected_provider_with_global_defaults() {
         let config: FileConfig = serde_yaml::from_str(
             r#"
@@ -626,26 +922,30 @@ mod tests {
     }
 
     #[test]
-    fn committed_yaml_config_is_valid() {
-        let config: FileConfig = serde_yaml::from_str(include_str!("../config.yaml")).unwrap();
-        let provider = config
-            .llm
-            .providers
-            .get(&config.llm.provider)
-            .expect("selected provider should exist");
+    fn committed_yaml_configs_are_valid() {
+        for yaml in [
+            include_str!("../config.yaml"),
+            include_str!("../config.example.yaml"),
+        ] {
+            let config: FileConfig = serde_yaml::from_str(yaml).unwrap();
+            let provider = config
+                .llm
+                .providers
+                .get(&config.llm.provider)
+                .expect("selected provider should exist");
 
-        assert!(
-            provider
-                .models
-                .iter()
-                .any(|model| model.name() == config.llm.model)
-        );
+            assert!(
+                provider
+                    .models
+                    .iter()
+                    .any(|model| model.name() == config.llm.model)
+            );
 
-        let llm = config
-            .llm
-            .into_runtime_config(|_| Some("secret".to_owned()))
-            .unwrap();
-        assert_eq!(llm.context_window, Some(1_000_000));
+            config
+                .llm
+                .into_runtime_config(|_| Some("secret".to_owned()))
+                .unwrap();
+        }
     }
 
     #[test]
@@ -806,5 +1106,9 @@ mod tests {
 
     fn fake_api_key(api_key_env: &str) -> Option<String> {
         (api_key_env == "TEST_API_KEY").then(|| "secret".to_owned())
+    }
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("glint-{label}-{}", uuid::Uuid::new_v4()))
     }
 }

@@ -2,10 +2,20 @@
 name = "glint"
 version = "0.1.0"
 edition = "2024"
+description = "A terminal coding agent for OpenAI-compatible LLM endpoints"
+repository = "https://github.com/xhhwyh/glint"
+homepage = "https://github.com/xhhwyh/glint"
+readme = "README.md"
+keywords = ["tui", "llm", "coding-agent", "terminal", "openai-compatible"]
+publish = false
+
+[package.metadata.dist]
+dist = true
 
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 http = "1"
 libc = "0.2"
@@ -35,3 +45,8 @@ tokio = { version = "1", features = [
 ] }
 unicode-width = "0.1"
 uuid = { version = "1", default-features = false, features = ["v4"] }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

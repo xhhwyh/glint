@@ -1,6 +1,7 @@
 mod agent;
 mod app;
 mod approval;
+mod cli;
 mod commands;
 mod config;
 mod context;
@@ -29,6 +30,8 @@ use std::{
 
 use anyhow::Result;
 use app::{App, ExecutionRepaintRequest};
+use clap::Parser;
+use cli::{Cli, CliCommand};
 use config::Config;
 use crossterm::{
     event::{
@@ -44,7 +47,13 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 const MAX_TERMINAL_EVENTS_PER_FRAME: usize = 64;
 
 fn main() -> Result<()> {
-    let config = Config::load()?;
+    let cli = Cli::parse();
+    if let Some(CliCommand::Init) = cli.command {
+        let path = config::init_config(cli.config.as_deref())?;
+        println!("Created Glint configuration at {}", path.display());
+        return Ok(());
+    }
+    let config = Config::load(cli.config.as_deref())?;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();

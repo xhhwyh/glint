@@ -1,0 +1,16 @@
+# Glint talks to any OpenAI-compatible chat-completions endpoint.
+# Replace the endpoint and model, then export the environment variable named by
+# api_key_env before starting Glint.
+llm:
+  provider: default
+  model: model-name
+  temperature: 0.7
+  max_tokens: 8196
+  providers:
+    default:
+      description: Default OpenAI-compatible endpoint
+      base_url: https://example.com/v1
+      models:
+        - model-name
+      api_key_env: LLM_API_KEY
+

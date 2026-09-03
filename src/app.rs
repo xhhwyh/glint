@@ -604,6 +604,7 @@ impl App {
             mcp_view: None,
             plugins_view: None,
             config: Config {
+                config_path: PathBuf::from("config.yaml"),
                 llm: LlmConfig {
                     provider: "test".to_owned(),
                     base_url: "http://localhost".to_owned(),
@@ -2082,7 +2083,8 @@ impl App {
     }
 
     fn add_mcp_server(&mut self) {
-        self.add_mcp_server_at(&plugin_command_cwd().join("config.yaml"));
+        let config_path = self.config.config_path.clone();
+        self.add_mcp_server_at(&config_path);
     }
 
     fn add_mcp_server_at(&mut self, config_path: &Path) {
@@ -2124,7 +2126,10 @@ impl App {
                     view.screen = McpScreen::Browse;
                 }
                 self.set_mcp_notice(
-                    format!("Added MCP server '{name}' and saved it to config.yaml."),
+                    format!(
+                        "Added MCP server '{name}' and saved it to {}.",
+                        config_path.display()
+                    ),
                     false,
                 );
             }
@@ -2144,7 +2149,10 @@ impl App {
             .is_some_and(|config| !config.enabled)
         {
             self.set_mcp_notice(
-                "This server is disabled by configuration; enable it in config.yaml or its plugin.",
+                format!(
+                    "This server is disabled by configuration; enable it in {} or its plugin.",
+                    self.config.config_path.display()
+                ),
                 true,
             );
             return;
@@ -2496,9 +2504,11 @@ impl App {
                     return;
                 };
                 if plugin.config_managed {
-                    self.show_plugin_ui_error(
-                        "Config-managed plugins must be enabled or disabled in config.yaml.",
+                    let message = format!(
+                        "Config-managed plugins must be enabled or disabled in {}.",
+                        self.config.config_path.display()
                     );
+                    self.show_plugin_ui_error(&message);
                     return;
                 }
                 let spec = plugin.spec();
@@ -6463,6 +6473,42 @@ mod tests {
         assert!(persisted.contains("      command: glint-missing-mcp-test-command\n"));
         assert!(persisted.contains("      - docs root\n"));
         assert!(persisted.contains("      - MCP_TOKEN\n"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn mcp_add_form_persists_to_the_selected_config_path() {
+        let root = std::env::temp_dir().join(format!(
+            "glint-app-selected-config-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("selected.yaml");
+        fs::write(&config_path, "llm:\n  provider: demo\n").unwrap();
+        let mut app = app();
+        app.config.config_path = config_path.clone();
+        let mut form = McpAddForm::default();
+        form.name.set("selected-path-server");
+        form.command.set("glint-missing-mcp-test-command");
+        app.mcp_view = Some(McpView {
+            selected: 0,
+            detail_scroll: 0,
+            detail_max_scroll: 0,
+            focus: McpFocus::Servers,
+            screen: McpScreen::Add(Box::new(form)),
+            notice: None,
+        });
+
+        app.add_mcp_server();
+
+        let persisted = fs::read_to_string(&config_path).unwrap();
+        assert!(persisted.contains("    selected-path-server:\n"));
+        assert!(
+            app.mcp_view
+                .as_ref()
+                .and_then(|view| view.notice.as_ref())
+                .is_some_and(|notice| notice.message.contains(&config_path.display().to_string()))
+        );
         fs::remove_dir_all(root).ok();
     }
 

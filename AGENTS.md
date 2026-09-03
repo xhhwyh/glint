@@ -9,7 +9,7 @@ Glint is a Rust 2024 TUI for chatting with an OpenAI-compatible LLM endpoint. It
 ## Commands
 
 ```bash
-cargo run                         # Run TUI; requires config.yaml and API key env var
+cargo run                         # Run TUI; requires a resolved config and API key env var
 cargo build                       # Build debug binary
 cargo fmt                         # Format Rust code
 cargo check                       # Fast compile check
@@ -40,7 +40,7 @@ Use `git branch -d` so Git verifies the branch has merged. If merge happened via
 
 ## Runtime Config
 
-`Config::load` reads `config.yaml` and `prompts/system.md` from the current working directory. The selected `llm.provider` must match an entry under `llm.providers`, and the selected `llm.model` must be listed in that provider's `models`:
+`Config::load` resolves configuration from `--config`, `GLINT_CONFIG`, project-local `.glint/config.yaml`, the user config directory, then legacy `config.yaml` in the current directory. The default system prompt is embedded in the binary. Commands that persist configuration write back to the selected file. The selected `llm.provider` must match an entry under `llm.providers`, and the selected `llm.model` must be listed in that provider's `models`:
 
 ```yaml
 llm:

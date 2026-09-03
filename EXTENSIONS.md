@@ -1,6 +1,6 @@
 # Plugins and MCP
 
-Glint loads plugins and MCP servers from `config.yaml` at startup. Plugin contributions are merged before the agent, LSP manager, MCP manager, slash-command registry, and system prompt are created. Treat plugins and MCP servers as trusted code: command hooks and stdio servers run local processes with the Glint user's permissions.
+Glint loads plugins and MCP servers from the configuration file selected at startup. Plugin contributions are merged before the agent, LSP manager, MCP manager, slash-command registry, and system prompt are created. Treat plugins and MCP servers as trusted code: command hooks and stdio servers run local processes with the Glint user's permissions.
 
 ## MCP configuration
 
@@ -57,7 +57,7 @@ variable and header names and redacts URL credentials and query strings.
 
 Select `＋ Add MCP server` to add a standalone stdio, Streamable HTTP, or OAuth server. The form
 accepts inherited environment-variable names for secrets, validates the configuration, appends it
-to `config.yaml` without reformatting the rest of the file, and activates the server immediately.
+to the selected configuration file without reformatting the rest of the file, and activates the server immediately.
 Use `Up`/`Down`/`Tab` to choose a field, `Left`/`Right` to change transport or approval, `Enter` to
 save, and `Esc` to cancel.
 

@@ -164,8 +164,8 @@ pub(crate) fn persist_mcp_server(path: &Path, name: &str, server: &McpServerConf
 
     let content =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let _: serde_yaml::Value =
-        serde_yaml::from_str(&content).context("failed to parse existing config.yaml")?;
+    let _: serde_yaml::Value = serde_yaml::from_str(&content)
+        .with_context(|| format!("failed to parse existing config {}", path.display()))?;
     let snippet = server_yaml(name, server)?;
     let updated = insert_server_yaml(&content, &snippet)?;
 
@@ -331,7 +331,7 @@ fn ensure_block_key(line: &str, key: &str) -> Result<()> {
     if value.is_empty() || value.starts_with('#') {
         Ok(())
     } else {
-        bail!("config.yaml uses an inline '{key}' value; expand it to block YAML before adding")
+        bail!("configuration uses an inline '{key}' value; expand it to block YAML before adding")
     }
 }
 
