@@ -13,6 +13,8 @@ mod input;
 mod message;
 mod plugins;
 mod progress;
+#[allow(dead_code)]
+mod provider_catalog;
 mod query;
 mod runtime;
 mod services;

@@ -12,6 +12,8 @@ use crate::{
     services::mcp::McpConfig,
 };
 
+pub use crate::provider_catalog::PromptCacheConfig;
+
 const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
 
 #[derive(Clone)]
@@ -51,12 +53,6 @@ pub struct LlmProviderConfig {
     pub model_context_windows: BTreeMap<String, u64>,
     pub api_key_env: String,
     pub prompt_cache: PromptCacheConfig,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PromptCacheConfig {
-    pub key: Option<String>,
-    pub retention: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

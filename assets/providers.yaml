@@ -1,0 +1,173 @@
+providers:
+  - id: deepseek
+    name: DeepSeek
+    description: DeepSeek official OpenAI-compatible endpoint
+    base_url: https://api.deepseek.com
+    default_model: deepseek-v4-flash
+    unit: CNY
+    models:
+      - name: deepseek-v4-flash
+        positioning: Fast general-purpose DeepSeek-style chat
+        input: 1.00
+        output: 2.00
+        cache_read: 0.02
+        context: 1000000
+        max_tokens: 384000
+      - name: deepseek-v4-pro
+        input: 3.00
+        output: 6.00
+        cache_read: 0.025
+        context: 1000000
+        max_tokens: 384000
+  - id: volcengine
+    name: Volcengine
+    description: Volcengine Ark endpoint for hosted model deployments
+    base_url: https://ark.cn-beijing.volces.com/api/v3
+    default_model: doubao-seed-2-1-pro-260628
+    unit: CNY
+    models:
+      - name: doubao-seed-2-1-pro-260628
+        input: 6.00
+        output: 30.00
+        cache_read: 1.20
+        context: 256000
+        max_tokens: 256000
+      - name: doubao-seed-2-1-turbo-260628
+        input: 3.00
+        output: 15.00
+        cache_read: 0.60
+        context: 256000
+        max_tokens: 256000
+      - name: doubao-seed-2-0-pro-260215
+        input: 3.20
+        output: 16.00
+        cache_read: 0.64
+        context: 256000
+        max_tokens: 128000
+      - name: doubao-seed-2-0-lite-260428
+        input: 0.60
+        output: 3.60
+        cache_read: 0.12
+        context: 256000
+        max_tokens: 128000
+      - name: doubao-seed-2-0-mini-260428
+        input: 0.20
+        output: 2.00
+        cache_read: 0.04
+        context: 256000
+        max_tokens: 128000
+      - name: doubao-seed-2-0-code-preview-260215
+        input: 3.20
+        output: 16.00
+        cache_read: 0.64
+        context: 256000
+        max_tokens: 128000
+  - id: zhipu
+    name: Zhipu
+    description: Zhipu GLM endpoint for general Chinese and bilingual work
+    base_url: https://open.bigmodel.cn/api/paas/v4/
+    default_model: glm-5.2
+    unit: CNY
+    models:
+      - name: glm-5.2
+        input: 8.00
+        output: 28.00
+        cache_read: 2.00
+        context: 1000000
+        max_tokens: 128000
+      - name: glm-5.1
+        input: 6.00
+        output: 24.00
+        cache_read: 1.30
+        context: 200000
+        max_tokens: 128000
+      - name: glm-5-turbo
+        input: 5.00
+        output: 22.00
+        cache_read: 1.20
+        context: 200000
+        max_tokens: 128000
+      - name: glm-5
+        input: 4.00
+        output: 18.00
+        cache_read: 1.00
+        context: 200000
+        max_tokens: 128000
+  - id: kimi
+    name: Kimi
+    description: Moonshot Kimi endpoint with long-context options
+    base_url: https://api.moonshot.ai/v1/
+    default_model: kimi-k2.7-code
+    unit: USD
+    models:
+      - name: kimi-k2.7-code
+        input: 0.95
+        output: 4.00
+        cache_read: 0.19
+        context: 262144
+      - name: kimi-k2.7-code-highspeed
+        input: 1.90
+        output: 8.00
+        cache_read: 0.38
+        context: 262144
+      - name: kimi-k2.6
+        input: 0.95
+        output: 4.00
+        cache_read: 0.16
+        context: 262144
+      - name: kimi-k2.5
+        input: 0.60
+        output: 3.00
+        cache_read: 0.10
+        context: 262144
+  - id: dashscope
+    name: DashScope
+    description: Alibaba DashScope compatible-mode endpoint for Qwen models
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    default_model: qwen3.7-max
+    unit: CNY
+    models:
+      - name: qwen3.7-max
+        input: 12.00
+        output: 36.00
+        cache_read: 2.40
+        context: 1000000
+        max_tokens: 64000
+      - name: qwen3.7-plus
+        input: 2.00
+        output: 8.00
+        cache_read: 0.4
+        context: 1000000
+        max_tokens: 64000
+      - name: qwen3.6-flash
+        input: 1.20
+        output: 7.20
+        cache_read: 0.12
+        context: 1000000
+        max_tokens: 64000
+      - name: minimax-m3
+        input: 4.20
+        output: 16.80
+        cache_read: 0.84
+        context: 1000000
+        max_tokens: 64000
+      - name: minimax-m2.7
+        input: 2.10
+        output: 8.40
+        cache_read: 0.42
+        context: 200000
+        max_tokens: 128000
+      - name: mimo-v2.5-pro
+        input: 7.00
+        output: 21.00
+        cache_read: 1.40
+        context: 1000000
+        max_tokens: 128000
+  - id: openrouter
+    name: OpenRouter
+    description: OpenRouter gateway for multiple upstream model families
+    base_url: https://openrouter.ai/api/v1
+    default_model: deepseek/deepseek-v4-flash
+    unit: USD
+    models:
+      - name: deepseek/deepseek-v4-flash
