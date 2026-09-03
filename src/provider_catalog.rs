@@ -213,6 +213,20 @@ mod tests {
     }
 
     #[test]
+    fn minimax_m3_has_no_max_tokens_metadata() {
+        let catalog = ProviderCatalog::embedded().expect("embedded catalog");
+        let model = catalog
+            .builtin("dashscope")
+            .expect("dashscope provider")
+            .models
+            .iter()
+            .find(|model| model.name == "minimax-m3")
+            .expect("minimax-m3 model");
+
+        assert!(model.metadata.max_tokens.is_empty());
+    }
+
+    #[test]
     fn catalog_rejects_case_insensitive_provider_collisions() {
         let yaml = r#"
 providers:
