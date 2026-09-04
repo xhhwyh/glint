@@ -109,6 +109,10 @@ struct DocumentLineMeta {
 
 #[cfg(test)]
 pub fn render(frame: &mut Frame, app: &App) {
+    if let Some(state) = &app.model_setup {
+        setup::render(frame, state, &app.provider_catalog);
+        return;
+    }
     if let Some(picker) = &app.resume_picker {
         resume::render_resume_picker(frame, app, picker);
         return;
@@ -140,6 +144,10 @@ pub fn prepare_document(app: &App, width: u16, height: u16) -> PreparedDocument 
 }
 
 pub fn render_prepared_document(frame: &mut Frame, app: &App, prepared: &PreparedDocument) {
+    if let Some(state) = &app.model_setup {
+        setup::render(frame, state, &app.provider_catalog);
+        return;
+    }
     if let Some(picker) = &app.resume_picker {
         resume::render_resume_picker(frame, app, picker);
         return;
@@ -1507,10 +1515,13 @@ mod tests {
     #[test]
     fn model_picker_renders_above_bottom_input_box() {
         let mut app = crate::app::App::test_empty();
+        let providers = app.configuration.available_providers().unwrap();
         app.model_picker = Some(ModelPicker {
             stage: ModelPickerStage::Provider,
             selected_provider: 0,
             selected_model: 0,
+            providers,
+            error: None,
         });
         let lines = composer(&app, 80).lines;
         let texts = lines.iter().map(line_text).collect::<Vec<_>>();
@@ -1520,7 +1531,7 @@ mod tests {
             .expect("model picker row");
         let help_row = texts
             .iter()
-            .position(|line| line.contains("Choose a provider endpoint"))
+            .position(|line| line.contains("Choose a configured provider"))
             .expect("model picker help row");
         let separator_row = texts[help_row + 1..]
             .iter()
@@ -1708,6 +1719,26 @@ mod tests {
         };
 
         assert_eq!(selected_text_from_lines(&lines, selection, 20), None);
+    }
+
+    #[test]
+    fn model_setup_replaces_the_entire_chat_view() {
+        let mut app = App::test_empty();
+        app.messages.push(Message::assistant("CHAT SENTINEL"));
+        app.model_setup = Some(crate::setup::SetupState::welcome(
+            &crate::provider_catalog::ProviderCatalog::embedded().unwrap(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).expect("test terminal");
+
+        terminal
+            .draw(|frame| render(frame, &app))
+            .expect("render setup");
+        let contents = buffer_rows(&terminal).join("\n");
+
+        assert!(contents.contains("WELCOME"));
+        assert!(contents.contains("Add a model to begin chatting."));
+        assert!(!contents.contains("CHAT SENTINEL"));
+        assert!(!contents.contains("COMPOSER"));
     }
 
     fn message_meta(message_index: usize, role: Role) -> DocumentLineMeta {

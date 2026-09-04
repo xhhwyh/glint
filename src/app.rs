@@ -20,7 +20,8 @@ use crate::{
     },
     approval::{AgentControl, ApprovalFocus, ApprovalPrompt},
     commands::{SlashCommand, SlashCommandKind, matching_slash_commands},
-    config::Config,
+    config::{Config, ModelCatalog, ModelCatalogEntry, ProviderCatalogEntry},
+    configuration::{AvailableProvider, ConfigurationManager},
     event::{
         AppEvent, ExtensionMouseAction, KeyAction, KeyInput, McpMouseAction, MouseAction,
         PluginsMouseAction, PluginsMouseTab, ResumeMouseAction,
@@ -34,6 +35,7 @@ use crate::{
     message::{Message, Role},
     plugins::{PluginManager, PluginMutationResult},
     progress::TodoUpdate,
+    provider_catalog::ProviderCatalog,
     runtime::{
         AssistantRecord, ConversationUsage, LoadedTranscript, RuntimeCommand, RuntimeEvent,
         SessionRuntime, StartPromptConfig, SubagentRuntimeEvent,
@@ -43,6 +45,7 @@ use crate::{
         persist_mcp_server,
     },
     services::tool_results::tool_result_artifact_path,
+    setup::{SetupEffect, SetupOutcome, SetupState, apply_setup_effect},
     subagent_transcript::{SubagentTranscript, SubagentTranscriptSnapshot},
     tasks::{
         self, SubagentRequest, SubagentStartResponse, SubagentSteering, TaskRequest, TaskSnapshot,
@@ -51,9 +54,13 @@ use crate::{
 };
 
 #[cfg(test)]
-use crate::config::{LlmConfig, LlmProviderConfig, LspConfig, ModelCatalog};
+use crate::config::{LlmConfig, LlmProviderConfig, LspConfig};
 #[cfg(test)]
-use crate::credentials::CredentialId;
+use crate::{
+    credentials::{CredentialId, FileCredentialStore},
+    paths::GlintPaths,
+    persistence::UserConfigStore,
+};
 
 pub struct App {
     pub should_quit: bool,
@@ -81,11 +88,14 @@ pub struct App {
     pub usage: ConversationUsage,
     pub slash_command_selection: usize,
     pub model_picker: Option<ModelPicker>,
+    pub model_setup: Option<SetupState>,
     pub resume_picker: Option<ResumePicker>,
     pub status_view: Option<StatusView>,
     pub mcp_view: Option<McpView>,
     pub plugins_view: Option<PluginsView>,
     pub config: Config,
+    pub configuration: ConfigurationManager,
+    pub(crate) provider_catalog: ProviderCatalog,
     pub current_dir: String,
     pub agent_activity: Option<String>,
     pub run_notice: Option<String>,
@@ -142,11 +152,19 @@ fn reconcile_anchored_scroll(
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ModelPicker {
     pub stage: ModelPickerStage,
     pub selected_provider: usize,
     pub selected_model: usize,
+    pub providers: Vec<AvailableProvider>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelPickerProviderRow {
+    Provider { id: String, display_name: String },
+    AddModel,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -518,7 +536,8 @@ impl PluginsTab {
 }
 
 impl App {
-    pub fn new(config: Config) -> Result<Self> {
+    pub fn new(config: Config, configuration: ConfigurationManager) -> Result<Self> {
+        let provider_catalog = ProviderCatalog::embedded()?;
         let current_dir = current_dir_label();
         let transcript_cwd = std::env::current_dir()
             .map(|path| path.display().to_string())
@@ -552,11 +571,14 @@ impl App {
             usage,
             slash_command_selection: 0,
             model_picker: None,
+            model_setup: None,
             resume_picker: None,
             status_view: None,
             mcp_view: None,
             plugins_view: None,
             config,
+            configuration,
+            provider_catalog,
             current_dir,
             agent_activity: None,
             run_notice: None,
@@ -582,6 +604,25 @@ impl App {
 
     #[cfg(test)]
     pub(crate) fn test_empty() -> Self {
+        let home =
+            std::env::temp_dir().join(format!("glint-app-empty-test-{}", uuid::Uuid::new_v4()));
+        let paths = GlintPaths::from_home(home);
+        let provider_catalog = ProviderCatalog::embedded().expect("embedded provider catalog");
+        let mut configuration = ConfigurationManager::new(
+            paths.clone(),
+            provider_catalog.clone(),
+            Box::new(UserConfigStore::new(paths.clone())),
+            Box::new(FileCredentialStore::new(paths.auth())),
+        )
+        .expect("test configuration manager");
+        configuration
+            .save_custom(
+                "test",
+                "http://localhost",
+                Some("test-key"),
+                vec!["test-model".to_owned()],
+            )
+            .expect("test provider");
         Self {
             should_quit: false,
             messages: Vec::new(),
@@ -601,6 +642,7 @@ impl App {
             usage: ConversationUsage::default(),
             slash_command_selection: 0,
             model_picker: None,
+            model_setup: None,
             resume_picker: None,
             status_view: None,
             mcp_view: None,
@@ -636,6 +678,8 @@ impl App {
                 base_mcp: Default::default(),
                 base_system_prompt: "system".to_owned(),
             },
+            configuration,
+            provider_catalog,
             current_dir: "/workspace".to_owned(),
             agent_activity: None,
             run_notice: None,
@@ -1341,6 +1385,10 @@ impl App {
 
     fn update_key(&mut self, key: KeyInput) {
         let action = key.action;
+        if self.model_setup.is_some() {
+            self.update_model_setup_key(action);
+            return;
+        }
         if action == KeyAction::ForceQuit {
             self.should_quit = true;
             return;
@@ -1470,6 +1518,7 @@ impl App {
 
     pub fn slash_query(&self) -> Option<&str> {
         if self.status != AgentStatus::Idle
+            || self.model_setup.is_some()
             || self.model_picker.is_some()
             || self.resume_picker.is_some()
             || self.status_view.is_some()
@@ -1582,30 +1631,56 @@ impl App {
 
     fn open_model_picker(&mut self) {
         self.input.set("/model");
-        let selected_provider = self
-            .config
-            .llm
-            .providers
+        let (providers, error) = match self.configuration.available_providers() {
+            Ok(providers) => (providers, None),
+            Err(_) => (Vec::new(), Some(model_configuration_error())),
+        };
+        let selected_provider = providers
             .iter()
-            .position(|provider| provider.name == self.config.llm.provider)
+            .position(|provider| provider.id == self.config.llm.provider)
             .unwrap_or(0);
-        let selected_model = self
-            .config
-            .llm
-            .providers
+        let selected_model = providers
             .get(selected_provider)
             .and_then(|provider| {
                 provider
                     .models
                     .iter()
-                    .position(|model| model == &self.config.llm.model)
+                    .position(|model| model.name == self.config.llm.model)
             })
             .unwrap_or(0);
         self.model_picker = Some(ModelPicker {
             stage: ModelPickerStage::Provider,
             selected_provider,
             selected_model,
+            providers,
+            error,
         });
+    }
+
+    pub(crate) fn model_picker_provider_rows(&self) -> Vec<ModelPickerProviderRow> {
+        let Some(picker) = &self.model_picker else {
+            return Vec::new();
+        };
+        picker
+            .providers
+            .iter()
+            .map(|provider| ModelPickerProviderRow::Provider {
+                id: provider.id.clone(),
+                display_name: provider.display_name.clone(),
+            })
+            .chain(std::iter::once(ModelPickerProviderRow::AddModel))
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn model_picker_items(&self) -> Vec<String> {
+        self.model_picker_provider_rows()
+            .into_iter()
+            .map(|row| match row {
+                ModelPickerProviderRow::Provider { display_name, .. } => display_name,
+                ModelPickerProviderRow::AddModel => "Add model".to_owned(),
+            })
+            .collect()
     }
 
     fn update_model_picker_key(&mut self, key: KeyAction) {
@@ -1630,45 +1705,104 @@ impl App {
                     .as_ref()
                     .map(|picker| picker.selected_provider)
                     .unwrap_or(0);
+                if selected_provider
+                    == self
+                        .model_picker
+                        .as_ref()
+                        .map(|picker| picker.providers.len())
+                        .unwrap_or(0)
+                {
+                    self.open_model_management();
+                    return;
+                }
                 let selected_model = self
-                    .config
-                    .llm
-                    .providers
-                    .get(selected_provider)
+                    .model_picker
+                    .as_ref()
+                    .and_then(|picker| picker.providers.get(selected_provider))
                     .and_then(|provider| {
                         provider
                             .models
                             .iter()
-                            .position(|model| model == &self.config.llm.model)
+                            .position(|model| model.name == self.config.llm.model)
                     })
                     .unwrap_or(0);
                 if let Some(picker) = self.model_picker.as_mut() {
                     picker.stage = ModelPickerStage::Model;
                     picker.selected_model = selected_model;
+                    picker.error = None;
                 }
             }
             ModelPickerStage::Model => self.switch_selected_model(),
         }
     }
 
+    fn open_model_management(&mut self) {
+        match SetupState::provider_list(&self.provider_catalog, &self.configuration) {
+            Ok(state) => {
+                self.model_picker = None;
+                self.model_setup = Some(state);
+                self.input.set("");
+            }
+            Err(_) => {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    picker.error = Some(model_configuration_error());
+                }
+            }
+        }
+    }
+
     fn switch_selected_model(&mut self) {
-        let Some(picker) = self.model_picker.take() else {
+        let Some(selected_model) = self
+            .model_picker
+            .as_ref()
+            .map(|picker| picker.selected_model)
+        else {
             return;
         };
         let Some((provider_name, model_name)) = self
-            .config
-            .llm
-            .providers
-            .get(picker.selected_provider)
+            .model_picker
+            .as_ref()
+            .and_then(|picker| picker.providers.get(picker.selected_provider))
             .and_then(|provider| {
                 provider
                     .models
-                    .get(picker.selected_model)
-                    .map(|model| (provider.name.clone(), model.clone()))
+                    .get(selected_model)
+                    .map(|model| (provider.id.clone(), model.name.clone()))
             })
         else {
             return;
         };
+
+        let mut selected_llm = match self.configuration.select_model(&provider_name, &model_name) {
+            Ok(selected) => selected,
+            Err(_) => {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    picker.error = Some(model_configuration_error());
+                }
+                return;
+            }
+        };
+        let api_key = selected_llm.api_key.clone();
+        if selected_llm
+            .switch_model(&provider_name, &model_name, Some(api_key))
+            .is_err()
+        {
+            if let Some(picker) = self.model_picker.as_mut() {
+                picker.error = Some(model_configuration_error());
+            }
+            return;
+        }
+        let providers = match self.configuration.available_providers() {
+            Ok(providers) => providers,
+            Err(_) => {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    picker.error = Some(model_configuration_error());
+                }
+                return;
+            }
+        };
+        self.config.llm = selected_llm;
+        self.config.model_catalog = self.model_catalog_from_available(&providers);
 
         let command = self.input.take_trimmed();
         let command = if command.is_empty() {
@@ -1677,20 +1811,11 @@ impl App {
             command
         };
         self.messages.push(Message::user(command.clone()));
-
-        let api_key =
-            (provider_name == self.config.llm.provider).then(|| self.config.llm.api_key.clone());
-        let result = match self
-            .config
-            .llm
-            .switch_model(&provider_name, &model_name, api_key)
-        {
-            Ok(()) => format!("Switch model to `{model_name}` provided by `{provider_name}`"),
-            Err(error) => format!("Failed to switch model: {error:#}"),
-        };
+        let result = format!("Switch model to `{model_name}` provided by `{provider_name}`");
         self.record_local_exchange(command, result.clone());
         self.messages.push(Message::assistant(result));
         self.scroll = 0;
+        self.model_picker = None;
     }
 
     fn back_out_of_model_picker(&mut self) {
@@ -1716,20 +1841,146 @@ impl App {
                 picker.selected_provider = move_index(
                     picker.selected_provider,
                     direction,
-                    self.config.llm.providers.len(),
+                    picker.providers.len() + 1,
                 );
                 picker.selected_model = 0;
             }
             ModelPickerStage::Model => {
-                let model_count = self
-                    .config
-                    .llm
+                let model_count = picker
                     .providers
                     .get(picker.selected_provider)
                     .map(|provider| provider.models.len())
                     .unwrap_or(0);
                 picker.selected_model = move_index(picker.selected_model, direction, model_count);
             }
+        }
+    }
+
+    fn update_model_setup_key(&mut self, action: KeyAction) {
+        if matches!(action, KeyAction::Quit | KeyAction::ForceQuit) {
+            self.should_quit = true;
+            return;
+        }
+        let effect = self
+            .model_setup
+            .as_mut()
+            .and_then(|state| state.update(action));
+        let Some(effect) = effect else {
+            return;
+        };
+        let mutation = matches!(
+            effect,
+            SetupEffect::SaveBuiltin { .. }
+                | SetupEffect::SaveCustom { .. }
+                | SetupEffect::DeleteProvider { .. }
+        );
+        let outcome = {
+            let state = self.model_setup.as_mut().expect("setup state is active");
+            apply_setup_effect(&mut self.configuration, state, effect)
+        };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                self.set_model_setup_error();
+                return;
+            }
+        };
+
+        match outcome {
+            Some(SetupOutcome::StartGlint) => match self.refresh_model_runtime() {
+                Ok(true) => self.model_setup = None,
+                Ok(false) | Err(_) => self.set_model_setup_error(),
+            },
+            Some(SetupOutcome::Exit) => self.model_setup = None,
+            None if mutation
+                && self
+                    .model_setup
+                    .as_ref()
+                    .is_some_and(|state| state.error.is_none())
+                && self.refresh_model_runtime().is_err() =>
+            {
+                self.set_model_setup_error();
+            }
+            None => {}
+        }
+    }
+
+    fn refresh_model_runtime(&mut self) -> Result<bool> {
+        let providers = self.configuration.available_providers()?;
+        if providers.is_empty() {
+            return Ok(false);
+        }
+        let selection = self
+            .configuration
+            .user_config()
+            .llm
+            .as_ref()
+            .context("model selection was not repaired")?
+            .clone();
+        let mut llm = self
+            .configuration
+            .select_model(&selection.provider, &selection.model)?;
+        let api_key = llm.api_key.clone();
+        llm.switch_model(&selection.provider, &selection.model, Some(api_key))?;
+        self.config.llm = llm;
+        self.config.model_catalog = self.model_catalog_from_available(&providers);
+        Ok(true)
+    }
+
+    fn model_catalog_from_available(&self, providers: &[AvailableProvider]) -> ModelCatalog {
+        let mut catalog = ModelCatalog::default();
+        for provider in providers {
+            let unit = self
+                .provider_catalog
+                .builtin(&provider.id)
+                .map(|definition| definition.unit.clone())
+                .unwrap_or_default();
+            catalog.providers.insert(
+                provider.id.clone(),
+                ProviderCatalogEntry {
+                    description: provider.description.clone(),
+                    unit,
+                },
+            );
+            catalog.models.insert(
+                provider.id.clone(),
+                provider
+                    .models
+                    .iter()
+                    .filter_map(|model| {
+                        let metadata = &model.metadata;
+                        let entry = ModelCatalogEntry {
+                            positioning: metadata.positioning.clone(),
+                            context: metadata
+                                .context
+                                .map(|value| value.to_string())
+                                .unwrap_or_default(),
+                            max_tokens: metadata.max_tokens.clone(),
+                            price: metadata.price.clone(),
+                            input: metadata.input.clone(),
+                            output: metadata.output.clone(),
+                            cache_read: metadata.cache_read.clone(),
+                            cache_write: metadata.cache_write.clone(),
+                        };
+                        let has_metadata = !entry.positioning.is_empty()
+                            || !entry.context.is_empty()
+                            || !entry.max_tokens.is_empty()
+                            || !entry.price.is_empty()
+                            || !entry.input.is_empty()
+                            || !entry.output.is_empty()
+                            || !entry.cache_read.is_empty()
+                            || !entry.cache_write.is_empty();
+                        has_metadata.then_some((model.name.clone(), entry))
+                    })
+                    .collect(),
+            );
+        }
+        catalog
+    }
+
+    fn set_model_setup_error(&mut self) {
+        if let Some(state) = self.model_setup.as_mut() {
+            state.error = Some(model_configuration_error());
         }
     }
 
@@ -3930,6 +4181,10 @@ fn move_index(index: usize, direction: isize, len: usize) -> usize {
     index.saturating_add_signed(direction).min(len - 1)
 }
 
+fn model_configuration_error() -> String {
+    "Unable to save model configuration. Please review the selection and try again.".to_owned()
+}
+
 fn subagent_transcripts_by_task_id(
     snapshots: Vec<SubagentTranscriptSnapshot>,
 ) -> BTreeMap<String, SubagentTranscript> {
@@ -4174,10 +4429,16 @@ mod tests {
         agent::provider::{FinishReason, ToolCall, ToolResult},
         agent::should_auto_compact,
         commands::SLASH_COMMANDS,
+        configuration::ConfigurationManager,
+        credentials::FileCredentialStore,
         execution::ExecutionRegion,
+        paths::GlintPaths,
+        persistence::UserConfigStore,
         plugins::PluginsConfig,
+        provider_catalog::ProviderCatalog,
         runtime::AssistantRecord,
         services::tool_results::{ToolResultBudget, tool_result_artifact_path},
+        setup::SetupScreen,
         tasks::{SubagentBackend, TaskStatus},
     };
     use ratatui::{Terminal, backend::TestBackend};
@@ -4186,6 +4447,119 @@ mod tests {
 
     fn app() -> App {
         App::test_empty()
+    }
+
+    fn send_key(app: &mut App, action: KeyAction) {
+        app.update(AppEvent::Key(KeyInput { action }));
+    }
+
+    fn app_with_configured_providers(provider_ids: impl IntoIterator<Item = &'static str>) -> App {
+        let home = std::env::temp_dir().join(format!(
+            "glint-model-management-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = GlintPaths::from_home(home);
+        let mut configuration = ConfigurationManager::new(
+            paths.clone(),
+            ProviderCatalog::embedded().expect("embedded provider catalog"),
+            Box::new(UserConfigStore::new(paths.clone())),
+            Box::new(FileCredentialStore::new(paths.auth())),
+        )
+        .expect("configuration manager");
+        for provider_id in provider_ids {
+            configuration
+                .save_builtin(provider_id, Some("test-key"))
+                .expect("configure built-in provider");
+        }
+        let selection = configuration
+            .user_config()
+            .llm
+            .as_ref()
+            .expect("selected model")
+            .clone();
+        let llm = configuration
+            .select_model(&selection.provider, &selection.model)
+            .expect("runtime model configuration");
+        let config = Config {
+            config_path: paths.config(),
+            llm,
+            model_catalog: ModelCatalog::default(),
+            lsp: LspConfig::default(),
+            mcp: Default::default(),
+            extensions: Default::default(),
+            system_prompt: "system".to_owned(),
+            plugins: Default::default(),
+            base_lsp: LspConfig::default(),
+            base_mcp: Default::default(),
+            base_system_prompt: "system".to_owned(),
+        };
+        App::new(config, configuration).expect("app")
+    }
+
+    fn open_model_picker_through_update(app: &mut App) {
+        app.input.set("/model");
+        send_key(app, KeyAction::Submit);
+        assert!(app.model_picker.is_some());
+    }
+
+    fn choose_model(app: &mut App, provider_id: &str, model_name: &str) {
+        open_model_picker_through_update(app);
+        let providers = app
+            .configuration
+            .available_providers()
+            .expect("available providers");
+        let provider_index = providers
+            .iter()
+            .position(|provider| provider.id == provider_id)
+            .expect("provider row");
+        while app.model_picker.as_ref().unwrap().selected_provider != provider_index {
+            send_key(app, KeyAction::Down);
+        }
+        send_key(app, KeyAction::Submit);
+
+        let model_index = providers[provider_index]
+            .models
+            .iter()
+            .position(|model| model.name == model_name)
+            .expect("model row");
+        while app.model_picker.as_ref().unwrap().selected_model != model_index {
+            send_key(app, KeyAction::Down);
+        }
+        send_key(app, KeyAction::Submit);
+    }
+
+    fn delete_provider_through_setup(app: &mut App, provider_id: &str) {
+        open_model_picker_through_update(app);
+        let add_model_index = app
+            .configuration
+            .available_providers()
+            .expect("available providers")
+            .len();
+        while app.model_picker.as_ref().unwrap().selected_provider != add_model_index {
+            send_key(app, KeyAction::Down);
+        }
+        send_key(app, KeyAction::Submit);
+
+        let provider_index = match &app.model_setup.as_ref().expect("model setup").screen {
+            SetupScreen::Providers(list) => list
+                .rows
+                .iter()
+                .position(|row| row.provider_id() == Some(provider_id))
+                .expect("configured provider row"),
+            screen => panic!("expected provider list, got {screen:?}"),
+        };
+        loop {
+            let focus = match &app.model_setup.as_ref().unwrap().screen {
+                SetupScreen::Providers(list) => list.focus,
+                _ => panic!("expected provider list"),
+            };
+            if focus == provider_index {
+                break;
+            }
+            send_key(app, KeyAction::Down);
+        }
+        send_key(app, KeyAction::Delete);
+        send_key(app, KeyAction::Submit);
     }
 
     struct RemoveFileOnDrop(PathBuf);
@@ -6933,5 +7307,177 @@ mod tests {
             home_relative_path(&home.join("projects/glint")),
             "~/projects/glint"
         );
+    }
+
+    #[test]
+    fn model_picker_lists_only_available_providers_and_add_model() {
+        let mut app = app_with_configured_providers(["deepseek"]);
+
+        open_model_picker_through_update(&mut app);
+
+        assert_eq!(
+            app.model_picker_items(),
+            vec!["DeepSeek".to_owned(), "Add model".to_owned()]
+        );
+    }
+
+    #[test]
+    fn choosing_add_model_opens_shared_provider_management() {
+        let mut app = app_with_configured_providers(["deepseek"]);
+        open_model_picker_through_update(&mut app);
+        send_key(&mut app, KeyAction::Down);
+
+        send_key(&mut app, KeyAction::Submit);
+
+        assert!(app.model_picker.is_none());
+        assert!(matches!(
+            app.model_setup.as_ref().map(|setup| &setup.screen),
+            Some(SetupScreen::Providers(_))
+        ));
+    }
+
+    #[test]
+    fn selected_model_is_written_before_picker_closes() {
+        let mut app = app_with_configured_providers(["deepseek"]);
+
+        choose_model(&mut app, "deepseek", "deepseek-v4-pro");
+
+        let persisted = app.configuration.user_config().llm.as_ref().unwrap();
+        assert_eq!(persisted.provider, "deepseek");
+        assert_eq!(persisted.model, "deepseek-v4-pro");
+        assert_eq!(app.config.llm.model, "deepseek-v4-pro");
+        assert!(app.model_picker.is_none());
+        assert_eq!(app.messages[app.messages.len() - 2].content, "/model");
+        assert!(
+            app.messages
+                .last()
+                .is_some_and(|message| message.content.contains("deepseek-v4-pro"))
+        );
+        assert_eq!(app.runtime.ui_messages(), app.messages);
+        let history = app.runtime.model_history();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content.as_deref(), Some("/model"));
+        assert!(
+            history[1]
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("deepseek-v4-pro"))
+        );
+    }
+
+    #[test]
+    fn deleting_last_provider_transitions_to_setup() {
+        let mut app = app_with_configured_providers(["deepseek"]);
+
+        delete_provider_through_setup(&mut app, "deepseek");
+
+        assert!(app.configuration.available_providers().unwrap().is_empty());
+        assert!(app.model_setup.is_some());
+    }
+
+    #[test]
+    fn failed_model_persistence_keeps_picker_open_with_redacted_error() {
+        let mut app = app_with_configured_providers(["deepseek"]);
+        open_model_picker_through_update(&mut app);
+        send_key(&mut app, KeyAction::Submit);
+        send_key(&mut app, KeyAction::Down);
+        let configuration_root = app.config.config_path.parent().unwrap().to_path_buf();
+        fs::remove_dir_all(&configuration_root).unwrap();
+        fs::write(&configuration_root, "blocked").unwrap();
+
+        send_key(&mut app, KeyAction::Submit);
+
+        let picker = app.model_picker.as_ref().expect("picker remains open");
+        let error = picker.error.as_deref().expect("redacted picker error");
+        assert_eq!(error, model_configuration_error());
+        assert!(!error.contains("test-key"));
+        assert_eq!(app.config.llm.model, "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn deleting_selected_provider_adopts_manager_repair() {
+        let mut app = app_with_configured_providers(["deepseek", "kimi"]);
+
+        delete_provider_through_setup(&mut app, "deepseek");
+
+        let persisted = app.configuration.user_config().llm.as_ref().unwrap();
+        assert_eq!(persisted.provider, "kimi");
+        assert_eq!(app.config.llm.provider, "kimi");
+        assert_eq!(app.config.llm.model, persisted.model);
+        assert!(app.model_setup.is_some());
+    }
+
+    #[test]
+    fn setup_blocks_chat_until_a_provider_is_saved_and_start_is_chosen() {
+        let mut app = app_with_configured_providers(["deepseek"]);
+        delete_provider_through_setup(&mut app, "deepseek");
+        let original_messages = app.messages.len();
+
+        assert!(app.input.value.is_empty());
+        send_key(&mut app, KeyAction::Char('x'));
+        send_key(&mut app, KeyAction::Submit);
+        assert!(app.input.value.is_empty());
+        assert_eq!(app.messages.len(), original_messages);
+        assert!(app.model_setup.is_some());
+
+        for character in "replacement-key".chars() {
+            send_key(&mut app, KeyAction::Char(character));
+        }
+        send_key(&mut app, KeyAction::Tab);
+        send_key(&mut app, KeyAction::Submit);
+        assert!(!app.configuration.available_providers().unwrap().is_empty());
+        assert!(app.model_setup.is_some());
+
+        send_key(&mut app, KeyAction::Up);
+        send_key(&mut app, KeyAction::Submit);
+        assert!(app.model_setup.is_none());
+    }
+
+    #[test]
+    fn editing_custom_provider_reuses_values_and_blank_key_preserves_credential() {
+        let mut app = App::test_empty();
+        open_model_picker_through_update(&mut app);
+        send_key(&mut app, KeyAction::Down);
+        send_key(&mut app, KeyAction::Submit);
+
+        let custom_index = match &app.model_setup.as_ref().unwrap().screen {
+            SetupScreen::Providers(list) => list
+                .rows
+                .iter()
+                .position(|row| row.provider_id() == Some("test"))
+                .unwrap(),
+            _ => panic!("expected provider list"),
+        };
+        for _ in 0..custom_index {
+            send_key(&mut app, KeyAction::Down);
+        }
+        send_key(&mut app, KeyAction::Submit);
+
+        let form = match &app.model_setup.as_ref().unwrap().screen {
+            SetupScreen::Custom(form) => form,
+            _ => panic!("expected custom provider form"),
+        };
+        assert_eq!(form.name.value, "test");
+        assert_eq!(form.base_url.value, "http://localhost");
+        assert_eq!(form.models[0].value, "test-model");
+        assert!(form.api_key.value.is_empty());
+
+        for _ in 0..5 {
+            send_key(&mut app, KeyAction::Tab);
+        }
+        send_key(&mut app, KeyAction::Submit);
+
+        assert!(matches!(
+            app.model_setup.as_ref().map(|state| &state.screen),
+            Some(SetupScreen::Providers(_))
+        ));
+        assert!(
+            app.configuration
+                .available_providers()
+                .unwrap()
+                .iter()
+                .any(|provider| provider.id == "test")
+        );
+        assert_eq!(app.config.llm.api_key, "test-key");
     }
 }

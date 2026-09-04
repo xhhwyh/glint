@@ -86,7 +86,10 @@ fn main() -> Result<()> {
 
     let result = (|| -> Result<()> {
         match choice {
-            BootstrapChoice::Chat => run(&mut terminal, configuration.build_runtime(&workspace)?),
+            BootstrapChoice::Chat => {
+                let config = configuration.build_runtime(&workspace)?;
+                run(&mut terminal, config, configuration)
+            }
             BootstrapChoice::Setup => {
                 let initial_state = if configuration
                     .provider_statuses()?
@@ -99,7 +102,8 @@ fn main() -> Result<()> {
                 };
                 match run_setup(&mut terminal, &mut configuration, initial_state, &catalog)? {
                     SetupOutcome::StartGlint => {
-                        run(&mut terminal, configuration.build_runtime(&workspace)?)
+                        let config = configuration.build_runtime(&workspace)?;
+                        run(&mut terminal, config, configuration)
                     }
                     SetupOutcome::Exit => Ok(()),
                 }
@@ -384,8 +388,12 @@ where
     }
 }
 
-fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, config: Config) -> Result<()> {
-    let mut app = App::new(config)?;
+fn run(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    config: Config,
+    configuration: ConfigurationManager,
+) -> Result<()> {
+    let mut app = App::new(config, configuration)?;
 
     while !app.should_quit {
         let size = terminal.size()?;
