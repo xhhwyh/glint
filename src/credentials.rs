@@ -87,6 +87,7 @@ impl FileCredentialStore {
     }
 
     fn load(&self) -> Result<AuthFile> {
+        create_private_directory(&self.root)?;
         match fs::metadata(&self.path) {
             Ok(_) => restrict_auth_permissions(&self.path)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -392,6 +393,40 @@ mod tests {
 
         assert_eq!(store.get(&id).unwrap().as_deref(), Some("secret"));
 
+        assert_eq!(
+            fs::metadata(paths.auth()).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reading_existing_file_backend_restricts_root_and_auth_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let paths = GlintPaths::from_home(temp_root("read-existing-root-mode"));
+        fs::create_dir_all(paths.root()).unwrap();
+        fs::write(
+            paths.auth(),
+            r#"{"credentials":{"builtin:deepseek":"secret"}}"#,
+        )
+        .unwrap();
+        fs::set_permissions(paths.root(), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(paths.auth(), fs::Permissions::from_mode(0o644)).unwrap();
+        let factory = FakeFactory::unavailable();
+        let store = open_with_factory(&paths, true, &factory).unwrap();
+
+        assert_eq!(
+            store
+                .get(&CredentialId::builtin("deepseek"))
+                .unwrap()
+                .as_deref(),
+            Some("secret")
+        );
+        assert_eq!(
+            fs::metadata(paths.root()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         assert_eq!(
             fs::metadata(paths.auth()).unwrap().permissions().mode() & 0o777,
             0o600
