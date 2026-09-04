@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, fmt, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -103,7 +103,7 @@ impl LlmConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Deserialize, Serialize, PartialEq)]
 pub struct UserConfig {
     #[serde(default = "schema_version")]
     pub version: u16,
@@ -121,6 +121,23 @@ pub struct UserConfig {
     pub lsp: Option<serde_yaml::Value>,
     #[serde(default, flatten)]
     extra: BTreeMap<String, serde_yaml::Value>,
+}
+
+impl fmt::Debug for UserConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let extra_sections = self.extra.keys().map(String::as_str).collect::<Vec<_>>();
+        formatter
+            .debug_struct("UserConfig")
+            .field("version", &self.version)
+            .field("llm", &self.llm)
+            .field("configured_providers", &self.configured_providers)
+            .field("custom_providers", &self.custom_providers)
+            .field("mcp_configured", &self.mcp.is_some())
+            .field("plugins_configured", &self.plugins.is_some())
+            .field("lsp_configured", &self.lsp.is_some())
+            .field("extra_sections", &extra_sections)
+            .finish()
+    }
 }
 
 impl Default for UserConfig {
@@ -355,6 +372,31 @@ mod tests {
         let error = serde_yaml::from_str::<UserConfig>("version: 1\nversion: 2\n").unwrap_err();
 
         assert!(error.to_string().contains("duplicate field `version`"));
+    }
+
+    #[test]
+    fn user_config_debug_redacts_raw_extension_and_unknown_values() {
+        let config: UserConfig = serde_yaml::from_str(
+            "version: 1\nllm:\n  provider: deepseek\n  model: safe-model\n  temperature: 0.7\n  max_tokens: 8196\nmcp:\n  token: mcp-sentinel-secret\nplugins:\n  token: plugin-sentinel-secret\nlsp:\n  token: lsp-sentinel-secret\nfuture_auth:\n  token: extra-sentinel-secret\n",
+        )
+        .unwrap();
+
+        let debug = format!("{config:?}");
+
+        assert!(debug.contains("version: 1"));
+        assert!(debug.contains("deepseek"));
+        assert!(debug.contains("mcp"));
+        assert!(debug.contains("plugins"));
+        assert!(debug.contains("lsp"));
+        assert!(debug.contains("future_auth"));
+        for secret in [
+            "mcp-sentinel-secret",
+            "plugin-sentinel-secret",
+            "lsp-sentinel-secret",
+            "extra-sentinel-secret",
+        ] {
+            assert!(!debug.contains(secret), "Debug leaked {secret}: {debug}");
+        }
     }
 
     #[test]
