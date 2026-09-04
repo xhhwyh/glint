@@ -72,15 +72,18 @@ fn main() -> Result<()> {
         io::stdout().is_terminal(),
     )?;
     let catalog = ProviderCatalog::embedded()?;
-    enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-    )?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    let mut lifecycle = TerminalLifecycle::enter(&mut stdout)?;
+    let mut terminal = match Terminal::new(CrosstermBackend::new(stdout)) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            let mut cleanup_stdout = io::stdout();
+            return combine_terminal_result(
+                Err(error.into()),
+                lifecycle.restore(&mut cleanup_stdout),
+            );
+        }
+    };
 
     let result = (|| -> Result<()> {
         match choice {
@@ -105,22 +108,85 @@ fn main() -> Result<()> {
         }
     })();
 
-    let raw_mode_result = disable_raw_mode();
-    let screen_result = execute!(
-        terminal.backend_mut(),
-        PopKeyboardEnhancementFlags,
-        DisableMouseCapture,
-        LeaveAlternateScreen
-    );
+    let restore_result = lifecycle.restore(terminal.backend_mut());
     let cursor_result = terminal.show_cursor();
-    let cleanup_error = raw_mode_result
-        .err()
-        .or_else(|| screen_result.err())
-        .or_else(|| cursor_result.err());
-    match (result, cleanup_error) {
+    combine_terminal_result(result, first_io_error(restore_result, cursor_result))
+}
+
+#[derive(Default)]
+struct TerminalLifecycle {
+    raw_mode: bool,
+    alternate_screen: bool,
+    mouse_capture: bool,
+    keyboard_enhancement: bool,
+}
+
+impl TerminalLifecycle {
+    fn enter<W: Write>(writer: &mut W) -> Result<Self> {
+        let mut lifecycle = Self::default();
+        let enter_result = (|| -> io::Result<()> {
+            enable_raw_mode()?;
+            lifecycle.raw_mode = true;
+            lifecycle.alternate_screen = true;
+            execute!(writer, EnterAlternateScreen)?;
+            lifecycle.mouse_capture = true;
+            execute!(writer, EnableMouseCapture)?;
+            lifecycle.keyboard_enhancement = true;
+            execute!(
+                writer,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            )?;
+            Ok(())
+        })();
+
+        match enter_result {
+            Ok(()) => Ok(lifecycle),
+            Err(error) => combine_terminal_result(Err(error.into()), lifecycle.restore(writer)),
+        }
+    }
+
+    fn restore<W: Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        let mut first_error = None;
+        if self.raw_mode {
+            record_io_error(&mut first_error, disable_raw_mode());
+            self.raw_mode = false;
+        }
+        if self.keyboard_enhancement {
+            record_io_error(
+                &mut first_error,
+                execute!(writer, PopKeyboardEnhancementFlags),
+            );
+            self.keyboard_enhancement = false;
+        }
+        if self.mouse_capture {
+            record_io_error(&mut first_error, execute!(writer, DisableMouseCapture));
+            self.mouse_capture = false;
+        }
+        if self.alternate_screen {
+            record_io_error(&mut first_error, execute!(writer, LeaveAlternateScreen));
+            self.alternate_screen = false;
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+fn record_io_error(slot: &mut Option<io::Error>, result: io::Result<()>) {
+    if let Err(error) = result
+        && slot.is_none()
+    {
+        *slot = Some(error);
+    }
+}
+
+fn first_io_error(left: io::Result<()>, right: io::Result<()>) -> io::Result<()> {
+    left.err().or_else(|| right.err()).map_or(Ok(()), Err)
+}
+
+fn combine_terminal_result<T>(result: Result<T>, cleanup: io::Result<()>) -> Result<T> {
+    match (result, cleanup) {
         (Err(error), _) => Err(error),
-        (Ok(()), Some(error)) => Err(error.into()),
-        (Ok(()), None) => Ok(()),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Ok(value), Ok(())) => Ok(value),
     }
 }
 
@@ -155,8 +221,8 @@ fn run_setup(
             continue;
         }
         let input = KeyInput::from(key);
-        if input.action == KeyAction::Quit {
-            return Ok(SetupOutcome::Exit);
+        if let Some(outcome) = setup_exit_outcome(input.action) {
+            return Ok(outcome);
         }
         if let Some(effect) = state.update(input.action)
             && let Some(outcome) = apply_setup_effect(manager, &mut state, effect)?
@@ -164,6 +230,10 @@ fn run_setup(
             return Ok(outcome);
         }
     }
+}
+
+fn setup_exit_outcome(action: KeyAction) -> Option<SetupOutcome> {
+    matches!(action, KeyAction::Quit | KeyAction::ForceQuit).then_some(SetupOutcome::Exit)
 }
 
 #[cfg(test)]
@@ -413,6 +483,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn setup_quit_actions_exit_the_setup_loop() {
+        assert_eq!(
+            setup_exit_outcome(KeyAction::Quit),
+            Some(SetupOutcome::Exit)
+        );
+        assert_eq!(
+            setup_exit_outcome(KeyAction::ForceQuit),
+            Some(SetupOutcome::Exit)
+        );
+    }
+
     #[derive(Clone, Default)]
     struct RecordingWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -436,6 +518,23 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn terminal_lifecycle_restores_entered_partial_screen_state() {
+        let mut writer = RecordingWriter::default();
+        let mut lifecycle = TerminalLifecycle {
+            raw_mode: false,
+            alternate_screen: true,
+            mouse_capture: true,
+            keyboard_enhancement: true,
+        };
+
+        lifecycle.restore(&mut writer).unwrap();
+
+        let output = writer.output();
+        assert!(output.contains("\x1b[?1049l"));
+        assert!(output.contains("\x1b[?1000l"));
     }
 
     #[test]
