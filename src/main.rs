@@ -57,7 +57,7 @@ use crossterm::{
 use event::{AppEvent, KeyAction, KeyInput, MouseAction};
 use provider_catalog::ProviderCatalog;
 use ratatui::{Terminal, backend::CrosstermBackend};
-use setup::{SetupOutcome, SetupState, apply_setup_effect};
+use setup::{SetupEffect, SetupOutcome, SetupState, apply_setup_effect};
 
 const MAX_TERMINAL_EVENTS_PER_FRAME: usize = 64;
 
@@ -74,16 +74,15 @@ fn main() -> Result<()> {
     let catalog = ProviderCatalog::embedded()?;
     let mut stdout = io::stdout();
     let mut lifecycle = TerminalLifecycle::enter(&mut stdout)?;
-    let mut terminal = match Terminal::new(CrosstermBackend::new(stdout)) {
-        Ok(terminal) => terminal,
-        Err(error) => {
-            let mut cleanup_stdout = io::stdout();
-            return combine_terminal_result(
-                Err(error.into()),
-                lifecycle.restore(&mut cleanup_stdout),
-            );
-        }
+    let mut cleanup_stdout = io::stdout();
+    let mut cleanup_control = CrosstermTerminalControl {
+        writer: &mut cleanup_stdout,
     };
+    let mut terminal = construct_terminal(
+        &mut lifecycle,
+        || Terminal::new(CrosstermBackend::new(stdout)),
+        &mut cleanup_control,
+    )?;
 
     let result = (|| -> Result<()> {
         match choice {
@@ -123,50 +122,132 @@ struct TerminalLifecycle {
 
 impl TerminalLifecycle {
     fn enter<W: Write>(writer: &mut W) -> Result<Self> {
+        let mut control = CrosstermTerminalControl { writer };
+        Self::enter_with(&mut control).map_err(Into::into)
+    }
+
+    fn enter_with<C: TerminalControl>(control: &mut C) -> io::Result<Self> {
         let mut lifecycle = Self::default();
         let enter_result = (|| -> io::Result<()> {
-            enable_raw_mode()?;
+            control.enable_raw_mode()?;
             lifecycle.raw_mode = true;
             lifecycle.alternate_screen = true;
-            execute!(writer, EnterAlternateScreen)?;
+            control.enter_alternate_screen()?;
             lifecycle.mouse_capture = true;
-            execute!(writer, EnableMouseCapture)?;
+            control.enable_mouse_capture()?;
             lifecycle.keyboard_enhancement = true;
-            execute!(
-                writer,
-                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-            )?;
+            control.push_keyboard_enhancement()?;
             Ok(())
         })();
 
         match enter_result {
             Ok(()) => Ok(lifecycle),
-            Err(error) => combine_terminal_result(Err(error.into()), lifecycle.restore(writer)),
+            Err(error) => {
+                let _ = lifecycle.restore_with(control);
+                Err(error)
+            }
         }
     }
 
     fn restore<W: Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        let mut control = CrosstermTerminalControl { writer };
+        self.restore_with(&mut control)
+    }
+
+    fn restore_with<C: TerminalControl>(&mut self, control: &mut C) -> io::Result<()> {
         let mut first_error = None;
         if self.raw_mode {
-            record_io_error(&mut first_error, disable_raw_mode());
+            record_io_error(&mut first_error, control.disable_raw_mode());
             self.raw_mode = false;
         }
         if self.keyboard_enhancement {
-            record_io_error(
-                &mut first_error,
-                execute!(writer, PopKeyboardEnhancementFlags),
-            );
+            record_io_error(&mut first_error, control.pop_keyboard_enhancement());
             self.keyboard_enhancement = false;
         }
         if self.mouse_capture {
-            record_io_error(&mut first_error, execute!(writer, DisableMouseCapture));
+            record_io_error(&mut first_error, control.disable_mouse_capture());
             self.mouse_capture = false;
         }
         if self.alternate_screen {
-            record_io_error(&mut first_error, execute!(writer, LeaveAlternateScreen));
+            record_io_error(&mut first_error, control.leave_alternate_screen());
             self.alternate_screen = false;
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    #[cfg(test)]
+    fn is_restored(&self) -> bool {
+        !self.raw_mode
+            && !self.alternate_screen
+            && !self.mouse_capture
+            && !self.keyboard_enhancement
+    }
+}
+
+trait TerminalControl {
+    fn enable_raw_mode(&mut self) -> io::Result<()>;
+    fn disable_raw_mode(&mut self) -> io::Result<()>;
+    fn enter_alternate_screen(&mut self) -> io::Result<()>;
+    fn leave_alternate_screen(&mut self) -> io::Result<()>;
+    fn enable_mouse_capture(&mut self) -> io::Result<()>;
+    fn disable_mouse_capture(&mut self) -> io::Result<()>;
+    fn push_keyboard_enhancement(&mut self) -> io::Result<()>;
+    fn pop_keyboard_enhancement(&mut self) -> io::Result<()>;
+}
+
+struct CrosstermTerminalControl<'a, W> {
+    writer: &'a mut W,
+}
+
+impl<W: Write> TerminalControl for CrosstermTerminalControl<'_, W> {
+    fn enable_raw_mode(&mut self) -> io::Result<()> {
+        enable_raw_mode()
+    }
+
+    fn disable_raw_mode(&mut self) -> io::Result<()> {
+        disable_raw_mode()
+    }
+
+    fn enter_alternate_screen(&mut self) -> io::Result<()> {
+        execute!(self.writer, EnterAlternateScreen)
+    }
+
+    fn leave_alternate_screen(&mut self) -> io::Result<()> {
+        execute!(self.writer, LeaveAlternateScreen)
+    }
+
+    fn enable_mouse_capture(&mut self) -> io::Result<()> {
+        execute!(self.writer, EnableMouseCapture)
+    }
+
+    fn disable_mouse_capture(&mut self) -> io::Result<()> {
+        execute!(self.writer, DisableMouseCapture)
+    }
+
+    fn push_keyboard_enhancement(&mut self) -> io::Result<()> {
+        execute!(
+            self.writer,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+    }
+
+    fn pop_keyboard_enhancement(&mut self) -> io::Result<()> {
+        execute!(self.writer, PopKeyboardEnhancementFlags)
+    }
+}
+
+fn construct_terminal<T, F, C>(
+    lifecycle: &mut TerminalLifecycle,
+    construct: F,
+    cleanup: &mut C,
+) -> Result<T>
+where
+    F: FnOnce() -> io::Result<T>,
+    C: TerminalControl,
+{
+    match construct() {
+        Ok(terminal) => Ok(terminal),
+        Err(error) => combine_terminal_result(Err(error.into()), lifecycle.restore_with(cleanup)),
     }
 }
 
@@ -221,19 +302,31 @@ fn run_setup(
             continue;
         }
         let input = KeyInput::from(key);
-        if let Some(outcome) = setup_exit_outcome(input.action) {
-            return Ok(outcome);
-        }
-        if let Some(effect) = state.update(input.action)
-            && let Some(outcome) = apply_setup_effect(manager, &mut state, effect)?
-        {
-            return Ok(outcome);
+        match setup_step(&mut state, input.action) {
+            SetupStep::Continue => {}
+            SetupStep::Exit(outcome) => return Ok(outcome),
+            SetupStep::Effect(effect) => {
+                if let Some(outcome) = apply_setup_effect(manager, &mut state, effect)? {
+                    return Ok(outcome);
+                }
+            }
         }
     }
 }
 
-fn setup_exit_outcome(action: KeyAction) -> Option<SetupOutcome> {
-    matches!(action, KeyAction::Quit | KeyAction::ForceQuit).then_some(SetupOutcome::Exit)
+enum SetupStep {
+    Continue,
+    Effect(SetupEffect),
+    Exit(SetupOutcome),
+}
+
+fn setup_step(state: &mut SetupState, action: KeyAction) -> SetupStep {
+    if matches!(action, KeyAction::Quit | KeyAction::ForceQuit) {
+        return SetupStep::Exit(SetupOutcome::Exit);
+    }
+    state
+        .update(action)
+        .map_or(SetupStep::Continue, SetupStep::Effect)
 }
 
 #[cfg(test)]
@@ -485,14 +578,21 @@ mod tests {
 
     #[test]
     fn setup_quit_actions_exit_the_setup_loop() {
-        assert_eq!(
-            setup_exit_outcome(KeyAction::Quit),
-            Some(SetupOutcome::Exit)
-        );
-        assert_eq!(
-            setup_exit_outcome(KeyAction::ForceQuit),
-            Some(SetupOutcome::Exit)
-        );
+        let catalog = ProviderCatalog::embedded().unwrap();
+        let mut state = SetupState::welcome(&catalog);
+
+        assert!(matches!(
+            setup_step(&mut state, KeyAction::Quit),
+            SetupStep::Exit(SetupOutcome::Exit)
+        ));
+        assert!(matches!(
+            setup_step(&mut state, KeyAction::ForceQuit),
+            SetupStep::Exit(SetupOutcome::Exit)
+        ));
+        assert!(matches!(
+            state.screen,
+            crate::setup::SetupScreen::Welcome(_)
+        ));
     }
 
     #[derive(Clone, Default)]
@@ -521,20 +621,162 @@ mod tests {
     }
 
     #[test]
-    fn terminal_lifecycle_restores_entered_partial_screen_state() {
-        let mut writer = RecordingWriter::default();
-        let mut lifecycle = TerminalLifecycle {
-            raw_mode: false,
-            alternate_screen: true,
-            mouse_capture: true,
-            keyboard_enhancement: true,
-        };
+    fn terminal_lifecycle_restores_every_control_in_reverse_order_and_is_idempotent() {
+        let mut control = FakeTerminalControl::default();
+        let mut lifecycle = TerminalLifecycle::enter_with(&mut control).unwrap();
 
-        lifecycle.restore(&mut writer).unwrap();
+        lifecycle.restore_with(&mut control).unwrap();
+        assert_eq!(
+            control.operations,
+            vec![
+                TerminalOperation::EnableRaw,
+                TerminalOperation::EnterAlternate,
+                TerminalOperation::EnableMouse,
+                TerminalOperation::PushKeyboard,
+                TerminalOperation::DisableRaw,
+                TerminalOperation::PopKeyboard,
+                TerminalOperation::DisableMouse,
+                TerminalOperation::LeaveAlternate,
+            ]
+        );
+        assert!(lifecycle.is_restored());
 
-        let output = writer.output();
-        assert!(output.contains("\x1b[?1049l"));
-        assert!(output.contains("\x1b[?1000l"));
+        lifecycle.restore_with(&mut control).unwrap();
+        assert_eq!(control.operations.len(), 8);
+    }
+
+    #[test]
+    fn terminal_lifecycle_continues_cleanup_after_a_raw_mode_failure() {
+        let mut startup = FakeTerminalControl::default();
+        let mut lifecycle = TerminalLifecycle::enter_with(&mut startup).unwrap();
+        let mut cleanup = FakeTerminalControl::failing(TerminalOperation::DisableRaw);
+
+        assert!(lifecycle.restore_with(&mut cleanup).is_err());
+        assert_eq!(
+            cleanup.operations,
+            vec![
+                TerminalOperation::DisableRaw,
+                TerminalOperation::PopKeyboard,
+                TerminalOperation::DisableMouse,
+                TerminalOperation::LeaveAlternate,
+            ]
+        );
+        assert!(lifecycle.is_restored());
+    }
+
+    #[test]
+    fn terminal_lifecycle_rolls_back_an_interrupted_enter_sequence() {
+        let mut control = FakeTerminalControl::failing(TerminalOperation::PushKeyboard);
+
+        assert!(TerminalLifecycle::enter_with(&mut control).is_err());
+        assert_eq!(
+            control.operations,
+            vec![
+                TerminalOperation::EnableRaw,
+                TerminalOperation::EnterAlternate,
+                TerminalOperation::EnableMouse,
+                TerminalOperation::PushKeyboard,
+                TerminalOperation::DisableRaw,
+                TerminalOperation::PopKeyboard,
+                TerminalOperation::DisableMouse,
+                TerminalOperation::LeaveAlternate,
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_constructor_failure_restores_the_entered_lifecycle() {
+        let mut startup = FakeTerminalControl::default();
+        let mut lifecycle = TerminalLifecycle::enter_with(&mut startup).unwrap();
+        let mut cleanup = FakeTerminalControl::default();
+
+        let result: Result<()> = construct_terminal(
+            &mut lifecycle,
+            || Err(io::Error::other("terminal creation failed")),
+            &mut cleanup,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            cleanup.operations,
+            vec![
+                TerminalOperation::DisableRaw,
+                TerminalOperation::PopKeyboard,
+                TerminalOperation::DisableMouse,
+                TerminalOperation::LeaveAlternate,
+            ]
+        );
+        assert!(lifecycle.is_restored());
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TerminalOperation {
+        EnableRaw,
+        DisableRaw,
+        EnterAlternate,
+        LeaveAlternate,
+        EnableMouse,
+        DisableMouse,
+        PushKeyboard,
+        PopKeyboard,
+    }
+
+    #[derive(Default)]
+    struct FakeTerminalControl {
+        operations: Vec<TerminalOperation>,
+        failure: Option<TerminalOperation>,
+    }
+
+    impl FakeTerminalControl {
+        fn failing(operation: TerminalOperation) -> Self {
+            Self {
+                operations: Vec::new(),
+                failure: Some(operation),
+            }
+        }
+
+        fn record(&mut self, operation: TerminalOperation) -> io::Result<()> {
+            self.operations.push(operation);
+            if self.failure == Some(operation) {
+                Err(io::Error::other("injected terminal control failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl TerminalControl for FakeTerminalControl {
+        fn enable_raw_mode(&mut self) -> io::Result<()> {
+            self.record(TerminalOperation::EnableRaw)
+        }
+
+        fn disable_raw_mode(&mut self) -> io::Result<()> {
+            self.record(TerminalOperation::DisableRaw)
+        }
+
+        fn enter_alternate_screen(&mut self) -> io::Result<()> {
+            self.record(TerminalOperation::EnterAlternate)
+        }
+
+        fn leave_alternate_screen(&mut self) -> io::Result<()> {
+            self.record(TerminalOperation::LeaveAlternate)
+        }
+
+        fn enable_mouse_capture(&mut self) -> io::Result<()> {
+            self.record(TerminalOperation::EnableMouse)
+        }
+
+        fn disable_mouse_capture(&mut self) -> io::Result<()> {
+            self.record(TerminalOperation::DisableMouse)
+        }
+
+        fn push_keyboard_enhancement(&mut self) -> io::Result<()> {
+            self.record(TerminalOperation::PushKeyboard)
+        }
+
+        fn pop_keyboard_enhancement(&mut self) -> io::Result<()> {
+            self.record(TerminalOperation::PopKeyboard)
+        }
     }
 
     #[test]
