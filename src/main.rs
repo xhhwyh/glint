@@ -4,6 +4,8 @@ mod approval;
 mod cli;
 mod commands;
 mod config;
+#[allow(dead_code)]
+mod configuration;
 mod context;
 #[allow(dead_code)]
 mod credentials;
@@ -39,8 +41,9 @@ use std::{
 use anyhow::Result;
 use app::{App, ExecutionRepaintRequest};
 use clap::Parser;
-use cli::{Cli, CliCommand};
+use cli::Cli;
 use config::Config;
+use configuration::ConfigurationManager;
 use crossterm::{
     event::{
         self as term_event, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
@@ -55,14 +58,15 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 const MAX_TERMINAL_EVENTS_PER_FRAME: usize = 64;
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-    if let Some(CliCommand::Init) = cli.command {
-        let path = config::init_config(cli.config.as_deref())?;
-        println!("Created Glint configuration at {}", path.display());
-        return Ok(());
+    let _cli = Cli::parse();
+    let workspace = std::env::current_dir()?;
+    let paths = paths::GlintPaths::discover()?;
+    let mut configuration = ConfigurationManager::discover(paths, &workspace)?;
+    configuration.repair_selection()?;
+    if configuration.available_providers()?.is_empty() {
+        anyhow::bail!("no model is configured; run `glint` in an interactive terminal to add one");
     }
-    let config = Config::load(cli.config.as_deref())?;
-
+    let config = configuration.build_runtime(&workspace)?;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(

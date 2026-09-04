@@ -1,33 +1,25 @@
 use std::process::Command;
 
 #[test]
-fn help_works_without_configuration() {
-    let cwd = temp_dir("help");
-    std::fs::create_dir_all(&cwd).unwrap();
+fn help_works_without_configuration_and_omits_legacy_options() {
+    let home = temp_home("help");
+    std::fs::create_dir_all(&home).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_glint"))
-        .arg("--help")
-        .current_dir(cwd)
-        .output()
-        .unwrap();
+    let output = glint(&home).arg("--help").output().unwrap();
 
     assert!(output.status.success(), "{}", stderr(&output));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Usage: glint"));
-    assert!(stdout.contains("init"));
-    assert!(stdout.contains("--config"));
+    assert!(!stdout.contains("init"));
+    assert!(!stdout.contains("--config"));
 }
 
 #[test]
 fn version_works_without_configuration() {
-    let cwd = temp_dir("version");
-    std::fs::create_dir_all(&cwd).unwrap();
+    let home = temp_home("version");
+    std::fs::create_dir_all(&home).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_glint"))
-        .arg("--version")
-        .current_dir(cwd)
-        .output()
-        .unwrap();
+    let output = glint(&home).arg("--version").output().unwrap();
 
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(
@@ -37,89 +29,65 @@ fn version_works_without_configuration() {
 }
 
 #[test]
-fn init_writes_the_starter_config_to_an_explicit_path() {
-    let cwd = temp_dir("init");
-    let config_path = cwd.join("nested/config.yaml");
-    std::fs::create_dir_all(&cwd).unwrap();
+fn legacy_config_option_is_rejected() {
+    let home = temp_home("config-option");
+    std::fs::create_dir_all(&home).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_glint"))
-        .args(["init", "--config"])
-        .arg(&config_path)
-        .current_dir(&cwd)
-        .output()
-        .unwrap();
-
-    assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(
-        std::fs::read_to_string(&config_path).unwrap(),
-        include_str!("../config.example.yaml")
-    );
-    assert!(String::from_utf8_lossy(&output.stdout).contains(&config_path.display().to_string()));
-}
-
-#[test]
-fn init_refuses_to_overwrite_an_existing_config() {
-    let cwd = temp_dir("init-existing");
-    let config_path = cwd.join("config.yaml");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::write(&config_path, "keep me\n").unwrap();
-
-    let output = Command::new(env!("CARGO_BIN_EXE_glint"))
-        .args(["init", "--config"])
-        .arg(&config_path)
-        .current_dir(&cwd)
+    let output = glint(&home)
+        .args(["--config", "legacy.yaml"])
         .output()
         .unwrap();
 
     assert!(!output.status.success());
-    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), "keep me\n");
-    assert!(stderr(&output).contains("already exists"));
+    assert!(stderr(&output).contains("unexpected argument '--config'"));
 }
 
 #[test]
-fn init_uses_xdg_config_home_when_no_path_is_given() {
-    let cwd = temp_dir("init-xdg");
-    let xdg = cwd.join("xdg");
-    let expected = xdg.join("glint/config.yaml");
-    std::fs::create_dir_all(&cwd).unwrap();
-
-    let output = Command::new(env!("CARGO_BIN_EXE_glint"))
-        .arg("init")
-        .current_dir(&cwd)
-        .env_remove("GLINT_CONFIG")
-        .env("XDG_CONFIG_HOME", &xdg)
-        .env_remove("HOME")
-        .output()
-        .unwrap();
-
-    assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(
-        std::fs::read_to_string(&expected).unwrap(),
-        include_str!("../config.example.yaml")
-    );
-}
-
-#[test]
-fn default_run_without_configuration_reports_attempts_and_init_hint() {
-    let cwd = temp_dir("missing-config");
-    let home = cwd.join("home");
+fn legacy_init_subcommand_is_rejected() {
+    let home = temp_home("init");
     std::fs::create_dir_all(&home).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_glint"))
-        .current_dir(&cwd)
-        .env_remove("GLINT_CONFIG")
-        .env_remove("XDG_CONFIG_HOME")
-        .env("HOME", &home)
+    let output = glint(&home).arg("init").output().unwrap();
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("unexpected argument 'init'"));
+}
+
+#[test]
+fn unconfigured_run_explains_interactive_setup() {
+    let home = temp_home("unconfigured");
+    let workspace = home.join("workspace");
+    std::fs::create_dir_all(workspace.join(".glint")).unwrap();
+    std::fs::write(workspace.join("config.yaml"), "legacy config").unwrap();
+    std::fs::write(workspace.join(".glint/config.yaml"), "project config").unwrap();
+
+    let output = glint(&home)
+        .current_dir(&workspace)
+        .env("GLINT_CONFIG", "/ignored/legacy.yaml")
         .output()
         .unwrap();
 
     assert!(!output.status.success());
     let stderr = stderr(&output);
-    assert!(stderr.contains(&cwd.join(".glint/config.yaml").display().to_string()));
-    assert!(stderr.contains("glint init"));
+    assert!(
+        stderr
+            .contains("no model is configured; run `glint` in an interactive terminal to add one")
+    );
+    assert!(!stderr.contains("ignored/legacy.yaml"));
+    assert!(!stderr.contains(&workspace.join("config.yaml").display().to_string()));
+    assert!(!stderr.contains(&workspace.join(".glint/config.yaml").display().to_string()));
 }
 
-fn temp_dir(label: &str) -> std::path::PathBuf {
+fn glint(home: &std::path::Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_glint"));
+    command
+        .current_dir(std::env::temp_dir())
+        .env("HOME", home)
+        .env_remove("XDG_CONFIG_HOME");
+    command
+}
+
+fn temp_home(label: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("glint-cli-{label}-{}", uuid::Uuid::new_v4()))
 }
 

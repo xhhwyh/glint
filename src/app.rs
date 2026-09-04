@@ -52,6 +52,8 @@ use crate::{
 
 #[cfg(test)]
 use crate::config::{LlmConfig, LlmProviderConfig, LspConfig, ModelCatalog};
+#[cfg(test)]
+use crate::credentials::CredentialId;
 
 pub struct App {
     pub should_quit: bool,
@@ -614,7 +616,7 @@ impl App {
                         base_url: "http://localhost".to_owned(),
                         models: vec!["test-model".to_owned()],
                         model_context_windows: Default::default(),
-                        api_key_env: "TEST_API_KEY".to_owned(),
+                        credential_id: CredentialId::builtin("test"),
                         prompt_cache: Default::default(),
                     }],
                     temperature: 0.0,
@@ -1676,16 +1678,16 @@ impl App {
         };
         self.messages.push(Message::user(command.clone()));
 
-        let result =
-            match self
-                .config
-                .llm
-                .switch_model(&provider_name, &model_name, |api_key_env| {
-                    std::env::var(api_key_env).ok()
-                }) {
-                Ok(()) => format!("Switch model to `{model_name}` provided by `{provider_name}`"),
-                Err(error) => format!("Failed to switch model: {error:#}"),
-            };
+        let api_key =
+            (provider_name == self.config.llm.provider).then(|| self.config.llm.api_key.clone());
+        let result = match self
+            .config
+            .llm
+            .switch_model(&provider_name, &model_name, api_key)
+        {
+            Ok(()) => format!("Switch model to `{model_name}` provided by `{provider_name}`"),
+            Err(error) => format!("Failed to switch model: {error:#}"),
+        };
         self.record_local_exchange(command, result.clone());
         self.messages.push(Message::assistant(result));
         self.scroll = 0;

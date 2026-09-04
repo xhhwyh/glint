@@ -853,6 +853,7 @@ mod tests {
     use crate::{
         agent::provider::{ModelRole, ToolResult, ToolSpec},
         config::{LlmProviderConfig, LspConfig},
+        credentials::CredentialId,
         settings::{ProjectPermissions, ProjectSettings},
     };
 
@@ -921,7 +922,7 @@ mod tests {
                     base_url: "http://localhost".to_owned(),
                     models: vec!["test-model".to_owned()],
                     model_context_windows: Default::default(),
-                    api_key_env: "TEST_API_KEY".to_owned(),
+                    credential_id: CredentialId::builtin("test"),
                     prompt_cache: Default::default(),
                 }],
                 temperature: 0.0,

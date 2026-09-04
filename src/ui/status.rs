@@ -140,9 +140,9 @@ fn status_general_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 ("Model", app.config.llm.model.clone()),
                 ("Endpoint", app.config.llm.base_url.clone()),
                 (
-                    "API key env",
+                    "Credential",
                     provider
-                        .map(|provider| provider.api_key_env.clone())
+                        .map(|provider| provider.credential_id.as_str().to_owned())
                         .unwrap_or_default(),
                 ),
                 ("Temperature", format!("{:.2}", app.config.llm.temperature)),
