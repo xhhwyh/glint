@@ -27,6 +27,8 @@ mod query;
 mod runtime;
 mod services;
 mod settings;
+#[allow(dead_code)]
+mod setup;
 mod subagent_transcript;
 mod tasks;
 mod tools;
