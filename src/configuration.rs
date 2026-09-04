@@ -58,13 +58,19 @@ impl ConfigurationManager {
         let repository: Box<dyn UserConfigRepository> =
             Box::new(UserConfigStore::new(paths.clone()));
         let user = repository.load()?.unwrap_or_default();
-        validate_user_version(&user)?;
+        let catalog = ProviderCatalog::embedded()?;
+        validate_loaded_user(&user, &catalog).with_context(|| {
+            format!(
+                "invalid Glint configuration at {}",
+                repository.path().display()
+            )
+        })?;
         let has_configured_providers =
             !user.configured_providers.is_empty() || !user.custom_providers.is_empty();
         let credentials = open_credential_store(&paths, has_configured_providers)?;
         Ok(Self {
             paths,
-            catalog: ProviderCatalog::embedded()?,
+            catalog,
             repository,
             credentials,
             user,
@@ -78,7 +84,12 @@ impl ConfigurationManager {
         credentials: Box<dyn CredentialStore>,
     ) -> Result<Self> {
         let user = repository.load()?.unwrap_or_default();
-        validate_user_version(&user)?;
+        validate_loaded_user(&user, &catalog).with_context(|| {
+            format!(
+                "invalid Glint configuration at {}",
+                repository.path().display()
+            )
+        })?;
         Ok(Self {
             paths,
             catalog,
@@ -435,9 +446,62 @@ impl ConfigurationManager {
     }
 }
 
-fn validate_user_version(user: &UserConfig) -> Result<()> {
+fn validate_loaded_user(user: &UserConfig, catalog: &ProviderCatalog) -> Result<()> {
     if user.version != 1 {
         bail!("unsupported configuration version {}", user.version);
+    }
+    validate_persisted_custom_providers(user, catalog)
+}
+
+fn validate_persisted_custom_providers(user: &UserConfig, catalog: &ProviderCatalog) -> Result<()> {
+    let mut custom_names = HashSet::new();
+    for (name, provider) in &user.custom_providers {
+        if name.is_empty() {
+            bail!("custom provider name must not be empty");
+        }
+        if name.trim() != name {
+            bail!("custom provider name '{name}' must not have surrounding whitespace");
+        }
+        if catalog.providers().iter().any(|builtin| {
+            builtin.id.eq_ignore_ascii_case(name) || builtin.name.eq_ignore_ascii_case(name)
+        }) {
+            bail!("custom provider '{name}' collides with a built-in provider");
+        }
+        if !custom_names.insert(name.to_ascii_lowercase()) {
+            bail!("duplicate custom provider name '{name}' (case-insensitive)");
+        }
+        validate_persisted_custom_provider(name, provider)?;
+    }
+    Ok(())
+}
+
+fn validate_persisted_custom_provider(name: &str, provider: &CustomProviderConfig) -> Result<()> {
+    if provider.base_url.trim().is_empty() {
+        bail!("custom provider '{name}' base URL must not be empty");
+    }
+    if provider.base_url.trim() != provider.base_url {
+        bail!("custom provider '{name}' base URL must not have surrounding whitespace");
+    }
+    let url = reqwest::Url::parse(&provider.base_url)
+        .with_context(|| format!("custom provider '{name}' base URL is invalid"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("custom provider '{name}' base URL must use http or https");
+    }
+    if provider.models.is_empty() {
+        bail!("custom provider '{name}' must define at least one model");
+    }
+
+    let mut model_names = HashSet::new();
+    for model in &provider.models {
+        if model.trim().is_empty() {
+            bail!("custom provider '{name}' model name must not be empty");
+        }
+        if model.trim() != model {
+            bail!("custom provider '{name}' model name must not have surrounding whitespace");
+        }
+        if !model_names.insert(model) {
+            bail!("custom provider '{name}' has duplicate model '{model}'");
+        }
     }
     Ok(())
 }
@@ -688,23 +752,12 @@ fn available_providers(
             .then_with(|| left.cmp(right))
     });
     for (name, provider) in custom {
-        if !valid_custom_config(provider)
-            || !credential_is_present(credentials, &CredentialId::custom(name))?
-        {
+        if !credential_is_present(credentials, &CredentialId::custom(name))? {
             continue;
         }
         providers.push(custom_available_provider(name, provider));
     }
     Ok(providers)
-}
-
-fn valid_custom_config(provider: &CustomProviderConfig) -> bool {
-    let Ok(url) = reqwest::Url::parse(provider.base_url.trim()) else {
-        return false;
-    };
-    matches!(url.scheme(), "http" | "https")
-        && !provider.models.is_empty()
-        && provider.models.iter().all(|model| !model.trim().is_empty())
 }
 
 fn custom_available_provider(name: &str, provider: &CustomProviderConfig) -> AvailableProvider {
@@ -787,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_persisted_custom_provider_contributes_no_models() {
+    fn invalid_persisted_custom_provider_is_rejected() {
         let mut fixture = ManagerFixture::new();
         fixture.user.custom_providers.insert(
             "Broken".into(),
@@ -798,7 +851,190 @@ mod tests {
         );
         fixture.credentials.insert("custom:Broken", "key");
 
-        assert!(fixture.manager().available_providers().unwrap().is_empty());
+        let error = fixture
+            .try_manager()
+            .err()
+            .expect("invalid URL should fail");
+
+        assert!(format!("{error:#}").contains("must use http or https"));
+    }
+
+    #[test]
+    fn persisted_custom_provider_identities_are_validated_before_use() {
+        let cases = [
+            (
+                "blank name",
+                vec![("", "https://llm.example/v1", vec!["model"])],
+                "name must not be empty",
+            ),
+            (
+                "surrounding name whitespace",
+                vec![(" Gateway ", "https://llm.example/v1", vec!["model"])],
+                "must not have surrounding whitespace",
+            ),
+            (
+                "built-in collision",
+                vec![("DEEPSEEK", "https://llm.example/v1", vec!["model"])],
+                "collides with a built-in provider",
+            ),
+            (
+                "case-insensitive custom collision",
+                vec![
+                    ("Gateway", "https://one.example/v1", vec!["one"]),
+                    ("gateway", "https://two.example/v1", vec!["two"]),
+                ],
+                "duplicate custom provider name",
+            ),
+        ];
+
+        for (label, providers, expected) in cases {
+            let mut fixture = ManagerFixture::new();
+            for (name, base_url, models) in providers {
+                fixture.user.custom_providers.insert(
+                    name.into(),
+                    CustomProviderConfig {
+                        base_url: base_url.into(),
+                        models: models.into_iter().map(str::to_owned).collect(),
+                    },
+                );
+            }
+
+            let error = fixture
+                .try_manager()
+                .err()
+                .unwrap_or_else(|| panic!("{label} should be rejected"));
+
+            assert!(
+                format!("{error:#}").contains(expected),
+                "{label}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_custom_provider_endpoint_and_models_are_validated_before_use() {
+        let cases = [
+            (
+                "blank URL",
+                "",
+                Vec::<&str>::from(["model"]),
+                "base URL must not be empty",
+            ),
+            (
+                "non-HTTP URL",
+                "file:///tmp/socket",
+                vec!["model"],
+                "must use http or https",
+            ),
+            (
+                "URL whitespace",
+                " https://llm.example/v1 ",
+                vec!["model"],
+                "base URL must not have surrounding whitespace",
+            ),
+            (
+                "empty model list",
+                "https://llm.example/v1",
+                vec![],
+                "at least one model",
+            ),
+            (
+                "blank model",
+                "https://llm.example/v1",
+                vec![""],
+                "model name must not be empty",
+            ),
+            (
+                "whitespace-only model",
+                "https://llm.example/v1",
+                vec!["   "],
+                "model name must not be empty",
+            ),
+            (
+                "model whitespace",
+                "https://llm.example/v1",
+                vec![" model "],
+                "model name must not have surrounding whitespace",
+            ),
+            (
+                "duplicate model",
+                "https://llm.example/v1",
+                vec!["model", "model"],
+                "duplicate model 'model'",
+            ),
+        ];
+
+        for (label, base_url, models, expected) in cases {
+            let mut fixture = ManagerFixture::new();
+            fixture.user.custom_providers.insert(
+                "Gateway".into(),
+                CustomProviderConfig {
+                    base_url: base_url.into(),
+                    models: models.into_iter().map(str::to_owned).collect(),
+                },
+            );
+
+            let error = fixture
+                .try_manager()
+                .err()
+                .unwrap_or_else(|| panic!("{label} should be rejected"));
+
+            assert!(
+                format!("{error:#}").contains(expected),
+                "{label}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_persisted_custom_models_preserve_declared_order() {
+        let mut fixture = ManagerFixture::new();
+        fixture.user.custom_providers.insert(
+            "Gateway".into(),
+            CustomProviderConfig {
+                base_url: "https://llm.example/v1".into(),
+                models: vec!["second".into(), "first".into(), "SECOND".into()],
+            },
+        );
+        fixture.credentials.insert("custom:Gateway", "key");
+
+        let providers = fixture.manager().available_providers().unwrap();
+
+        assert_eq!(
+            providers[0]
+                .models
+                .iter()
+                .map(|model| model.name.as_str())
+                .collect::<Vec<_>>(),
+            ["second", "first", "SECOND"]
+        );
+    }
+
+    #[test]
+    fn discover_reports_the_fixed_config_path_for_semantic_errors() {
+        let home = std::env::temp_dir().join(format!(
+            "glint-invalid-persisted-config-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = GlintPaths::from_home(home);
+        let store = crate::persistence::UserConfigStore::new(paths.clone());
+        let mut user = UserConfig::default();
+        user.custom_providers.insert(
+            " Gateway ".into(),
+            CustomProviderConfig {
+                base_url: "https://llm.example/v1".into(),
+                models: vec!["model".into()],
+            },
+        );
+        store.save(&user).unwrap();
+
+        let error = ConfigurationManager::discover(paths.clone(), Path::new("/workspace"))
+            .err()
+            .expect("invalid persisted provider should fail discovery");
+        let message = format!("{error:#}");
+
+        assert!(message.contains(&paths.config().display().to_string()));
+        assert!(message.contains("surrounding whitespace"));
     }
 
     #[test]
@@ -1294,7 +1530,10 @@ mod tests {
             Self {
                 user: UserConfig::default(),
                 credentials: MemoryCredentialStore::default(),
-                repository: MemoryUserConfigStore::default(),
+                repository: MemoryUserConfigStore {
+                    path: PathBuf::from("/fixture/.glint/config.yaml"),
+                    ..MemoryUserConfigStore::default()
+                },
             }
         }
 
@@ -1303,7 +1542,7 @@ mod tests {
             self.credentials.insert(&format!("builtin:{provider}"), key);
         }
 
-        fn manager(&self) -> ConfigurationManager {
+        fn try_manager(&self) -> Result<ConfigurationManager> {
             self.repository.replace(self.user.clone());
             ConfigurationManager::new(
                 GlintPaths::from_home("/fixture"),
@@ -1311,7 +1550,10 @@ mod tests {
                 Box::new(self.repository.clone()),
                 Box::new(self.credentials.clone()),
             )
-            .unwrap()
+        }
+
+        fn manager(&self) -> ConfigurationManager {
+            self.try_manager().unwrap()
         }
     }
 
