@@ -11,6 +11,10 @@ mod execution;
 mod http_proxy_tests;
 mod input;
 mod message;
+#[allow(dead_code)]
+mod paths;
+#[allow(dead_code)]
+mod persistence;
 mod plugins;
 mod progress;
 #[allow(dead_code)]

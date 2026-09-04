@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     plugins::{ExtensionCatalog, PluginLoadResult, PluginManager, PluginsConfig},
@@ -58,6 +58,60 @@ pub struct LlmProviderConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LspConfig {
     pub servers: BTreeMap<String, LspServerConfig>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UserConfig {
+    #[serde(default = "schema_version")]
+    pub version: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm: Option<UserLlmConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub configured_providers: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub custom_providers: BTreeMap<String, CustomProviderConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<serde_yaml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugins: Option<serde_yaml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsp: Option<serde_yaml::Value>,
+}
+
+impl Default for UserConfig {
+    fn default() -> Self {
+        Self {
+            version: schema_version(),
+            llm: None,
+            configured_providers: Vec::new(),
+            custom_providers: BTreeMap::new(),
+            mcp: None,
+            plugins: None,
+            lsp: None,
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UserLlmConfig {
+    pub provider: String,
+    pub model: String,
+    pub temperature: f32,
+    pub max_tokens: u32,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CustomProviderConfig {
+    pub base_url: String,
+    pub models: Vec<String>,
+}
+
+#[allow(dead_code)]
+fn schema_version() -> u16 {
+    1
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -644,7 +698,159 @@ fn non_empty_string(value: String) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, sync::Arc};
+
     use super::*;
+    use crate::{
+        paths::GlintPaths,
+        persistence::{AtomicFileWriter, UserConfigStore},
+    };
+
+    #[test]
+    fn user_config_omits_empty_optional_sections() {
+        let config = UserConfig {
+            version: 1,
+            llm: Some(UserLlmConfig {
+                provider: "deepseek".into(),
+                model: "deepseek-v4-flash".into(),
+                temperature: 0.7,
+                max_tokens: 8196,
+            }),
+            ..UserConfig::default()
+        };
+
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        assert!(!yaml.contains("configured_providers:"));
+        assert!(!yaml.contains("custom_providers:"));
+        assert!(!yaml.contains("mcp:"));
+        assert!(!yaml.contains("plugins:"));
+        assert!(!yaml.contains("lsp:"));
+    }
+
+    #[test]
+    fn malformed_user_config_is_reported_without_replacement() {
+        let root = temp_dir("malformed-user-config");
+        let paths = GlintPaths::from_home(&root);
+        fs::create_dir_all(paths.root()).unwrap();
+        fs::write(paths.config(), "llm: [broken\n").unwrap();
+        let store = UserConfigStore::new(paths.clone());
+
+        let error = store.load().unwrap_err();
+
+        assert!(format!("{error:#}").contains(&paths.config().display().to_string()));
+        assert_eq!(
+            fs::read_to_string(paths.config()).unwrap(),
+            "llm: [broken\n"
+        );
+    }
+
+    #[test]
+    fn user_config_round_trips_extension_sections_when_model_changes() {
+        let root = temp_dir("user-config-extensions");
+        let paths = GlintPaths::from_home(&root);
+        fs::create_dir_all(paths.root()).unwrap();
+        fs::write(
+            paths.config(),
+            r#"
+version: 1
+llm:
+  provider: deepseek
+  model: deepseek-v4-flash
+  temperature: 0.7
+  max_tokens: 8196
+mcp:
+  servers:
+    docs:
+      command: docs-mcp
+plugins:
+  enabled:
+    - example
+lsp:
+  servers:
+    rust:
+      command: rust-analyzer
+"#,
+        )
+        .unwrap();
+        let store = UserConfigStore::new(paths);
+        let mut config = store.load().unwrap().unwrap();
+        let mcp = config.mcp.clone();
+        let plugins = config.plugins.clone();
+        let lsp = config.lsp.clone();
+
+        config.llm.as_mut().unwrap().model = "deepseek-v4-pro".into();
+        store.save(&config).unwrap();
+        let saved = store.load().unwrap().unwrap();
+
+        assert_eq!(saved.llm.unwrap().model, "deepseek-v4-pro");
+        assert_eq!(saved.mcp, mcp);
+        assert_eq!(saved.plugins, plugins);
+        assert_eq!(saved.lsp, lsp);
+    }
+
+    #[test]
+    fn user_config_keeps_existing_file_when_atomic_writer_fails() {
+        let root = temp_dir("atomic-user-config");
+        let paths = GlintPaths::from_home(&root);
+        fs::create_dir_all(paths.root()).unwrap();
+        let original = b"version: 1\n";
+        fs::write(paths.config(), original).unwrap();
+        let store = UserConfigStore::with_writer(paths.clone(), Arc::new(FailingWriter));
+
+        let error = store.save(&UserConfig::default()).unwrap_err();
+
+        assert!(format!("{error:#}").contains("simulated atomic write failure"));
+        assert_eq!(fs::read(paths.config()).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_config_first_save_uses_private_directory_and_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("private-user-config");
+        let paths = GlintPaths::from_home(&root);
+        let store = UserConfigStore::new(paths.clone());
+
+        store.save(&UserConfig::default()).unwrap();
+
+        assert_eq!(
+            fs::metadata(paths.root()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(paths.config()).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_config_save_preserves_existing_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir("existing-user-config-permissions");
+        let paths = GlintPaths::from_home(&root);
+        fs::create_dir_all(paths.root()).unwrap();
+        fs::write(paths.config(), "version: 1\n").unwrap();
+        fs::set_permissions(paths.config(), fs::Permissions::from_mode(0o640)).unwrap();
+        let store = UserConfigStore::new(paths.clone());
+
+        store.save(&UserConfig::default()).unwrap();
+
+        assert_eq!(
+            fs::metadata(paths.config()).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    struct FailingWriter;
+
+    impl AtomicFileWriter for FailingWriter {
+        fn write(&self, _path: &Path, _bytes: &[u8], _unix_mode: u32) -> Result<()> {
+            bail!("simulated atomic write failure")
+        }
+    }
 
     #[test]
     fn resolve_config_path_honors_documented_precedence() {
