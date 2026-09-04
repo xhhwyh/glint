@@ -3,7 +3,8 @@ use std::fmt;
 use anyhow::Result;
 
 use crate::{
-    configuration::{ConfigurationManager, ProviderStatus},
+    configuration::{ConfigurationManager, ConfigurationMutationErrorKind, ProviderStatus},
+    credentials::CredentialStoreStatus,
     event::KeyAction,
     input::InputState,
     provider_catalog::ProviderCatalog,
@@ -13,14 +14,18 @@ use crate::{
 pub struct SetupState {
     pub screen: SetupScreen,
     pub error: Option<String>,
+    pub notice: Option<String>,
     catalog: ProviderCatalog,
 }
+
+const DEGRADED_CREDENTIAL_REPAIR_NOTICE: &str = "The system credential store is unavailable.\nRe-enter an API key to repair this provider.\nGlint will switch to its protected auth.json file.";
 
 impl SetupState {
     pub fn welcome(catalog: &ProviderCatalog) -> Self {
         Self {
             screen: SetupScreen::Welcome(WelcomeState::default()),
             error: None,
+            notice: None,
             catalog: catalog.clone(),
         }
     }
@@ -39,6 +44,7 @@ impl SetupState {
         Self {
             screen: SetupScreen::Custom(CustomProviderForm::new_with_list(list)),
             error: None,
+            notice: None,
             catalog,
         }
     }
@@ -51,6 +57,7 @@ impl SetupState {
             return Self {
                 screen: SetupScreen::Providers(list),
                 error: Some(format!("Built-in provider '{provider_id}' is not defined.")),
+                notice: None,
                 catalog,
             };
         };
@@ -66,6 +73,7 @@ impl SetupState {
                 list,
             )),
             error: None,
+            notice: None,
             catalog,
         }
     }
@@ -183,7 +191,10 @@ impl SetupState {
                     None
                 }
                 FormAction::Save => Some(SetupEffect::SaveCustom {
-                    name: form.name.value.clone(),
+                    name: form
+                        .existing_identity
+                        .clone()
+                        .unwrap_or_else(|| form.name.value.clone()),
                     base_url: form.base_url.value.clone(),
                     api_key: nonblank_input(&form.api_key),
                     models: form
@@ -232,6 +243,12 @@ impl SetupState {
             &statuses,
             available_models > 0,
         ));
+        self.notice = match manager.credential_store_status() {
+            CredentialStoreStatus::Ready => None,
+            CredentialStoreStatus::KeyringUnavailable { .. } => {
+                Some(DEGRADED_CREDENTIAL_REPAIR_NOTICE.to_owned())
+            }
+        };
         Ok(())
     }
 }
@@ -242,6 +259,7 @@ impl fmt::Debug for SetupState {
             .debug_struct("SetupState")
             .field("screen", &self.screen)
             .field("error", &self.error)
+            .field("notice", &self.notice)
             .finish_non_exhaustive()
     }
 }
@@ -547,6 +565,7 @@ pub struct CustomProviderForm {
     pub api_key: InputState,
     pub models: Vec<InputState>,
     pub focus: CustomFocus,
+    existing_identity: Option<String>,
     list: Box<ProviderListState>,
 }
 
@@ -565,6 +584,7 @@ impl CustomProviderForm {
             api_key: InputState::default(),
             models: vec![InputState::default()],
             focus: CustomFocus::Name,
+            existing_identity: None,
             list: Box::new(list),
         }
     }
@@ -576,7 +596,7 @@ impl CustomProviderForm {
         list: ProviderListState,
     ) -> Self {
         let mut form = Self::new_with_list(list);
-        form.name.set(name);
+        form.name.set(name.clone());
         form.base_url.set(base_url);
         form.models = models
             .into_iter()
@@ -589,7 +609,13 @@ impl CustomProviderForm {
         if form.models.is_empty() {
             form.models.push(InputState::default());
         }
+        form.existing_identity = Some(name);
+        form.focus = CustomFocus::BaseUrl;
         form
+    }
+
+    pub fn name_is_read_only(&self) -> bool {
+        self.existing_identity.is_some()
     }
 
     pub fn add_model_row(&mut self) {
@@ -607,10 +633,18 @@ impl CustomProviderForm {
         }
         self.models.remove(index);
         self.focus = match self.focus {
-            CustomFocus::Model(current) if current >= self.models.len() => {
+            CustomFocus::Model(current) | CustomFocus::DeleteModel(current)
+                if current >= self.models.len() =>
+            {
                 CustomFocus::Model(self.models.len() - 1)
             }
             CustomFocus::Model(current) if current > index => CustomFocus::Model(current - 1),
+            CustomFocus::DeleteModel(current) if current > index => {
+                CustomFocus::DeleteModel(current - 1)
+            }
+            CustomFocus::DeleteModel(current) if current == index => {
+                CustomFocus::Model(index.min(self.models.len() - 1))
+            }
             focus => focus,
         };
     }
@@ -619,11 +653,15 @@ impl CustomProviderForm {
         match action {
             KeyAction::Escape => FormAction::Cancel,
             KeyAction::Tab | KeyAction::Down => {
-                self.focus = self.focus.next(self.models.len());
+                self.focus = self
+                    .focus
+                    .next(self.models.len(), !self.name_is_read_only());
                 FormAction::None
             }
             KeyAction::Up => {
-                self.focus = self.focus.previous(self.models.len());
+                self.focus = self
+                    .focus
+                    .previous(self.models.len(), !self.name_is_read_only());
                 FormAction::None
             }
             KeyAction::Submit if self.focus == CustomFocus::AddModel => {
@@ -631,10 +669,21 @@ impl CustomProviderForm {
                 self.focus = CustomFocus::Model(self.models.len() - 1);
                 FormAction::None
             }
+            KeyAction::Submit | KeyAction::Delete
+                if matches!(self.focus, CustomFocus::DeleteModel(_)) =>
+            {
+                let CustomFocus::DeleteModel(index) = self.focus else {
+                    unreachable!();
+                };
+                self.delete_model_row(index);
+                FormAction::None
+            }
             KeyAction::Submit if self.focus == CustomFocus::Save => FormAction::Save,
             KeyAction::Submit if self.focus == CustomFocus::Cancel => FormAction::Cancel,
             KeyAction::Submit => {
-                self.focus = self.focus.next(self.models.len());
+                self.focus = self
+                    .focus
+                    .next(self.models.len(), !self.name_is_read_only());
                 FormAction::None
             }
             _ => {
@@ -647,7 +696,10 @@ impl CustomProviderForm {
                             edit_input(model, action);
                         }
                     }
-                    CustomFocus::AddModel | CustomFocus::Save | CustomFocus::Cancel => {}
+                    CustomFocus::DeleteModel(_)
+                    | CustomFocus::AddModel
+                    | CustomFocus::Save
+                    | CustomFocus::Cancel => {}
                 }
                 FormAction::None
             }
@@ -674,33 +726,38 @@ pub enum CustomFocus {
     BaseUrl,
     ApiKey,
     Model(usize),
+    DeleteModel(usize),
     AddModel,
     Save,
     Cancel,
 }
 
 impl CustomFocus {
-    fn next(self, models: usize) -> Self {
+    fn next(self, models: usize, name_editable: bool) -> Self {
         match self {
             Self::Name => Self::BaseUrl,
             Self::BaseUrl => Self::ApiKey,
             Self::ApiKey => Self::Model(0),
-            Self::Model(index) if index + 1 < models => Self::Model(index + 1),
-            Self::Model(_) => Self::AddModel,
+            Self::Model(index) => Self::DeleteModel(index),
+            Self::DeleteModel(index) if index + 1 < models => Self::Model(index + 1),
+            Self::DeleteModel(_) => Self::AddModel,
             Self::AddModel => Self::Save,
             Self::Save => Self::Cancel,
-            Self::Cancel => Self::Name,
+            Self::Cancel if name_editable => Self::Name,
+            Self::Cancel => Self::BaseUrl,
         }
     }
 
-    fn previous(self, models: usize) -> Self {
+    fn previous(self, models: usize, name_editable: bool) -> Self {
         match self {
             Self::Name => Self::Cancel,
-            Self::BaseUrl => Self::Name,
+            Self::BaseUrl if name_editable => Self::Name,
+            Self::BaseUrl => Self::Cancel,
             Self::ApiKey => Self::BaseUrl,
             Self::Model(0) => Self::ApiKey,
-            Self::Model(index) => Self::Model(index - 1),
-            Self::AddModel => Self::Model(models.saturating_sub(1)),
+            Self::Model(index) => Self::DeleteModel(index - 1),
+            Self::DeleteModel(index) => Self::Model(index),
+            Self::AddModel => Self::DeleteModel(models.saturating_sub(1)),
             Self::Save => Self::AddModel,
             Self::Cancel => Self::Save,
         }
@@ -816,7 +873,18 @@ pub fn apply_setup_effect(
         } => manager.save_custom(&name, &base_url, api_key.as_deref(), models),
         SetupEffect::DeleteProvider { provider_id } => manager.delete_provider(&provider_id),
         SetupEffect::StartGlint => {
-            if manager.available_providers()?.is_empty() {
+            let providers = match manager.available_providers() {
+                Ok(providers) => providers,
+                Err(_) => {
+                    state.error = Some(
+                        ConfigurationMutationErrorKind::CredentialUnavailable
+                            .user_message()
+                            .to_owned(),
+                    );
+                    return Ok(None);
+                }
+            };
+            if providers.is_empty() {
                 state.error = Some("Configure at least one model before starting Glint.".into());
                 return Ok(None);
             }
@@ -825,16 +893,16 @@ pub fn apply_setup_effect(
         SetupEffect::Exit => return Ok(Some(SetupOutcome::Exit)),
     };
 
-    if result.is_err() {
-        state.error = Some(
-            "Unable to save provider configuration. Please review the form and try again.".into(),
-        );
+    if let Err(error) = result {
+        state.error = Some(error.user_message().to_owned());
         return Ok(None);
     }
 
     if state.refresh_provider_list(manager).is_err() {
         state.error = Some(
-            "Unable to save provider configuration. Please review the form and try again.".into(),
+            ConfigurationMutationErrorKind::CredentialUnavailable
+                .user_message()
+                .to_owned(),
         );
         return Ok(None);
     }
@@ -872,7 +940,7 @@ mod tests {
     use crate::{
         config::UserConfig,
         configuration::ConfigurationManager,
-        credentials::{CredentialId, CredentialStore},
+        credentials::{CredentialId, CredentialStore, CredentialStoreStatus},
         event::KeyAction,
         paths::GlintPaths,
         persistence::UserConfigRepository,
@@ -925,6 +993,41 @@ mod tests {
     }
 
     #[test]
+    fn submit_on_keyboard_reachable_delete_target_clears_the_last_model_row() {
+        let mut state = SetupState::custom_provider(test_catalog());
+        state.custom_form_mut().unwrap().models[0].set("only-model");
+
+        for _ in 0..4 {
+            state.update(KeyAction::Tab);
+        }
+        state.update(KeyAction::Submit);
+
+        let form = state.custom_form_mut().expect("custom form remains open");
+        assert_eq!(form.models.len(), 1);
+        assert_eq!(form.models[0].value, "");
+        assert_eq!(form.focus, CustomFocus::Model(0));
+    }
+
+    #[test]
+    fn delete_key_on_keyboard_reachable_delete_target_removes_that_model_row() {
+        let mut state = SetupState::custom_provider(test_catalog());
+        let form = state.custom_form_mut().unwrap();
+        form.models[0].set("first");
+        form.add_model_row();
+        form.models[1].set("second");
+
+        for _ in 0..4 {
+            state.update(KeyAction::Tab);
+        }
+        state.update(KeyAction::Delete);
+
+        let form = state.custom_form_mut().expect("custom form remains open");
+        assert_eq!(form.models.len(), 1);
+        assert_eq!(form.models[0].value, "second");
+        assert_eq!(form.focus, CustomFocus::Model(0));
+    }
+
+    #[test]
     fn cancel_custom_form_emits_no_persistence_effect() {
         let mut state = SetupState::custom_provider(test_catalog());
 
@@ -956,6 +1059,60 @@ mod tests {
     }
 
     #[test]
+    fn existing_custom_provider_keeps_identity_read_only_through_navigation_and_save() {
+        let fixture = ManagerFixture::new();
+        let mut manager = fixture.manager();
+        manager
+            .save_custom(
+                "Gateway",
+                "https://old.example/v1",
+                Some("old-secret"),
+                vec!["model".into()],
+            )
+            .unwrap();
+        let mut state = SetupState::provider_list(&test_catalog(), &manager).unwrap();
+        let custom_index = match &state.screen {
+            SetupScreen::Providers(list) => list
+                .rows
+                .iter()
+                .position(|row| row.provider_id() == Some("Gateway"))
+                .unwrap(),
+            _ => unreachable!(),
+        };
+        for _ in 0..custom_index {
+            state.update(KeyAction::Down);
+        }
+        state.update(KeyAction::Submit);
+
+        let form = state.custom_form_mut().expect("custom form");
+        assert_eq!(form.name.value, "Gateway");
+        assert_eq!(form.focus, CustomFocus::BaseUrl);
+
+        state.update(KeyAction::Char('x'));
+        for _ in 0..5 {
+            state.update(KeyAction::Tab);
+        }
+        let effect = state.update(KeyAction::Submit).expect("save effect");
+        assert!(matches!(
+            &effect,
+            SetupEffect::SaveCustom { name, .. } if name == "Gateway"
+        ));
+        apply_setup_effect(&mut manager, &mut state, effect).unwrap();
+
+        assert_eq!(manager.user_config().custom_providers.len(), 1);
+        assert!(
+            manager
+                .user_config()
+                .custom_providers
+                .contains_key("Gateway")
+        );
+        assert_eq!(
+            manager.user_config().custom_providers["Gateway"].base_url,
+            "https://old.example/v1x"
+        );
+    }
+
+    #[test]
     fn setup_debug_output_redacts_api_keys() {
         let mut state = SetupState::custom_provider(test_catalog());
         let form = state.custom_form_mut().expect("custom form");
@@ -980,7 +1137,7 @@ mod tests {
 
     #[test]
     fn failed_save_preserves_the_custom_draft_focus_and_redacts_error() {
-        let mut fixture = ManagerFixture::new();
+        let fixture = ManagerFixture::new();
         fixture.repository.fail_saves();
         let mut manager = fixture.manager();
         let mut state = SetupState::custom_provider(test_catalog());
@@ -1015,6 +1172,149 @@ mod tests {
     }
 
     #[test]
+    fn custom_validation_errors_are_actionable_and_distinct() {
+        let cases = [
+            (
+                "",
+                "https://llm.example/v1",
+                vec!["model".into()],
+                "Enter a provider name.",
+            ),
+            (
+                "   ",
+                "https://llm.example/v1",
+                vec!["model".into()],
+                "Enter a provider name.",
+            ),
+            (
+                "DeepSeek",
+                "https://llm.example/v1",
+                vec!["model".into()],
+                "Choose a unique provider name; it matches an existing provider.",
+            ),
+            (
+                "Gateway",
+                "not a URL",
+                vec!["model".into()],
+                "Enter a valid HTTP or HTTPS base URL.",
+            ),
+            (
+                "Gateway",
+                "https://llm.example/v1",
+                vec![" ".into()],
+                "Enter at least one model name.",
+            ),
+            (
+                "Gateway",
+                "https://llm.example/v1",
+                vec!["model".into(), "model".into()],
+                "Model names must be unique.",
+            ),
+        ];
+
+        for (name, base_url, models, expected) in cases {
+            let fixture = ManagerFixture::new();
+            let mut manager = fixture.manager();
+            let mut state = SetupState::custom_provider(test_catalog());
+            let form = state.custom_form_mut().unwrap();
+            form.name.set(name);
+            form.base_url.set(base_url);
+            form.models[0].set("draft-model");
+            form.focus = CustomFocus::Model(0);
+
+            apply_setup_effect(
+                &mut manager,
+                &mut state,
+                SetupEffect::SaveCustom {
+                    name: name.into(),
+                    base_url: base_url.into(),
+                    api_key: Some("sentinel-secret".into()),
+                    models,
+                },
+            )
+            .unwrap();
+
+            assert_eq!(state.error.as_deref(), Some(expected));
+            let form = state.custom_form_mut().expect("draft remains visible");
+            assert_eq!(form.focus, CustomFocus::Model(0));
+            assert_eq!(form.api_key.value, "");
+            assert!(!state.error.as_deref().unwrap().contains("sentinel-secret"));
+        }
+    }
+
+    #[test]
+    fn credential_and_filesystem_failures_have_safe_actionable_messages() {
+        let credential_fixture = ManagerFixture::new();
+        credential_fixture.credentials.fail_get_after(0);
+        let mut credential_manager = credential_fixture.manager();
+        let mut credential_state = SetupState::builtin(test_catalog(), "deepseek");
+        let form = credential_state.builtin_form_mut().unwrap();
+        form.api_key.set("sentinel-secret");
+        form.focus = BuiltinFocus::Save;
+
+        apply_setup_effect(
+            &mut credential_manager,
+            &mut credential_state,
+            SetupEffect::SaveBuiltin {
+                provider_id: "deepseek".into(),
+                api_key: Some("sentinel-secret".into()),
+            },
+        )
+        .unwrap();
+
+        let credential_error = credential_state.error.as_deref().unwrap();
+        assert!(credential_error.contains("Credential storage is unavailable"));
+        assert!(!credential_error.contains("sentinel-secret"));
+        let form = credential_state.builtin_form_mut().unwrap();
+        assert_eq!(form.api_key.value, "sentinel-secret");
+        assert_eq!(form.focus, BuiltinFocus::Save);
+
+        let persistence_fixture = ManagerFixture::new();
+        persistence_fixture.repository.fail_saves();
+        let mut persistence_manager = persistence_fixture.manager();
+        let mut persistence_state = SetupState::builtin(test_catalog(), "deepseek");
+        let form = persistence_state.builtin_form_mut().unwrap();
+        form.api_key.set("sentinel-secret");
+        form.focus = BuiltinFocus::Save;
+
+        apply_setup_effect(
+            &mut persistence_manager,
+            &mut persistence_state,
+            SetupEffect::SaveBuiltin {
+                provider_id: "deepseek".into(),
+                api_key: Some("sentinel-secret".into()),
+            },
+        )
+        .unwrap();
+
+        let persistence_error = persistence_state.error.as_deref().unwrap();
+        assert!(persistence_error.contains("Check that ~/.glint is writable"));
+        assert!(!persistence_error.contains("sentinel-secret"));
+        let form = persistence_state.builtin_form_mut().unwrap();
+        assert_eq!(form.api_key.value, "sentinel-secret");
+        assert_eq!(form.focus, BuiltinFocus::Save);
+    }
+
+    #[test]
+    fn provider_setup_exposes_safe_degraded_credential_repair_notice() {
+        let fixture = ManagerFixture::new();
+        let mut user = UserConfig::default();
+        user.configured_providers.push("deepseek".into());
+        fixture.repository.replace(user);
+        fixture.credentials.mark_keyring_unavailable();
+        let manager = fixture.manager();
+
+        let state = SetupState::provider_list(&test_catalog(), &manager).unwrap();
+
+        let notice = state.notice.as_deref().expect("degraded-store notice");
+        assert_eq!(
+            notice,
+            "The system credential store is unavailable.\nRe-enter an API key to repair this provider.\nGlint will switch to its protected auth.json file."
+        );
+        assert!(!notice.contains("sentinel-secret"));
+    }
+
+    #[test]
     fn refresh_failure_after_a_successful_save_stays_redacted_and_keeps_the_form() {
         let fixture = ManagerFixture::new();
         fixture.credentials.fail_get_after(2);
@@ -1040,12 +1340,13 @@ mod tests {
         assert_eq!(form.api_key.value, "secret-value");
         assert_eq!(form.focus, BuiltinFocus::Save);
         assert!(
-            !state
+            state
                 .error
                 .as_deref()
                 .expect("redacted refresh error")
-                .contains("secret-value")
+                .contains("Credential storage is unavailable")
         );
+        assert!(!state.error.as_deref().unwrap().contains("secret-value"));
     }
 
     #[test]
@@ -1145,6 +1446,10 @@ mod tests {
     }
 
     impl MemoryUserConfigStore {
+        fn replace(&self, config: UserConfig) {
+            *self.config.lock().expect("config lock") = Some(config);
+        }
+
         fn fail_saves(&self) {
             *self.fail_save.lock().expect("save lock") = true;
         }
@@ -1173,11 +1478,16 @@ mod tests {
         values: Arc<Mutex<BTreeMap<String, String>>>,
         get_calls: Arc<std::sync::atomic::AtomicUsize>,
         fail_get_after: Arc<Mutex<Option<usize>>>,
+        keyring_unavailable: Arc<Mutex<bool>>,
     }
 
     impl MemoryCredentialStore {
         fn fail_get_after(&self, successful_gets: usize) {
             *self.fail_get_after.lock().expect("failure lock") = Some(successful_gets);
+        }
+
+        fn mark_keyring_unavailable(&self) {
+            *self.keyring_unavailable.lock().expect("status lock") = true;
         }
     }
 
@@ -1217,6 +1527,16 @@ mod tests {
                 .expect("credentials lock")
                 .remove(id.as_str());
             Ok(())
+        }
+
+        fn status(&self) -> CredentialStoreStatus {
+            if *self.keyring_unavailable.lock().expect("status lock") {
+                CredentialStoreStatus::KeyringUnavailable {
+                    diagnostic: "safe status; backend details sentinel-secret".into(),
+                }
+            } else {
+                CredentialStoreStatus::Ready
+            }
         }
     }
 }

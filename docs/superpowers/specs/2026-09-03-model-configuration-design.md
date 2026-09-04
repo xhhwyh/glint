@@ -145,7 +145,7 @@ A new custom provider form contains:
 - masked API key
 - model-name rows
 
-The model section initially contains one plain input box. It does not display labels such as `Model ID 1`. A delete icon appears at the far right of the same row. `Add model` appends another identical row below it. The form always retains at least one row; deleting the last row clears it. Saving requires at least one non-empty model name, trims whitespace, preserves entry order, and removes exact duplicates.
+The model section initially contains one plain input box. It does not display labels such as `Model ID 1`. A keyboard-focusable delete icon appears at the far right of the same row. `Add model` appends another identical row below it. The form always retains at least one row; deleting the last row clears it. Saving requires at least one non-empty model name, trims whitespace, preserves entry order, and reports exact duplicates for correction.
 
 Selecting an existing custom provider from `Add model` reuses its name, URL, and credential. The user can append or remove model rows, update the URL, or replace the API key. Removing every model is not a substitute for deleting a provider and is rejected; provider deletion is a separate confirmed action.
 
@@ -206,7 +206,7 @@ Implementation follows test-driven development. Coverage includes:
 
 - embedded catalog parsing, required defaults, model metadata, and invalid-catalog rejection
 - user YAML defaults, version validation, omission of empty optional sections, and atomic replacement behavior
-- built-in/custom name collisions, URL validation, model trimming, stable ordering, and de-duplication
+- built-in/custom name collisions, URL validation, model trimming, stable ordering, and duplicate-model rejection
 - a replaceable in-memory credential store plus keyring/file backend behavior and protected Unix permissions
 - available-model computation, missing-credential repair, first-provider selection, invalid-current-model repair, and last-model removal
 - setup reducers for welcome, provider list, built-in save, custom save, cancellation, errors, and deletion confirmation

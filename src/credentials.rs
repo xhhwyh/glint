@@ -16,6 +16,8 @@ use crate::{
 const KEYRING_SERVICE: &str = "glint";
 const KEYRING_PROBE_ID: &str = "glint-probe";
 const KEYRING_UNAVAILABLE_DIAGNOSTIC: &str = "The system credential store is unavailable. Saving an API key will use Glint's private auth.json file.";
+const KEYRING_UNAVAILABLE_DELETE_ERROR: &str =
+    "The system credential store is unavailable. Provider configuration was not changed.";
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CredentialId(String);
@@ -235,7 +237,7 @@ impl CredentialStore for DeferredFileCredentialStore {
             .lock()
             .expect("credential backend mutex poisoned")
         {
-            DeferredState::Unavailable(_) => Ok(()),
+            DeferredState::Unavailable(_) => Err(anyhow!(KEYRING_UNAVAILABLE_DELETE_ERROR)),
             DeferredState::Ready(store) => store.delete(id),
         }
     }
@@ -312,8 +314,12 @@ mod tests {
 
     use super::*;
     use crate::{
+        config::{UserConfig, UserLlmConfig},
+        configuration::{ConfigurationManager, ConfigurationMutationErrorKind},
         paths::GlintPaths,
+        persistence::UserConfigStore,
         persistence::{AtomicFileWriter, FsAtomicFileWriter},
+        provider_catalog::ProviderCatalog,
     };
 
     #[test]
@@ -499,6 +505,63 @@ mod tests {
         assert_eq!(store.status(), CredentialStoreStatus::Ready);
         assert_eq!(store.get(&id).unwrap().as_deref(), Some("file-secret"));
         assert!(paths.auth().exists());
+    }
+
+    #[test]
+    fn configured_install_rejects_delete_while_keyring_is_unavailable() {
+        let paths = GlintPaths::from_home(temp_root("deferred-delete"));
+        let factory = FakeFactory::unavailable();
+        let id = CredentialId::builtin("deepseek");
+        let store = open_with_factory(&paths, true, &factory).unwrap();
+
+        let error = store.delete(&id).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "The system credential store is unavailable. Provider configuration was not changed."
+        );
+        assert!(!error.to_string().contains(id.as_str()));
+        assert!(!paths.auth().exists());
+        assert!(matches!(
+            store.status(),
+            CredentialStoreStatus::KeyringUnavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn deferred_delete_failure_preserves_manager_and_yaml_configuration() {
+        let home = temp_root("deferred-manager-delete");
+        let paths = GlintPaths::from_home(&home);
+        let repository = UserConfigStore::new(paths.clone());
+        let mut user = UserConfig::default();
+        user.configured_providers.push("deepseek".into());
+        user.llm = Some(UserLlmConfig {
+            provider: "deepseek".into(),
+            model: "deepseek-v4-flash".into(),
+            temperature: 0.7,
+            max_tokens: 8196,
+        });
+        repository.save(&user).unwrap();
+        let store = open_with_factory(&paths, true, &FakeFactory::unavailable()).unwrap();
+        let mut manager = ConfigurationManager::new(
+            paths.clone(),
+            PathBuf::from("/workspace"),
+            ProviderCatalog::embedded().unwrap(),
+            Box::new(UserConfigStore::new(paths.clone())),
+            store,
+        )
+        .unwrap();
+
+        let error = manager.delete_provider("deepseek").unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ConfigurationMutationErrorKind::CredentialUnavailable
+        );
+        assert_eq!(manager.user_config(), &user);
+        assert_eq!(repository.load().unwrap(), Some(user));
+        assert!(!paths.auth().exists());
+        fs::remove_dir_all(home).ok();
     }
 
     #[test]

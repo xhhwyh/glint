@@ -17,7 +17,7 @@ use crate::{
 };
 
 use super::{
-    layout::{box_body_styled, box_bottom, box_input_body_line, box_top, truncate_end_to_width},
+    layout::{box_body_styled, box_bottom, box_input_body_line, box_top, wrap_text},
     star,
     theme::{
         ACCENT_COLOR, BG_COLOR, BORDER_BRIGHT_COLOR, MUTED_TEXT_COLOR, SOFT_TEXT_COLOR, TEXT_COLOR,
@@ -91,18 +91,28 @@ fn screen_lines(state: &SetupState, width: u16) -> (Vec<Line<'static>>, Option<(
         SetupScreen::ConfirmDelete(confirm) => confirm_delete_lines(width, confirm),
     };
 
-    if let Some(error) = &state.error {
-        lines.insert(
-            1.min(lines.len()),
-            box_body_styled(
-                &truncate_end_to_width(error, width.saturating_sub(4) as usize),
-                width,
-                Style::default().fg(BORDER_BRIGHT_COLOR),
-            ),
-        );
-        cursor = cursor.map(|(x, y)| (x, y + 1));
+    let mut inserted = 0_u16;
+    if let Some(notice) = &state.notice {
+        let notice_lines = wrapped_message_lines(notice, width, Style::default().fg(ACCENT_COLOR));
+        inserted += u16::try_from(notice_lines.len()).unwrap_or(u16::MAX);
+        lines.splice(1.min(lines.len())..1.min(lines.len()), notice_lines);
     }
+    if let Some(error) = &state.error {
+        let error_lines =
+            wrapped_message_lines(error, width, Style::default().fg(BORDER_BRIGHT_COLOR));
+        let error_index = usize::from(1 + inserted).min(lines.len());
+        inserted += u16::try_from(error_lines.len()).unwrap_or(u16::MAX);
+        lines.splice(error_index..error_index, error_lines);
+    }
+    cursor = cursor.map(|(x, y)| (x, y + inserted));
     (lines, cursor)
+}
+
+fn wrapped_message_lines(text: &str, width: u16, style: Style) -> Vec<Line<'static>> {
+    wrap_text(text, width.saturating_sub(4))
+        .into_iter()
+        .map(|line| box_body_styled(&line, width, style))
+        .collect()
 }
 
 fn welcome_lines(width: u16, focus: WelcomeFocus) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
@@ -200,7 +210,15 @@ fn custom_lines(
     let mut lines = vec![box_top("Custom provider", width)];
     let mut cursor = None;
     for (label, input, focus) in [
-        ("Name", &form.name, form.focus == CustomFocus::Name),
+        (
+            if form.name_is_read_only() {
+                "Name (read-only)"
+            } else {
+                "Name"
+            },
+            &form.name,
+            form.focus == CustomFocus::Name,
+        ),
         (
             "Base URL",
             &form.base_url,
@@ -222,10 +240,11 @@ fn custom_lines(
     ));
     for (index, model) in form.models.iter().enumerate() {
         let y = lines.len() as u16;
-        let focused = form.focus == CustomFocus::Model(index);
-        let (line, x) = custom_model_line(model, width, focused);
+        let input_focused = form.focus == CustomFocus::Model(index);
+        let delete_focused = form.focus == CustomFocus::DeleteModel(index);
+        let (line, x) = custom_model_line(model, width, input_focused, delete_focused);
         lines.push(line);
-        if focused {
+        if input_focused {
             cursor = Some((x, y));
         }
     }
@@ -308,14 +327,26 @@ fn input_line(
     )
 }
 
-fn custom_model_line(input: &InputState, width: u16, focused: bool) -> (Line<'static>, u16) {
+fn custom_model_line(
+    input: &InputState,
+    width: u16,
+    input_focused: bool,
+    delete_focused: bool,
+) -> (Line<'static>, u16) {
     let body_width = width.saturating_sub(4) as usize;
     let available = body_width.saturating_sub(1);
     let (visible, cursor_column) = clipped_input(input, available, false);
-    let style = if focused {
+    let style = if input_focused {
         Style::default().fg(TEXT_COLOR).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(SOFT_TEXT_COLOR)
+    };
+    let delete_style = if delete_focused {
+        Style::default()
+            .fg(ACCENT_COLOR)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(MUTED_TEXT_COLOR)
     };
     let line = box_input_body_line(
         Line::from(vec![
@@ -323,7 +354,7 @@ fn custom_model_line(input: &InputState, width: u16, focused: bool) -> (Line<'st
             Span::raw(
                 " ".repeat(available.saturating_sub(input_visible_width(input, available, false))),
             ),
-            Span::styled("×", Style::default().fg(MUTED_TEXT_COLOR)),
+            Span::styled("×", delete_style),
         ]),
         width,
     );
@@ -374,9 +405,18 @@ fn clipped_input(input: &InputState, width: usize, masked: bool) -> (String, usi
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
-    use crate::{provider_catalog::ProviderCatalog, setup::SetupState};
+    use crate::{
+        configuration::ConfigurationManager,
+        credentials::FileCredentialStore,
+        paths::GlintPaths,
+        persistence::UserConfigStore,
+        provider_catalog::ProviderCatalog,
+        setup::{SetupScreen, SetupState},
+    };
 
     use super::{panel_area, render, screen_lines};
 
@@ -434,6 +474,40 @@ mod tests {
     }
 
     #[test]
+    fn custom_model_delete_icon_visibly_renders_keyboard_focus() {
+        let mut state = SetupState::custom_provider(test_catalog());
+        for _ in 0..4 {
+            state.update(crate::event::KeyAction::Tab);
+        }
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let catalog = test_catalog();
+        terminal
+            .draw(|frame| render(frame, &state, &catalog))
+            .unwrap();
+
+        let panel = panel_area(Rect::new(0, 0, 100, 30));
+        let icon = terminal
+            .backend()
+            .buffer()
+            .cell((panel.x + panel.width - 3, panel.y + 5))
+            .unwrap();
+        assert_eq!(icon.symbol(), "×");
+        assert_eq!(icon.fg, super::ACCENT_COLOR);
+        assert!(icon.modifier.contains(ratatui::style::Modifier::BOLD));
+    }
+
+    #[test]
+    fn existing_custom_provider_renders_name_as_read_only_and_focuses_base_url() {
+        let state = existing_custom_provider_state();
+        let rendered = render_setup(&state, 100, 30);
+        let (_, cursor) = screen_lines(&state, 100);
+
+        assert!(rendered.contains("Name (read-only): Gateway"));
+        assert_eq!(cursor.map(|(_, y)| y), Some(2));
+    }
+
+    #[test]
     fn form_error_keeps_the_cursor_on_its_shifted_input_row() {
         let mut state = SetupState::builtin(test_catalog(), "deepseek");
         state.error = Some("Unable to save provider configuration.".into());
@@ -441,6 +515,21 @@ mod tests {
         let (_, cursor) = screen_lines(&state, 70);
 
         assert_eq!(cursor.map(|(_, y)| y), Some(2));
+    }
+
+    #[test]
+    fn degraded_credential_notice_renders_separately_from_form_errors() {
+        let mut state = SetupState::builtin(test_catalog(), "deepseek");
+        state.notice = Some(
+            "The system credential store is unavailable.\nRe-enter an API key to repair this provider.\nGlint will switch to its protected auth.json file.".into(),
+        );
+        state.error = Some("Enter an API key for this provider.".into());
+
+        let rendered = render_setup(&state, 100, 30);
+
+        assert!(rendered.contains("system credential store is unavailable"));
+        assert!(rendered.contains("protected auth.json file."), "{rendered}");
+        assert!(rendered.contains("Enter an API key for this provider."));
     }
 
     fn test_catalog() -> ProviderCatalog {
@@ -461,5 +550,45 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    fn existing_custom_provider_state() -> SetupState {
+        let home = std::env::temp_dir().join(format!(
+            "glint-setup-render-existing-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = GlintPaths::from_home(&home);
+        let catalog = test_catalog();
+        let mut manager = ConfigurationManager::new(
+            paths.clone(),
+            PathBuf::from("/workspace"),
+            catalog.clone(),
+            Box::new(UserConfigStore::new(paths.clone())),
+            Box::new(FileCredentialStore::new(paths.auth())),
+        )
+        .unwrap();
+        manager
+            .save_custom(
+                "Gateway",
+                "https://old.example/v1",
+                Some("secret"),
+                vec!["model".into()],
+            )
+            .unwrap();
+        let mut state = SetupState::provider_list(&catalog, &manager).unwrap();
+        let custom_index = match &state.screen {
+            SetupScreen::Providers(list) => list
+                .rows
+                .iter()
+                .position(|row| row.provider_id() == Some("Gateway"))
+                .unwrap(),
+            _ => unreachable!(),
+        };
+        for _ in 0..custom_index {
+            state.update(crate::event::KeyAction::Down);
+        }
+        state.update(crate::event::KeyAction::Submit);
+        std::fs::remove_dir_all(home).ok();
+        state
     }
 }

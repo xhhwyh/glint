@@ -69,6 +69,7 @@ fn main() -> Result<()> {
     configuration.repair_selection()?;
     let choice = bootstrap_choice(
         !configuration.available_providers()?.is_empty(),
+        io::stdin().is_terminal(),
         io::stdout().is_terminal(),
     )?;
     let catalog = ProviderCatalog::embedded()?;
@@ -281,11 +282,15 @@ enum BootstrapChoice {
     Chat,
 }
 
-fn bootstrap_choice(has_available_models: bool, interactive: bool) -> Result<BootstrapChoice> {
+fn bootstrap_choice(
+    has_available_models: bool,
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+) -> Result<BootstrapChoice> {
     if has_available_models {
         return Ok(BootstrapChoice::Chat);
     }
-    if interactive {
+    if stdin_is_terminal && stdout_is_terminal {
         return Ok(BootstrapChoice::Setup);
     }
     bail!("no model is configured; run `glint` in an interactive terminal to add one")
@@ -563,25 +568,32 @@ mod tests {
     #[test]
     fn unconfigured_interactive_startup_enters_setup() {
         assert_eq!(
-            bootstrap_choice(false, true).unwrap(),
+            bootstrap_choice(false, true, true).unwrap(),
             BootstrapChoice::Setup
         );
     }
 
     #[test]
     fn configured_startup_bypasses_setup() {
-        assert_eq!(bootstrap_choice(true, true).unwrap(), BootstrapChoice::Chat);
+        assert_eq!(
+            bootstrap_choice(true, false, false).unwrap(),
+            BootstrapChoice::Chat
+        );
     }
 
     #[test]
-    fn unconfigured_non_interactive_startup_explains_setup() {
-        let error = bootstrap_choice(false, false).unwrap_err();
+    fn unconfigured_startup_requires_both_terminal_streams() {
+        for (stdin_is_terminal, stdout_is_terminal) in
+            [(false, false), (false, true), (true, false)]
+        {
+            let error = bootstrap_choice(false, stdin_is_terminal, stdout_is_terminal).unwrap_err();
 
-        assert!(
-            error
-                .to_string()
-                .contains("run `glint` in an interactive terminal to add one")
-        );
+            assert!(
+                error
+                    .to_string()
+                    .contains("run `glint` in an interactive terminal to add one")
+            );
+        }
     }
 
     #[test]

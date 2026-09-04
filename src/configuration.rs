@@ -1,5 +1,7 @@
 use std::{
     collections::HashSet,
+    error::Error,
+    fmt,
     path::{Path, PathBuf},
 };
 
@@ -11,7 +13,7 @@ use crate::{
         ModelCatalog, ModelCatalogEntry, ProviderCatalogEntry, RuntimeExtensions, UserConfig,
         UserLlmConfig,
     },
-    credentials::{CredentialId, CredentialStore, open_credential_store},
+    credentials::{CredentialId, CredentialStore, CredentialStoreStatus, open_credential_store},
     paths::GlintPaths,
     persistence::{UserConfigRepository, UserConfigStore},
     plugins::PluginManager,
@@ -43,6 +45,97 @@ pub struct ModelRuntimeConfig {
     pub llm: LlmConfig,
     pub model_catalog: ModelCatalog,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigurationMutationErrorKind {
+    ProviderNameRequired,
+    ProviderNameCollision,
+    InvalidBaseUrl,
+    ModelRequired,
+    DuplicateModel,
+    CredentialRequired,
+    CredentialUnavailable,
+    Persistence,
+    ProviderNotConfigured,
+    InvalidProvider,
+}
+
+impl ConfigurationMutationErrorKind {
+    pub fn user_message(self) -> &'static str {
+        match self {
+            Self::ProviderNameRequired => "Enter a provider name.",
+            Self::ProviderNameCollision => {
+                "Choose a unique provider name; it matches an existing provider."
+            }
+            Self::InvalidBaseUrl => "Enter a valid HTTP or HTTPS base URL.",
+            Self::ModelRequired => "Enter at least one model name.",
+            Self::DuplicateModel => "Model names must be unique.",
+            Self::CredentialRequired => "Enter an API key for this provider.",
+            Self::CredentialUnavailable => {
+                "Credential storage is unavailable. Re-enter the API key to repair it, or try again when the system credential store is available."
+            }
+            Self::Persistence => {
+                "Could not write Glint configuration. Check that ~/.glint is writable and try again."
+            }
+            Self::ProviderNotConfigured => {
+                "That provider is no longer configured. Return to the provider list and try again."
+            }
+            Self::InvalidProvider => {
+                "That provider is not available. Return to the provider list and try again."
+            }
+        }
+    }
+}
+
+pub struct ConfigurationMutationError {
+    kind: ConfigurationMutationErrorKind,
+    source: Option<anyhow::Error>,
+}
+
+impl ConfigurationMutationError {
+    fn new(kind: ConfigurationMutationErrorKind) -> Self {
+        Self { kind, source: None }
+    }
+
+    fn with_source(kind: ConfigurationMutationErrorKind, source: anyhow::Error) -> Self {
+        Self {
+            kind,
+            source: Some(source),
+        }
+    }
+
+    pub fn kind(&self) -> ConfigurationMutationErrorKind {
+        self.kind
+    }
+
+    pub fn user_message(&self) -> &'static str {
+        self.kind.user_message()
+    }
+}
+
+impl fmt::Debug for ConfigurationMutationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfigurationMutationError")
+            .field("kind", &self.kind)
+            .field("source", &self.source.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
+impl fmt::Display for ConfigurationMutationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.user_message())
+    }
+}
+
+impl Error for ConfigurationMutationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source.as_ref().map(|source| source.as_ref())
+    }
+}
+
+pub type ConfigurationMutationResult<T> = std::result::Result<T, ConfigurationMutationError>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderStatus {
@@ -122,6 +215,10 @@ impl ConfigurationManager {
 
     pub fn user_config(&self) -> &UserConfig {
         &self.user
+    }
+
+    pub fn credential_store_status(&self) -> CredentialStoreStatus {
+        self.credentials.status()
     }
 
     pub fn available_providers(&self) -> Result<Vec<AvailableProvider>> {
@@ -269,17 +366,27 @@ impl ConfigurationManager {
         Ok(ModelRuntimeConfig { llm, model_catalog })
     }
 
-    pub fn save_builtin(&mut self, provider_id: &str, api_key: Option<&str>) -> Result<()> {
-        let provider = self
-            .catalog
-            .builtin(provider_id)
-            .with_context(|| format!("built-in provider '{provider_id}' is not defined"))?;
+    pub fn save_builtin(
+        &mut self,
+        provider_id: &str,
+        api_key: Option<&str>,
+    ) -> ConfigurationMutationResult<()> {
+        let provider = self.catalog.builtin(provider_id).ok_or_else(|| {
+            ConfigurationMutationError::new(ConfigurationMutationErrorKind::InvalidProvider)
+        })?;
         let provider_id = provider.id.clone();
         let credential_id = CredentialId::builtin(&provider_id);
-        let old_credential = self.credentials.get(&credential_id)?;
+        let old_credential = self.credentials.get(&credential_id).map_err(|error| {
+            ConfigurationMutationError::with_source(
+                ConfigurationMutationErrorKind::CredentialUnavailable,
+                error,
+            )
+        })?;
         let new_credential = nonblank_key(api_key);
         if new_credential.is_none() && !has_nonblank_credential(old_credential.as_deref()) {
-            bail!("an API key is required for provider '{provider_id}'");
+            return Err(ConfigurationMutationError::new(
+                ConfigurationMutationErrorKind::CredentialRequired,
+            ));
         }
 
         let mut staged = self.user.clone();
@@ -299,15 +406,19 @@ impl ConfigurationManager {
         base_url: &str,
         api_key: Option<&str>,
         models: Vec<String>,
-    ) -> Result<()> {
+    ) -> ConfigurationMutationResult<()> {
         let name = name.trim();
         if name.is_empty() {
-            bail!("custom provider name must not be empty");
+            return Err(ConfigurationMutationError::new(
+                ConfigurationMutationErrorKind::ProviderNameRequired,
+            ));
         }
         if self.catalog.providers().iter().any(|provider| {
             provider.id.eq_ignore_ascii_case(name) || provider.name.eq_ignore_ascii_case(name)
         }) {
-            bail!("custom provider '{name}' collides with a built-in provider");
+            return Err(ConfigurationMutationError::new(
+                ConfigurationMutationErrorKind::ProviderNameCollision,
+            ));
         }
         if self
             .user
@@ -315,16 +426,25 @@ impl ConfigurationManager {
             .keys()
             .any(|existing| existing != name && existing.eq_ignore_ascii_case(name))
         {
-            bail!("custom provider '{name}' already exists with different casing");
+            return Err(ConfigurationMutationError::new(
+                ConfigurationMutationErrorKind::ProviderNameCollision,
+            ));
         }
 
         let base_url = validate_base_url(base_url)?;
         let models = normalize_models(models)?;
         let credential_id = CredentialId::custom(name);
-        let old_credential = self.credentials.get(&credential_id)?;
+        let old_credential = self.credentials.get(&credential_id).map_err(|error| {
+            ConfigurationMutationError::with_source(
+                ConfigurationMutationErrorKind::CredentialUnavailable,
+                error,
+            )
+        })?;
         let new_credential = nonblank_key(api_key);
         if new_credential.is_none() && !has_nonblank_credential(old_credential.as_deref()) {
-            bail!("an API key is required for provider '{name}'");
+            return Err(ConfigurationMutationError::new(
+                ConfigurationMutationErrorKind::CredentialRequired,
+            ));
         }
 
         let mut staged = self.user.clone();
@@ -334,7 +454,7 @@ impl ConfigurationManager {
         self.persist_provider_change(staged, &credential_id, old_credential, new_credential)
     }
 
-    pub fn delete_provider(&mut self, provider_id: &str) -> Result<()> {
+    pub fn delete_provider(&mut self, provider_id: &str) -> ConfigurationMutationResult<()> {
         let (credential_id, mut staged) = if self.catalog.builtin(provider_id).is_some() {
             let mut staged = self.user.clone();
             let original_len = staged.configured_providers.len();
@@ -342,7 +462,9 @@ impl ConfigurationManager {
                 .configured_providers
                 .retain(|configured| configured != provider_id);
             if original_len == staged.configured_providers.len() {
-                bail!("provider '{provider_id}' is not configured");
+                return Err(ConfigurationMutationError::new(
+                    ConfigurationMutationErrorKind::ProviderNotConfigured,
+                ));
             }
             (CredentialId::builtin(provider_id), staged)
         } else if self.user.custom_providers.contains_key(provider_id) {
@@ -350,27 +472,45 @@ impl ConfigurationManager {
             staged.custom_providers.remove(provider_id);
             (CredentialId::custom(provider_id), staged)
         } else {
-            bail!("provider '{provider_id}' is not configured");
+            return Err(ConfigurationMutationError::new(
+                ConfigurationMutationErrorKind::ProviderNotConfigured,
+            ));
         };
 
-        let old_credential = self.credentials.get(&credential_id)?;
-        self.credentials.delete(&credential_id)?;
+        let old_credential = self.credentials.get(&credential_id).map_err(|error| {
+            ConfigurationMutationError::with_source(
+                ConfigurationMutationErrorKind::CredentialUnavailable,
+                error,
+            )
+        })?;
+        self.credentials.delete(&credential_id).map_err(|error| {
+            ConfigurationMutationError::with_source(
+                ConfigurationMutationErrorKind::CredentialUnavailable,
+                error,
+            )
+        })?;
         if let Err(error) =
             repair_selection_in(&self.catalog, self.credentials.as_ref(), &mut staged)
         {
-            return Err(rollback_credential_error(
+            return Err(rollback_credential_mutation_error(
                 self.credentials.as_ref(),
                 &credential_id,
                 old_credential.as_deref(),
-                error,
+                ConfigurationMutationError::with_source(
+                    ConfigurationMutationErrorKind::CredentialUnavailable,
+                    error,
+                ),
             ));
         }
         if let Err(error) = self.repository.save(&staged) {
-            return Err(rollback_credential_error(
+            return Err(rollback_credential_mutation_error(
                 self.credentials.as_ref(),
                 &credential_id,
                 old_credential.as_deref(),
-                error,
+                ConfigurationMutationError::with_source(
+                    ConfigurationMutationErrorKind::Persistence,
+                    error,
+                ),
             ));
         }
         self.user = staged;
@@ -419,33 +559,52 @@ impl ConfigurationManager {
         credential_id: &CredentialId,
         old_credential: Option<String>,
         new_credential: Option<&str>,
-    ) -> Result<()> {
+    ) -> ConfigurationMutationResult<()> {
         if let Some(api_key) = new_credential {
-            self.credentials.set(credential_id, api_key)?;
+            self.credentials
+                .set(credential_id, api_key)
+                .map_err(|error| {
+                    ConfigurationMutationError::with_source(
+                        ConfigurationMutationErrorKind::CredentialUnavailable,
+                        error,
+                    )
+                })?;
         }
         if let Err(error) =
             repair_selection_in(&self.catalog, self.credentials.as_ref(), &mut staged)
         {
             if new_credential.is_some() {
-                return Err(rollback_credential_error(
+                return Err(rollback_credential_mutation_error(
                     self.credentials.as_ref(),
                     credential_id,
                     old_credential.as_deref(),
-                    error,
+                    ConfigurationMutationError::with_source(
+                        ConfigurationMutationErrorKind::CredentialUnavailable,
+                        error,
+                    ),
                 ));
             }
-            return Err(error);
+            return Err(ConfigurationMutationError::with_source(
+                ConfigurationMutationErrorKind::CredentialUnavailable,
+                error,
+            ));
         }
         if let Err(error) = self.repository.save(&staged) {
             if new_credential.is_some() {
-                return Err(rollback_credential_error(
+                return Err(rollback_credential_mutation_error(
                     self.credentials.as_ref(),
                     credential_id,
                     old_credential.as_deref(),
-                    error,
+                    ConfigurationMutationError::with_source(
+                        ConfigurationMutationErrorKind::Persistence,
+                        error,
+                    ),
                 ));
             }
-            return Err(error);
+            return Err(ConfigurationMutationError::with_source(
+                ConfigurationMutationErrorKind::Persistence,
+                error,
+            ));
         }
         self.user = staged;
         Ok(())
@@ -675,50 +834,70 @@ fn has_nonblank_credential(api_key: Option<&str>) -> bool {
     api_key.is_some_and(|api_key| !api_key.trim().is_empty())
 }
 
-fn rollback_credential_error(
+fn rollback_credential_mutation_error(
     credentials: &dyn CredentialStore,
     credential_id: &CredentialId,
     old_credential: Option<&str>,
-    original_error: anyhow::Error,
-) -> anyhow::Error {
+    mut original_error: ConfigurationMutationError,
+) -> ConfigurationMutationError {
     let rollback = match old_credential {
         Some(api_key) => credentials.set(credential_id, api_key),
         None => credentials.delete(credential_id),
     };
-    match rollback {
-        Ok(()) => original_error,
-        Err(rollback_error) => anyhow!(
-            "{original_error:#}; credential rollback for '{}' also failed: {rollback_error:#}",
-            credential_id.as_str()
-        ),
+    if let Err(rollback_error) = rollback {
+        let original_source = original_error.source.take();
+        original_error.source = Some(match original_source {
+            Some(source) => anyhow!(
+                "configuration mutation failed: {source:#}; credential rollback also failed: {rollback_error:#}"
+            ),
+            None => anyhow!("credential rollback failed: {rollback_error:#}"),
+        });
     }
+    original_error
 }
 
-fn validate_base_url(base_url: &str) -> Result<String> {
+fn validate_base_url(base_url: &str) -> ConfigurationMutationResult<String> {
     let base_url = base_url.trim();
     if base_url.is_empty() {
-        bail!("custom provider base URL must not be empty");
+        return Err(ConfigurationMutationError::new(
+            ConfigurationMutationErrorKind::InvalidBaseUrl,
+        ));
     }
-    let parsed = reqwest::Url::parse(base_url)
-        .with_context(|| format!("custom provider base URL '{base_url}' is invalid"))?;
+    let parsed = reqwest::Url::parse(base_url).map_err(|error| {
+        ConfigurationMutationError::with_source(
+            ConfigurationMutationErrorKind::InvalidBaseUrl,
+            error.into(),
+        )
+    })?;
     if !matches!(parsed.scheme(), "http" | "https") {
-        bail!("custom provider base URL must use http or https");
+        return Err(ConfigurationMutationError::new(
+            ConfigurationMutationErrorKind::InvalidBaseUrl,
+        ));
     }
     Ok(base_url.trim_end_matches('/').to_owned())
 }
 
-fn normalize_models(models: Vec<String>) -> Result<Vec<String>> {
+fn normalize_models(models: Vec<String>) -> ConfigurationMutationResult<Vec<String>> {
     let mut seen = HashSet::new();
-    let models = models
-        .into_iter()
-        .map(|model| model.trim().to_owned())
-        .filter(|model| !model.is_empty())
-        .filter(|model| seen.insert(model.clone()))
-        .collect::<Vec<_>>();
-    if models.is_empty() {
-        bail!("custom provider must define at least one model");
+    let mut normalized = Vec::new();
+    for model in models {
+        let model = model.trim().to_owned();
+        if model.is_empty() {
+            continue;
+        }
+        if !seen.insert(model.clone()) {
+            return Err(ConfigurationMutationError::new(
+                ConfigurationMutationErrorKind::DuplicateModel,
+            ));
+        }
+        normalized.push(model);
     }
-    Ok(models)
+    if normalized.is_empty() {
+        return Err(ConfigurationMutationError::new(
+            ConfigurationMutationErrorKind::ModelRequired,
+        ));
+    }
+    Ok(normalized)
 }
 
 fn metadata_catalog_entry(metadata: ModelMetadata) -> ModelCatalogEntry {
@@ -1178,7 +1357,10 @@ mod tests {
             )
             .unwrap_err();
 
-        assert!(format!("{error:#}").contains("already exists"));
+        assert_eq!(
+            error.kind(),
+            ConfigurationMutationErrorKind::ProviderNameCollision
+        );
         assert_eq!(manager.user_config().custom_providers.len(), 1);
     }
 
@@ -1197,7 +1379,10 @@ mod tests {
                 )
                 .unwrap_err();
 
-            assert!(format!("{error:#}").contains("built-in provider"));
+            assert_eq!(
+                error.kind(),
+                ConfigurationMutationErrorKind::ProviderNameCollision
+            );
         }
     }
 
@@ -1215,11 +1400,11 @@ mod tests {
             )
             .unwrap_err();
 
-        assert!(format!("{error:#}").contains("http or https"));
+        assert_eq!(error.kind(), ConfigurationMutationErrorKind::InvalidBaseUrl);
     }
 
     #[test]
-    fn save_custom_trims_models_ignores_blanks_and_removes_exact_duplicates() {
+    fn save_custom_trims_models_and_ignores_blank_rows() {
         let fixture = ManagerFixture::new();
         let mut manager = fixture.manager();
 
@@ -1228,18 +1413,31 @@ mod tests {
                 "  Gateway  ",
                 " https://llm.example/v1/ ",
                 Some("key"),
-                vec![
-                    " code-large ".into(),
-                    "".into(),
-                    "code-large".into(),
-                    "CODE-LARGE".into(),
-                ],
+                vec![" code-large ".into(), "".into(), "CODE-LARGE".into()],
             )
             .unwrap();
 
         let provider = &manager.user_config().custom_providers["Gateway"];
         assert_eq!(provider.base_url, "https://llm.example/v1");
         assert_eq!(provider.models, ["code-large", "CODE-LARGE"]);
+    }
+
+    #[test]
+    fn save_custom_rejects_duplicate_model_names() {
+        let fixture = ManagerFixture::new();
+        let mut manager = fixture.manager();
+
+        let error = manager
+            .save_custom(
+                "Gateway",
+                "https://llm.example/v1",
+                Some("key"),
+                vec![" model ".into(), "model".into()],
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ConfigurationMutationErrorKind::DuplicateModel);
+        assert_eq!(error.user_message(), "Model names must be unique.");
     }
 
     #[test]
@@ -1632,7 +1830,8 @@ mod tests {
             .save_builtin("deepseek", Some("new-secret"))
             .unwrap_err();
 
-        assert!(format!("{error:#}").contains("user config save failure"));
+        assert_eq!(error.kind(), ConfigurationMutationErrorKind::Persistence);
+        assert!(!error.to_string().contains("user config save failure"));
         assert_eq!(
             credentials
                 .get(&CredentialId::builtin("deepseek"))
@@ -1661,7 +1860,7 @@ mod tests {
     }
 
     #[test]
-    fn rollback_failure_reports_both_errors_without_secrets() {
+    fn rollback_failure_keeps_a_safe_persistence_error_without_secrets() {
         let mut fixture = ManagerFixture::new();
         fixture.enable_builtin("deepseek", "old-secret");
         fixture.repository.fail_saves();
@@ -1673,9 +1872,11 @@ mod tests {
             .unwrap_err();
         let message = format!("{error:#}");
 
-        assert!(message.contains("user config save failure"));
-        assert!(message.contains("credential rollback"));
-        assert!(message.contains("injected credential set failure"));
+        assert_eq!(error.kind(), ConfigurationMutationErrorKind::Persistence);
+        assert_eq!(
+            message,
+            "Could not write Glint configuration. Check that ~/.glint is writable and try again."
+        );
         assert!(!message.contains("old-secret"));
         assert!(!message.contains("new-secret"));
     }
@@ -1777,7 +1978,11 @@ mod tests {
 
         let error = manager.delete_provider("deepseek").unwrap_err();
 
-        assert!(format!("{error:#}").contains("credential delete failure"));
+        assert_eq!(
+            error.kind(),
+            ConfigurationMutationErrorKind::CredentialUnavailable
+        );
+        assert!(!error.to_string().contains("credential delete failure"));
         assert_eq!(manager.user_config().configured_providers, ["deepseek"]);
         assert_eq!(
             repository.load().unwrap().unwrap().configured_providers,
