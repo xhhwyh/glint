@@ -157,7 +157,11 @@ fn default_tool_timeout_ms() -> u64 {
     60_000
 }
 
-pub(crate) fn persist_mcp_server(path: &Path, name: &str, server: &McpServerConfig) -> Result<()> {
+pub(crate) fn persist_mcp_server(
+    path: &Path,
+    name: &str,
+    server: &McpServerConfig,
+) -> Result<serde_yaml::Value> {
     let mut validation = McpConfig::default();
     validation.servers.insert(name.to_owned(), server.clone());
     validation.validate()?;
@@ -168,6 +172,12 @@ pub(crate) fn persist_mcp_server(path: &Path, name: &str, server: &McpServerConf
         .with_context(|| format!("failed to parse existing config {}", path.display()))?;
     let snippet = server_yaml(name, server)?;
     let updated = insert_server_yaml(&content, name, &snippet)?;
+    let updated_document: serde_yaml::Value = serde_yaml::from_str(&updated)
+        .with_context(|| format!("failed to parse updated config {}", path.display()))?;
+    let updated_mcp = updated_document
+        .get("mcp")
+        .cloned()
+        .context("updated configuration does not contain an mcp block")?;
 
     let temporary = path.with_extension(format!("yaml.tmp-{}", std::process::id()));
     fs::write(&temporary, updated)
@@ -180,7 +190,9 @@ pub(crate) fn persist_mcp_server(path: &Path, name: &str, server: &McpServerConf
             )
         })?;
     }
-    fs::rename(&temporary, path).with_context(|| format!("failed to replace {}", path.display()))
+    fs::rename(&temporary, path)
+        .with_context(|| format!("failed to replace {}", path.display()))?;
+    Ok(updated_mcp)
 }
 
 fn server_yaml(name: &str, server: &McpServerConfig) -> Result<String> {

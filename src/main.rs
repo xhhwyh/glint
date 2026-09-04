@@ -87,7 +87,7 @@ fn main() -> Result<()> {
     let result = (|| -> Result<()> {
         match choice {
             BootstrapChoice::Chat => {
-                let config = configuration.build_runtime(&workspace)?;
+                let config = configuration.build_runtime()?;
                 run(&mut terminal, config, configuration)
             }
             BootstrapChoice::Setup => {
@@ -102,7 +102,7 @@ fn main() -> Result<()> {
                 };
                 match run_setup(&mut terminal, &mut configuration, initial_state, &catalog)? {
                     SetupOutcome::StartGlint => {
-                        let config = configuration.build_runtime(&workspace)?;
+                        let config = configuration.build_runtime()?;
                         run(&mut terminal, config, configuration)
                     }
                     SetupOutcome::Exit => Ok(()),

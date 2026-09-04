@@ -42,7 +42,6 @@ use crate::{
     },
     services::mcp::{
         McpApprovalPolicy, McpConfig, McpOAuthConfig, McpServerConfig, McpTransportConfig,
-        persist_mcp_server,
     },
     services::tool_results::tool_result_artifact_path,
     setup::{SetupEffect, SetupOutcome, SetupState, apply_setup_effect},
@@ -538,10 +537,9 @@ impl PluginsTab {
 impl App {
     pub fn new(config: Config, configuration: ConfigurationManager) -> Result<Self> {
         let provider_catalog = ProviderCatalog::embedded()?;
-        let current_dir = current_dir_label();
-        let transcript_cwd = std::env::current_dir()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|_| current_dir.clone());
+        let workspace = configuration.workspace().to_path_buf();
+        let current_dir = home_relative_path(&workspace, configuration.paths().root().parent());
+        let transcript_cwd = workspace.display().to_string();
         let sessions_root = configuration.paths().sessions();
         let mcp_root = configuration.paths().mcp();
         let runtime = SessionRuntime::create_new(
@@ -614,6 +612,7 @@ impl App {
         let provider_catalog = ProviderCatalog::embedded().expect("embedded provider catalog");
         let mut configuration = ConfigurationManager::new(
             paths.clone(),
+            PathBuf::from("/workspace"),
             provider_catalog.clone(),
             Box::new(UserConfigStore::new(paths.clone())),
             Box::new(FileCredentialStore::new(paths.auth())),
@@ -2260,11 +2259,11 @@ impl App {
     }
 
     fn add_mcp_server(&mut self) {
-        let config_path = self.config.config_path.clone();
-        self.add_mcp_server_at(&config_path);
+        self.add_mcp_server_at();
     }
 
-    fn add_mcp_server_at(&mut self, config_path: &Path) {
+    fn add_mcp_server_at(&mut self) {
+        let config_path = self.configuration.paths().config();
         let result = self
             .mcp_view
             .as_ref()
@@ -2277,7 +2276,7 @@ impl App {
                 if self.config.mcp.servers.contains_key(&name) {
                     bail!("MCP server '{name}' already exists");
                 }
-                persist_mcp_server(config_path, &name, &server)?;
+                self.configuration.upsert_mcp_server(&name, &server)?;
                 Ok((name, server))
             });
 
@@ -3655,14 +3654,10 @@ impl App {
     }
 
     fn start_prompt_config(&self) -> StartPromptConfig {
-        let runtime_current_dir = std::env::current_dir()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|_| self.current_dir.clone());
-
         StartPromptConfig {
             llm: self.config.llm.clone(),
             system_prompt: self.config.system_prompt.clone(),
-            runtime_current_dir,
+            runtime_current_dir: self.configuration.workspace().display().to_string(),
         }
     }
 
@@ -4131,14 +4126,8 @@ fn subagent_transcripts_by_task_id(
         .collect()
 }
 
-fn current_dir_label() -> String {
-    std::env::current_dir()
-        .map(|path| home_relative_path(&path))
-        .unwrap_or_else(|_| "?".to_owned())
-}
-
-fn home_relative_path(path: &Path) -> String {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+fn home_relative_path(path: &Path, home: Option<&Path>) -> String {
+    let Some(home) = home else {
         return path.display().to_string();
     };
 
@@ -4146,7 +4135,7 @@ fn home_relative_path(path: &Path) -> String {
         return "~".to_owned();
     }
 
-    path.strip_prefix(&home)
+    path.strip_prefix(home)
         .ok()
         .filter(|relative| !relative.as_os_str().is_empty())
         .map(|relative| format!("~/{}", relative.display()))
@@ -4479,6 +4468,7 @@ mod tests {
         let credentials = FaultCredentialStore::default();
         let mut configuration = ConfigurationManager::new(
             paths.clone(),
+            PathBuf::from("/workspace"),
             ProviderCatalog::embedded().unwrap(),
             Box::new(repository.clone()),
             Box::new(credentials.clone()),
@@ -4521,6 +4511,7 @@ mod tests {
         let paths = GlintPaths::from_home(home);
         let mut configuration = ConfigurationManager::new(
             paths.clone(),
+            PathBuf::from("/workspace"),
             ProviderCatalog::embedded().expect("embedded provider catalog"),
             Box::new(UserConfigStore::new(paths.clone())),
             Box::new(FileCredentialStore::new(paths.auth())),
@@ -6893,11 +6884,8 @@ mod tests {
 
     #[test]
     fn mcp_add_form_persists_and_activates_server() {
-        let root = std::env::temp_dir().join(format!("glint-app-add-mcp-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&root).unwrap();
-        let config_path = root.join("config.yaml");
-        fs::write(&config_path, "llm:\n  provider: demo\n").unwrap();
         let mut app = app();
+        let config_path = app.configuration.paths().config();
         let mut form = McpAddForm::default();
         form.name.set("local-docs");
         form.command.set("glint-missing-mcp-test-command");
@@ -6912,7 +6900,7 @@ mod tests {
             notice: None,
         });
 
-        app.add_mcp_server_at(&config_path);
+        app.add_mcp_server_at();
 
         assert!(app.config.base_mcp.servers.contains_key("local-docs"));
         assert!(app.config.mcp.servers.contains_key("local-docs"));
@@ -6938,20 +6926,32 @@ mod tests {
         assert!(persisted.contains("      command: glint-missing-mcp-test-command\n"));
         assert!(persisted.contains("      - docs root\n"));
         assert!(persisted.contains("      - MCP_TOKEN\n"));
-        fs::remove_dir_all(root).ok();
+
+        let expected_mcp = app.configuration.user_config().mcp.clone();
+        app.configuration
+            .select_model("test", "test-model")
+            .unwrap();
+        app.configuration
+            .save_custom(
+                "temporary",
+                "https://temporary.example/v1",
+                Some("temporary-key"),
+                vec!["temporary-model".to_owned()],
+            )
+            .unwrap();
+        app.configuration.delete_provider("temporary").unwrap();
+        let saved = UserConfigStore::new(app.configuration.paths().clone())
+            .load()
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.mcp, expected_mcp);
     }
 
     #[test]
-    fn mcp_add_form_persists_to_the_selected_config_path() {
-        let root = std::env::temp_dir().join(format!(
-            "glint-app-selected-config-{}",
-            uuid::Uuid::new_v4()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let config_path = root.join("selected.yaml");
-        fs::write(&config_path, "llm:\n  provider: demo\n").unwrap();
+    fn mcp_add_form_persists_to_the_configuration_manager_path() {
         let mut app = app();
-        app.config.config_path = config_path.clone();
+        let config_path = app.configuration.paths().config();
+        app.config.config_path = PathBuf::from("/stale/runtime/config.yaml");
         let mut form = McpAddForm::default();
         form.name.set("selected-path-server");
         form.command.set("glint-missing-mcp-test-command");
@@ -6974,17 +6974,13 @@ mod tests {
                 .and_then(|view| view.notice.as_ref())
                 .is_some_and(|notice| notice.message.contains(&config_path.display().to_string()))
         );
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn mcp_add_form_keeps_validation_errors_in_the_form() {
-        let root =
-            std::env::temp_dir().join(format!("glint-app-invalid-mcp-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&root).unwrap();
-        let config_path = root.join("config.yaml");
-        fs::write(&config_path, "llm:\n  provider: demo\n").unwrap();
         let mut app = app();
+        let config_path = app.configuration.paths().config();
+        let before = fs::read_to_string(&config_path).unwrap();
         let mut form = McpAddForm::default();
         form.name.set("invalid name");
         app.mcp_view = Some(McpView {
@@ -6996,7 +6992,7 @@ mod tests {
             notice: None,
         });
 
-        app.add_mcp_server_at(&config_path);
+        app.add_mcp_server_at();
 
         assert!(matches!(
             app.mcp_view.as_ref().map(|view| &view.screen),
@@ -7008,11 +7004,7 @@ mod tests {
                 .and_then(|view| view.notice.as_ref())
                 .is_some_and(|notice| notice.failed && notice.message.contains("server name"))
         );
-        assert_eq!(
-            fs::read_to_string(&config_path).unwrap(),
-            "llm:\n  provider: demo\n"
-        );
-        fs::remove_dir_all(root).ok();
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), before);
     }
 
     #[test]
@@ -7387,15 +7379,45 @@ mod tests {
 
     #[test]
     fn current_dir_label_uses_home_prefix() {
-        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-            return;
-        };
+        let home = PathBuf::from("/home/tester");
 
-        assert_eq!(home_relative_path(&home), "~");
+        assert_eq!(home_relative_path(&home, Some(&home)), "~");
         assert_eq!(
-            home_relative_path(&home.join("projects/glint")),
+            home_relative_path(&home.join("projects/glint"), Some(&home)),
             "~/projects/glint"
         );
+    }
+
+    #[test]
+    fn prompt_runtime_uses_the_configuration_workspace() {
+        const CHILD_WORKDIR: &str = "GLINT_APP_EXPLICIT_ROOT_CHILD";
+        if let Some(ambient) = std::env::var_os(CHILD_WORKDIR) {
+            assert_eq!(std::env::current_dir().unwrap(), PathBuf::from(ambient));
+            let (app, _, _) = app_with_counting_stores();
+            assert_eq!(app.start_prompt_config().runtime_current_dir, "/workspace");
+            assert_eq!(app.current_dir, "/workspace");
+            return;
+        }
+        let ambient =
+            std::env::temp_dir().join(format!("glint-app-ambient-root-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&ambient).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "app::tests::prompt_runtime_uses_the_configuration_workspace",
+            ])
+            .env(CHILD_WORKDIR, &ambient)
+            .env("HOME", ambient.join("ambient-home"))
+            .current_dir(&ambient)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(ambient).ok();
     }
 
     #[test]

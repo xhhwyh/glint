@@ -1128,6 +1128,7 @@ mod tests {
         fn manager(&self) -> ConfigurationManager {
             ConfigurationManager::new(
                 GlintPaths::from_home("/fixture"),
+                PathBuf::from("/workspace"),
                 test_catalog(),
                 Box::new(self.repository.clone()),
                 Box::new(self.credentials.clone()),

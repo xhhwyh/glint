@@ -1,4 +1,7 @@
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -13,6 +16,7 @@ use crate::{
     persistence::{UserConfigRepository, UserConfigStore},
     plugins::PluginManager,
     provider_catalog::{ModelMetadata, PromptCacheConfig, ProviderCatalog},
+    services::mcp::{McpServerConfig, persist_mcp_server},
 };
 
 const DEFAULT_TEMPERATURE: f32 = 0.7;
@@ -52,6 +56,7 @@ pub struct ProviderStatus {
 
 pub struct ConfigurationManager {
     paths: GlintPaths,
+    workspace: PathBuf,
     catalog: ProviderCatalog,
     repository: Box<dyn UserConfigRepository>,
     credentials: Box<dyn CredentialStore>,
@@ -59,7 +64,7 @@ pub struct ConfigurationManager {
 }
 
 impl ConfigurationManager {
-    pub fn discover(paths: GlintPaths, _workspace: &Path) -> Result<Self> {
+    pub fn discover(paths: GlintPaths, workspace: &Path) -> Result<Self> {
         let repository: Box<dyn UserConfigRepository> =
             Box::new(UserConfigStore::new(paths.clone()));
         let user = repository.load()?.unwrap_or_default();
@@ -75,6 +80,7 @@ impl ConfigurationManager {
         let credentials = open_credential_store(&paths, has_configured_providers)?;
         Ok(Self {
             paths,
+            workspace: workspace.to_path_buf(),
             catalog,
             repository,
             credentials,
@@ -84,6 +90,7 @@ impl ConfigurationManager {
 
     pub fn new(
         paths: GlintPaths,
+        workspace: PathBuf,
         catalog: ProviderCatalog,
         repository: Box<dyn UserConfigRepository>,
         credentials: Box<dyn CredentialStore>,
@@ -97,6 +104,7 @@ impl ConfigurationManager {
         })?;
         Ok(Self {
             paths,
+            workspace,
             catalog,
             repository,
             credentials,
@@ -106,6 +114,10 @@ impl ConfigurationManager {
 
     pub fn paths(&self) -> &GlintPaths {
         &self.paths
+    }
+
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
     }
 
     pub fn user_config(&self) -> &UserConfig {
@@ -171,7 +183,7 @@ impl ConfigurationManager {
         Ok(())
     }
 
-    pub fn build_runtime(&self, _workspace: &Path) -> Result<Config> {
+    pub fn build_runtime(&self) -> Result<Config> {
         let model_runtime = self.build_model_runtime()?;
         let runtime_extensions = RuntimeExtensions::from_user_config(&self.user)?;
         let base_lsp = runtime_extensions.lsp;
@@ -203,6 +215,20 @@ impl ConfigurationManager {
             base_mcp,
             base_system_prompt,
         })
+    }
+
+    pub fn upsert_mcp_server(&mut self, name: &str, server: &McpServerConfig) -> Result<()> {
+        let mut staged = self.repository.load()?.unwrap_or_default();
+        validate_loaded_user(&staged, &self.catalog).with_context(|| {
+            format!(
+                "invalid Glint configuration at {}",
+                self.repository.path().display()
+            )
+        })?;
+        let updated_mcp = persist_mcp_server(self.repository.path(), name, server)?;
+        staged.mcp = Some(updated_mcp);
+        self.user = staged;
+        Ok(())
     }
 
     pub fn build_model_runtime(&self) -> Result<ModelRuntimeConfig> {
@@ -799,6 +825,7 @@ fn credential_is_present(credentials: &dyn CredentialStore, id: &CredentialId) -
 mod tests {
     use std::{
         collections::BTreeMap,
+        fs,
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
     };
@@ -810,7 +837,7 @@ mod tests {
         config::{CustomProviderConfig, UserConfig, UserLlmConfig},
         credentials::{CredentialId, CredentialStore},
         paths::GlintPaths,
-        persistence::UserConfigRepository,
+        persistence::{UserConfigRepository, UserConfigStore},
         provider_catalog::ProviderCatalog,
     };
 
@@ -1055,6 +1082,7 @@ mod tests {
 
         let error = ConfigurationManager::new(
             GlintPaths::from_home("/fixture"),
+            PathBuf::from("/workspace"),
             ProviderCatalog::embedded().unwrap(),
             Box::new(fixture.repository.clone()),
             Box::new(fixture.credentials.clone()),
@@ -1368,7 +1396,7 @@ mod tests {
             Some(serde_yaml::from_str(&format!("cache_dir: {}", plugin_cache.display())).unwrap());
         let manager = fixture.manager();
 
-        let runtime = manager.build_runtime(Path::new("/workspace")).unwrap();
+        let runtime = manager.build_runtime().unwrap();
 
         assert_eq!(runtime.llm.api_key, "runtime-secret");
         assert_eq!(runtime.llm.base_url, "https://api.deepseek.com");
@@ -1383,6 +1411,109 @@ mod tests {
             "1000000"
         );
         assert!(!runtime.system_prompt.is_empty());
+    }
+
+    #[test]
+    fn mcp_updates_survive_later_model_and_provider_persistence() {
+        let home = std::env::temp_dir().join(format!(
+            "glint-manager-mcp-sequence-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = GlintPaths::from_home(&home);
+        let workspace = home.join("workspace");
+        let mut manager = ConfigurationManager::new(
+            paths.clone(),
+            workspace,
+            ProviderCatalog::embedded().unwrap(),
+            Box::new(UserConfigStore::new(paths.clone())),
+            Box::new(crate::credentials::FileCredentialStore::new(paths.auth())),
+        )
+        .unwrap();
+        manager
+            .save_builtin("deepseek", Some("deepseek-key"))
+            .unwrap();
+        let mut server = test_mcp_server("old-mcp");
+        manager.upsert_mcp_server("demo", &server).unwrap();
+        server = test_mcp_server("new-mcp");
+        manager.upsert_mcp_server("demo", &server).unwrap();
+        let expected_mcp = manager.user_config().mcp.clone();
+
+        manager
+            .select_model("deepseek", "deepseek-v4-flash")
+            .unwrap();
+        assert_eq!(
+            UserConfigStore::new(paths.clone())
+                .load()
+                .unwrap()
+                .unwrap()
+                .mcp,
+            expected_mcp
+        );
+        manager
+            .save_custom(
+                "Gateway",
+                "https://gateway.example/v1",
+                Some("gateway-key"),
+                vec!["gateway-model".to_owned()],
+            )
+            .unwrap();
+        manager.delete_provider("Gateway").unwrap();
+
+        let persisted = UserConfigStore::new(paths.clone()).load().unwrap().unwrap();
+        assert_eq!(persisted.mcp, expected_mcp);
+        assert!(!persisted.custom_providers.contains_key("Gateway"));
+        assert_eq!(persisted.llm.unwrap().provider, "deepseek");
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn failed_mcp_write_leaves_disk_and_manager_unchanged() {
+        let home = std::env::temp_dir().join(format!(
+            "glint-manager-mcp-rollback-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = GlintPaths::from_home(&home);
+        let mut manager = ConfigurationManager::new(
+            paths.clone(),
+            home.join("workspace"),
+            ProviderCatalog::embedded().unwrap(),
+            Box::new(UserConfigStore::new(paths.clone())),
+            Box::new(crate::credentials::FileCredentialStore::new(paths.auth())),
+        )
+        .unwrap();
+        manager
+            .save_builtin("deepseek", Some("deepseek-key"))
+            .unwrap();
+        let before_user = manager.user_config().clone();
+        let before_disk = fs::read(paths.config()).unwrap();
+        let temporary = paths
+            .config()
+            .with_extension(format!("yaml.tmp-{}", std::process::id()));
+        fs::create_dir_all(&temporary).unwrap();
+
+        let error = manager
+            .upsert_mcp_server("demo", &test_mcp_server("demo-mcp"))
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("failed to write temporary config"));
+        assert_eq!(manager.user_config(), &before_user);
+        assert_eq!(fs::read(paths.config()).unwrap(), before_disk);
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn manager_keeps_the_injected_workspace() {
+        let fixture = ManagerFixture::new();
+        let manager = ConfigurationManager::new(
+            GlintPaths::from_home("/explicit/home"),
+            PathBuf::from("/injected/workspace"),
+            ProviderCatalog::embedded().unwrap(),
+            Box::new(fixture.repository.clone()),
+            Box::new(fixture.credentials.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(manager.workspace(), Path::new("/injected/workspace"));
     }
 
     #[test]
@@ -1556,6 +1687,25 @@ mod tests {
         repository: MemoryUserConfigStore,
     }
 
+    fn test_mcp_server(command: &str) -> McpServerConfig {
+        McpServerConfig {
+            enabled: true,
+            startup_timeout_ms: 20_000,
+            tool_timeout_ms: 60_000,
+            approval: crate::services::mcp::McpApprovalPolicy::Prompt,
+            tool_approval: Default::default(),
+            enabled_tools: None,
+            disabled_tools: Vec::new(),
+            transport: crate::services::mcp::McpTransportConfig::Stdio {
+                command: command.to_owned(),
+                args: Vec::new(),
+                env: Default::default(),
+                env_vars: Vec::new(),
+                cwd: None,
+            },
+        }
+    }
+
     impl ManagerFixture {
         fn new() -> Self {
             Self {
@@ -1577,6 +1727,7 @@ mod tests {
             self.repository.replace(self.user.clone());
             ConfigurationManager::new(
                 GlintPaths::from_home("/fixture"),
+                PathBuf::from("/workspace"),
                 ProviderCatalog::embedded().unwrap(),
                 Box::new(self.repository.clone()),
                 Box::new(self.credentials.clone()),

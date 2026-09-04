@@ -2188,12 +2188,12 @@ fn stable_hash(value: &str) -> u64 {
         })
 }
 
-fn resolve_user_path(path: &Path, cwd: &Path) -> PathBuf {
+fn resolve_user_path(path: &Path, glint_root: &Path) -> PathBuf {
     if let Some(value) = path.to_str()
-        && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+        && let Some(home) = glint_root.parent()
     {
         if value == "~" {
-            return home;
+            return home.to_path_buf();
         }
         if let Some(relative) = value.strip_prefix("~/") {
             return home.join(relative);
@@ -2202,7 +2202,7 @@ fn resolve_user_path(path: &Path, cwd: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
-        cwd.join(path)
+        glint_root.join(path)
     }
 }
 
@@ -2738,6 +2738,10 @@ mod tests {
             Path::new("/users/alice/.glint/plugins/local")
         );
         assert_eq!(
+            resolve_user_path(Path::new("~/shared/plugin"), glint_root),
+            Path::new("/users/alice/shared/plugin")
+        );
+        assert_eq!(
             plugin_cache_dir(&config, glint_root),
             Path::new("/users/alice/.glint/plugins/cache")
         );
@@ -2750,6 +2754,43 @@ mod tests {
         save_plugin_state(&config, &root, &PluginState::default()).unwrap();
         assert!(root.join("plugins/state.json").is_file());
         fs::remove_dir_all(root.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn plugin_paths_ignore_changed_ambient_home_and_working_directory() {
+        const CHILD_WORKDIR: &str = "GLINT_PLUGIN_EXPLICIT_ROOT_CHILD";
+        if let Some(ambient) = std::env::var_os(CHILD_WORKDIR) {
+            assert_eq!(std::env::current_dir().unwrap(), PathBuf::from(ambient));
+            let glint_root = Path::new("/explicit/home/.glint");
+            assert_eq!(
+                resolve_user_path(Path::new("~/shared/plugin"), glint_root),
+                Path::new("/explicit/home/shared/plugin")
+            );
+            assert_eq!(
+                plugin_state_path(&PluginsConfig::default(), glint_root),
+                Path::new("/explicit/home/.glint/plugins/state.json")
+            );
+            return;
+        }
+        let ambient = test_dir("ambient-plugin-roots");
+        fs::create_dir_all(&ambient).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "plugins::tests::plugin_paths_ignore_changed_ambient_home_and_working_directory",
+            ])
+            .env(CHILD_WORKDIR, &ambient)
+            .env("HOME", ambient.join("ambient-home"))
+            .current_dir(&ambient)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(ambient).ok();
     }
 
     #[test]

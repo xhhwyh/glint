@@ -1177,13 +1177,13 @@ fn archive_dir(sessions_root: &Path) -> PathBuf {
 }
 
 fn transcript_project_dir(sessions_root: &Path, cwd: &str) -> PathBuf {
-    sessions_root.join(sanitize_cwd(cwd))
+    sessions_root.join(project_directory_component(cwd))
 }
 
 fn legacy_project_dir(sessions_root: &Path, cwd: &str) -> PathBuf {
     glint_root(sessions_root)
         .join("projects")
-        .join(sanitize_cwd(cwd))
+        .join(legacy_sanitize_cwd(cwd))
 }
 
 fn legacy_archive_dir(sessions_root: &Path) -> PathBuf {
@@ -1203,7 +1203,37 @@ fn session_search_dirs(sessions_root: &Path, cwd: &str) -> [PathBuf; 4] {
     ]
 }
 
-fn sanitize_cwd(cwd: &str) -> String {
+fn project_directory_component(cwd: &str) -> String {
+    const MAX_ENCODED_BYTES: usize = 200;
+
+    let mut encoded = String::from("workspace-");
+    for byte in cwd.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+            encoded.push(char::from(*byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "_{byte:02x}").expect("writing to a string cannot fail");
+        }
+    }
+    if encoded.len() > MAX_ENCODED_BYTES {
+        encoded.truncate(MAX_ENCODED_BYTES - 17);
+        use std::fmt::Write as _;
+        write!(&mut encoded, "-{:016x}", stable_path_hash(cwd))
+            .expect("writing to a string cannot fail");
+    }
+    encoded
+}
+
+fn stable_path_hash(value: &str) -> u64 {
+    value
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
+}
+
+fn legacy_sanitize_cwd(cwd: &str) -> String {
     let sanitized = cwd.replace('/', "-");
     if sanitized.is_empty() {
         "-".to_owned()
@@ -1409,6 +1439,37 @@ mod tests {
     }
 
     #[test]
+    fn project_directory_encoding_is_a_single_safe_component_for_cross_platform_paths() {
+        let sessions_root = Path::new("/fixed/.glint/sessions");
+        for cwd in [
+            "/home/alice/project",
+            r"C:\Users\Alice\project",
+            "C:/Users/Alice/project",
+            r"\\server\share\project",
+            r"relative\windows\project",
+        ] {
+            let directory = transcript_project_dir(sessions_root, cwd);
+            let relative = directory.strip_prefix(sessions_root).unwrap();
+            let component = relative.to_str().unwrap();
+
+            assert_eq!(relative.components().count(), 1, "{cwd}: {directory:?}");
+            assert!(!relative.is_absolute(), "{cwd}: {directory:?}");
+            assert!(!component.contains(['/', '\\', ':']), "{cwd}: {component}");
+            assert!(directory.starts_with(sessions_root), "{cwd}: {directory:?}");
+        }
+    }
+
+    #[test]
+    fn unix_legacy_project_directory_keeps_the_historical_name() {
+        let sessions_root = Path::new("/home/alice/.glint/sessions");
+
+        assert_eq!(
+            legacy_project_dir(sessions_root, "/work/project"),
+            Path::new("/home/alice/.glint/projects/-work-project")
+        );
+    }
+
+    #[test]
     fn session_summaries_include_new_and_legacy_roots() {
         let glint_root = std::env::temp_dir().join(format!(
             "glint-session-summary-roots-{}",
@@ -1418,7 +1479,7 @@ mod tests {
         let cwd = "/work/project";
         let mut current = TranscriptStore::create_new(&sessions_root, cwd).unwrap();
         current.append_user("current session".to_owned()).unwrap();
-        let legacy_project = glint_root.join("projects").join(sanitize_cwd(cwd));
+        let legacy_project = glint_root.join("projects").join(legacy_sanitize_cwd(cwd));
         let mut legacy = TranscriptStore::create_new_in_project_dir(legacy_project).unwrap();
         legacy.append_user("legacy project".to_owned()).unwrap();
         let legacy_archive = glint_root.join("archive");

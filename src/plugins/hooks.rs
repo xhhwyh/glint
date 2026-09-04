@@ -102,6 +102,7 @@ fn run_hook(
     let (program, args) = parts
         .split_first()
         .with_context(|| format!("empty hook command in plugin '{}'", hook.plugin))?;
+    let args = resolve_plugin_relative_args(args, hook.root.as_deref());
     let output_path =
         std::env::temp_dir().join(format!("glint-hook-{}.json", uuid::Uuid::new_v4()));
     let error_path = std::env::temp_dir().join(format!("glint-hook-{}.err", uuid::Uuid::new_v4()));
@@ -109,7 +110,7 @@ fn run_hook(
     let stderr = fs::File::create(&error_path)?;
     let mut command = Command::new(program);
     command
-        .args(args)
+        .args(&args)
         .env("GLINT_PLUGIN", &hook.plugin)
         .env("GLINT_HOOK_EVENT", format!("{event:?}"))
         .current_dir(workspace)
@@ -172,6 +173,47 @@ fn run_hook(
     let value: Value = serde_json::from_str(&stdout)
         .with_context(|| format!("hook from plugin '{}' returned invalid JSON", hook.plugin))?;
     Ok(parse_hook_output(value))
+}
+
+fn resolve_plugin_relative_args(args: &[String], plugin_root: Option<&Path>) -> Vec<String> {
+    let Some(plugin_root) = plugin_root else {
+        return args.to_vec();
+    };
+    let canonical_root = plugin_root.canonicalize().ok();
+
+    args.iter()
+        .map(|argument| {
+            if !argument.contains(['/', '\\']) {
+                return argument.clone();
+            }
+            let relative = Path::new(argument);
+            if relative.is_absolute()
+                || relative.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                })
+            {
+                return argument.clone();
+            }
+            let candidate = plugin_root.join(relative);
+            let Some(canonical_candidate) = candidate.canonicalize().ok() else {
+                return argument.clone();
+            };
+            if canonical_root
+                .as_ref()
+                .is_some_and(|root| canonical_candidate.starts_with(root))
+                && canonical_candidate.is_file()
+            {
+                canonical_candidate.to_string_lossy().into_owned()
+            } else {
+                argument.clone()
+            }
+        })
+        .collect()
 }
 
 fn parse_hook_output(value: Value) -> HookOutput {
@@ -279,19 +321,22 @@ mod tests {
         let workspace = root.join("workspace");
         let plugin_root = root.join("plugin");
         fs::create_dir_all(&workspace).unwrap();
-        fs::create_dir_all(&plugin_root).unwrap();
-        let check_script = script(
-            "roots",
-            &format!(
+        let hooks_dir = plugin_root.join("hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        let check_script = hooks_dir.join("check.py");
+        fs::write(
+            &check_script,
+            format!(
                 "import os\nassert os.getcwd() == {:?}\nassert os.environ['GLINT_PLUGIN_ROOT'] == {:?}\n",
                 workspace.display().to_string(),
                 plugin_root.display().to_string()
             ),
-        );
+        )
+        .unwrap();
         let runner = HookRunner::new(
             vec![PluginHook {
                 event: HookEvent::SessionStart,
-                command: format!("python3 {}", check_script.display()),
+                command: "python3 hooks/check.py".to_owned(),
                 matcher: None,
                 timeout_ms: 2_000,
                 plugin: "rooted".to_owned(),
@@ -305,7 +350,6 @@ mod tests {
             .run(HookEvent::SessionStart, serde_json::json!({}))
             .unwrap();
 
-        fs::remove_file(check_script).ok();
         fs::remove_dir_all(root).ok();
     }
 
