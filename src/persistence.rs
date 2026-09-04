@@ -161,7 +161,7 @@ fn set_new_file_permissions(_path: &Path, _unix_mode: u32) -> Result<()> {
     Ok(())
 }
 
-fn create_private_directory(path: &Path) -> Result<()> {
+pub(crate) fn create_private_directory(path: &Path) -> Result<()> {
     fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
     #[cfg(unix)]
     {

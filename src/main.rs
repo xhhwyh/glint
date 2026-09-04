@@ -5,6 +5,8 @@ mod cli;
 mod commands;
 mod config;
 mod context;
+#[allow(dead_code)]
+mod credentials;
 mod event;
 mod execution;
 #[cfg(test)]
