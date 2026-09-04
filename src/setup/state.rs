@@ -43,6 +43,33 @@ impl SetupState {
         }
     }
 
+    /// Opens a catalog-defined built-in form. Unknown IDs return to the provider list with a
+    /// display-safe error instead of constructing an invalid form.
+    pub fn builtin(catalog: ProviderCatalog, provider_id: &str) -> Self {
+        let list = ProviderListState::from_catalog(&catalog);
+        let Some(provider) = catalog.builtin(provider_id) else {
+            return Self {
+                screen: SetupScreen::Providers(list),
+                error: Some(format!("Built-in provider '{provider_id}' is not defined.")),
+                catalog,
+            };
+        };
+        Self {
+            screen: SetupScreen::Builtin(BuiltinProviderForm::new(
+                provider.id.clone(),
+                provider.name.clone(),
+                provider
+                    .models
+                    .iter()
+                    .map(|model| model.name.clone())
+                    .collect(),
+                list,
+            )),
+            error: None,
+            catalog,
+        }
+    }
+
     pub fn builtin_form_mut(&mut self) -> Option<&mut BuiltinProviderForm> {
         match &mut self.screen {
             SetupScreen::Builtin(form) => Some(form),
@@ -82,7 +109,10 @@ impl SetupState {
                     if let Some(row) = list.selected().cloned().filter(ProviderListRow::can_delete)
                     {
                         next_screen = Some(SetupScreen::ConfirmDelete(DeleteProviderState {
-                            provider_id: row.id().to_owned(),
+                            provider_id: row
+                                .provider_id()
+                                .expect("deletable rows have an ID")
+                                .to_owned(),
                             display_name: row.display_name().to_owned(),
                             focus: DeleteFocus::Confirm,
                             list: Box::new(list.clone()),
@@ -325,7 +355,7 @@ impl ProviderListState {
         Self { rows, focus: 0 }
     }
 
-    fn selected(&self) -> Option<&ProviderListRow> {
+    pub fn selected(&self) -> Option<&ProviderListRow> {
         self.rows.get(self.focus)
     }
 
@@ -361,15 +391,15 @@ pub enum ProviderListRow {
 }
 
 impl ProviderListRow {
-    fn id(&self) -> &str {
+    pub fn provider_id(&self) -> Option<&str> {
         match self {
-            Self::Builtin { provider_id, .. } => provider_id,
-            Self::Custom { name, .. } => name,
-            Self::AddCustom | Self::StartGlint => "",
+            Self::Builtin { provider_id, .. } => Some(provider_id),
+            Self::Custom { name, .. } => Some(name),
+            Self::AddCustom | Self::StartGlint => None,
         }
     }
 
-    fn display_name(&self) -> &str {
+    pub fn display_name(&self) -> &str {
         match self {
             Self::Builtin { display_name, .. } => display_name,
             Self::Custom { name, .. } => name,
@@ -378,7 +408,37 @@ impl ProviderListRow {
         }
     }
 
-    fn can_delete(&self) -> bool {
+    pub fn configured(&self) -> bool {
+        matches!(
+            self,
+            Self::Builtin {
+                configured: true,
+                ..
+            } | Self::Custom { .. }
+        )
+    }
+
+    pub fn needs_credential(&self) -> bool {
+        match self {
+            Self::Builtin {
+                needs_credential, ..
+            }
+            | Self::Custom {
+                needs_credential, ..
+            } => *needs_credential,
+            Self::AddCustom | Self::StartGlint => false,
+        }
+    }
+
+    pub fn model_count(&self) -> usize {
+        match self {
+            Self::Builtin { model_count, .. } => *model_count,
+            Self::Custom { models, .. } => models.len(),
+            Self::AddCustom | Self::StartGlint => 0,
+        }
+    }
+
+    pub fn can_delete(&self) -> bool {
         matches!(
             self,
             Self::Builtin {
@@ -772,8 +832,14 @@ pub fn apply_setup_effect(
         return Ok(None);
     }
 
+    if state.refresh_provider_list(manager).is_err() {
+        state.error = Some(
+            "Unable to save provider configuration. Please review the form and try again.".into(),
+        );
+        return Ok(None);
+    }
+
     state.error = None;
-    state.refresh_provider_list(manager)?;
     Ok(None)
 }
 
@@ -822,6 +888,16 @@ mod tests {
 
         assert_eq!(effect, None);
         assert!(matches!(state.screen, SetupScreen::Providers(_)));
+    }
+
+    #[test]
+    fn builtin_constructor_opens_the_requested_catalog_form() {
+        let mut state = SetupState::builtin(test_catalog(), "deepseek");
+
+        let form = state.builtin_form_mut().expect("built-in form");
+
+        assert_eq!(form.provider_id, "deepseek");
+        assert_eq!(form.models, ["deepseek-v4-flash", "deepseek-v4-pro"]);
     }
 
     #[test]
@@ -936,6 +1012,40 @@ mod tests {
         assert_eq!(form.focus, CustomFocus::Model(0));
         let error = state.error.as_deref().expect("save error");
         assert!(!error.contains("secret-value"));
+    }
+
+    #[test]
+    fn refresh_failure_after_a_successful_save_stays_redacted_and_keeps_the_form() {
+        let fixture = ManagerFixture::new();
+        fixture.credentials.fail_get_after(2);
+        let mut manager = fixture.manager();
+        let mut state = SetupState::builtin(test_catalog(), "deepseek");
+        let form = state.builtin_form_mut().expect("built-in form");
+        form.api_key.set("secret-value");
+        form.focus = BuiltinFocus::Save;
+
+        let outcome = apply_setup_effect(
+            &mut manager,
+            &mut state,
+            SetupEffect::SaveBuiltin {
+                provider_id: "deepseek".into(),
+                api_key: Some("secret-value".into()),
+            },
+        )
+        .expect("refresh failures become state errors");
+
+        assert_eq!(outcome, None);
+        assert_eq!(manager.user_config().configured_providers, ["deepseek"]);
+        let form = state.builtin_form_mut().expect("form stays visible");
+        assert_eq!(form.api_key.value, "secret-value");
+        assert_eq!(form.focus, BuiltinFocus::Save);
+        assert!(
+            !state
+                .error
+                .as_deref()
+                .expect("redacted refresh error")
+                .contains("secret-value")
+        );
     }
 
     #[test]
@@ -1060,10 +1170,30 @@ mod tests {
     #[derive(Clone, Default)]
     struct MemoryCredentialStore {
         values: Arc<Mutex<BTreeMap<String, String>>>,
+        get_calls: Arc<std::sync::atomic::AtomicUsize>,
+        fail_get_after: Arc<Mutex<Option<usize>>>,
+    }
+
+    impl MemoryCredentialStore {
+        fn fail_get_after(&self, successful_gets: usize) {
+            *self.fail_get_after.lock().expect("failure lock") = Some(successful_gets);
+        }
     }
 
     impl CredentialStore for MemoryCredentialStore {
         fn get(&self, id: &CredentialId) -> Result<Option<String>> {
+            let call = self
+                .get_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if self
+                .fail_get_after
+                .lock()
+                .expect("failure lock")
+                .is_some_and(|successful_gets| call > successful_gets)
+            {
+                bail!("injected credential refresh failure for secret-value")
+            }
             Ok(self
                 .values
                 .lock()
