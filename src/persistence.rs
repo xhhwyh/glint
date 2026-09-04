@@ -43,14 +43,16 @@ impl AtomicFileWriter for FsAtomicFileWriter {
             let _ = fs::remove_file(&temporary);
             return Err(error);
         }
-        if let Some(permissions) = existing_permissions
-            && let Err(error) = fs::set_permissions(&temporary, permissions).with_context(|| {
+        let permission_result = match existing_permissions {
+            Some(permissions) => fs::set_permissions(&temporary, permissions).with_context(|| {
                 format!(
                     "failed to preserve permissions for temporary configuration {}",
                     temporary.display()
                 )
-            })
-        {
+            }),
+            None => set_new_file_permissions(&temporary, unix_mode),
+        };
+        if let Err(error) = permission_result {
             let _ = fs::remove_file(&temporary);
             return Err(error);
         }
@@ -144,6 +146,19 @@ fn open_private_file(path: &Path, unix_mode: u32) -> std::io::Result<std::fs::Fi
 #[cfg(not(unix))]
 fn open_private_file(path: &Path, _unix_mode: u32) -> std::io::Result<std::fs::File> {
     OpenOptions::new().write(true).create_new(true).open(path)
+}
+
+#[cfg(unix)]
+fn set_new_file_permissions(path: &Path, unix_mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(unix_mode))
+        .with_context(|| format!("failed to restrict permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_new_file_permissions(_path: &Path, _unix_mode: u32) -> Result<()> {
+    Ok(())
 }
 
 fn create_private_directory(path: &Path) -> Result<()> {

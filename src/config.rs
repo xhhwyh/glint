@@ -698,7 +698,7 @@ fn non_empty_string(value: String) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, sync::Arc};
+    use std::{fs, process::Command, sync::Arc};
 
     use super::*;
     use crate::{
@@ -822,6 +822,41 @@ lsp:
             fs::metadata(paths.config()).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_config_first_save_sets_mode_despite_restrictive_umask() {
+        const CHILD_ENV: &str = "GLINT_TEST_RESTRICTIVE_UMASK";
+        const TEST_NAME: &str =
+            "config::tests::user_config_first_save_sets_mode_despite_restrictive_umask";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let root = temp_dir("restrictive-umask-user-config");
+            fs::create_dir_all(&root).unwrap();
+            unsafe {
+                libc::umask(0o700);
+            }
+            let paths = GlintPaths::from_home(&root);
+            let store = UserConfigStore::new(paths.clone());
+
+            store.save(&UserConfig::default()).unwrap();
+
+            assert_eq!(
+                fs::metadata(paths.config()).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            return;
+        }
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     #[cfg(unix)]
