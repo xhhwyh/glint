@@ -9,7 +9,7 @@ Glint is a Rust 2024 TUI for chatting with an OpenAI-compatible LLM endpoint. It
 ## Commands
 
 ```bash
-cargo run                         # Run TUI; requires a resolved config and API key env var
+cargo run                         # Run TUI; opens interactive model setup when unconfigured
 cargo build                       # Build debug binary
 cargo fmt                         # Format Rust code
 cargo check                       # Fast compile check
@@ -40,33 +40,25 @@ Use `git branch -d` so Git verifies the branch has merged. If merge happened via
 
 ## Runtime Config
 
-`Config::load` resolves configuration from `--config`, `GLINT_CONFIG`, project-local `.glint/config.yaml`, the user config directory, then legacy `config.yaml` in the current directory. The default system prompt is embedded in the binary. Commands that persist configuration write back to the selected file. The selected `llm.provider` must match an entry under `llm.providers`, and the selected `llm.model` must be listed in that provider's `models`:
+`GlintPaths::discover` derives one fixed state root from `HOME`: `~/.glint`. It never reads configuration from the workspace, source tree, or an override environment variable. The user-editable document is always `~/.glint/config.yaml`; the default system prompt and built-in provider catalog are embedded in the executable. There is no initialization subcommand or configuration-path option.
+
+The model setup UI owns built-in provider selection and credentials. Built-in provider metadata remains embedded; enabling one with its API key makes all of its shipped models available. An existing protected `~/.glint/auth.json` is authoritative; otherwise credentials prefer the OS keyring. A fresh installation falls back to that protected file when the keyring is unavailable. If a configured provider's keyring becomes unavailable, startup enters setup/repair; the first explicit key save creates and switches to the file backend. Never add API keys to YAML or environment-based LLM settings.
+
+The persisted model schema is intentionally small:
 
 ```yaml
+version: 1
 llm:
-  provider: default
-  model: model-name
+  provider: deepseek
+  model: deepseek-v4-flash
   temperature: 0.7
   max_tokens: 8196
-  context_window: 65536 # optional
-  providers:
-    default:
-      description: Default OpenAI-compatible endpoint
-      base_url: https://example.com/v1
-      unit: USD
-      models:
-        - name: model-name
-          positioning: General-purpose chat
-          input: 1.00
-          output: 2.00
-          cache_read: 0.02
-          context: 1000000
-          max_tokens: 384000
-        - other-model
-      prompt_cache:
-        key: glint-default
-        retention: 24h
-      api_key_env: LLM_API_KEY
+configured_providers:
+  - deepseek
+custom_providers:
+  Team Gateway:
+    base_url: https://llm.example.com/v1
+    models: [code-large, code-fast]
 lsp:
   servers:
     rust:
@@ -78,11 +70,11 @@ lsp:
       max_restarts: 3
 ```
 
-Provider entries own `description`, `base_url`, optional token-cost `unit`, `models`, optional `prompt_cache`, and `api_key_env`; global LLM settings own the selected `provider`, selected `model`, `temperature`, `max_tokens`, and optional `context_window`. A model entry can be a plain model name or an object with `name`, `positioning`, `input`, `output`, `cache_read`, `cache_write`, `context`, `max_tokens`, or `price` for `/model` picker display. Provider `unit` is converted to a price symbol, such as `￥` for RMB/CNY or `$` for USD, and appended to each input/output/cache price value when present. Numeric model `context` values are also used as the status-bar context window, with global `context_window` as fallback. Provider `prompt_cache.key` is sent as OpenAI-compatible `prompt_cache_key`, and `prompt_cache.retention` is sent as `prompt_cache_retention`; only enable it for endpoints that accept those request fields. API keys must come from the environment variable named by `api_key_env`; never hardcode or leak secrets. The HTTP client trims trailing slashes from `base_url`, posts to `{base_url}/chat/completions`, and expects `choices[0].message.content`.
+`configured_providers` contains only built-in IDs; `custom_providers` contains a display name, compatible base URL, and ordered non-empty model names. `llm` is omitted when no model is configured. Empty optional `configured_providers`, `custom_providers`, `mcp`, `plugins`, and `lsp` sections are omitted. Custom names are case-insensitively unique and cannot collide with built-in identities.
 
-The optional `lsp.servers` block configures stdio language servers by file extension. If `lsp.servers` is omitted, Glint registers the Rust default shown above. If it is present, the configured servers replace the default set.
+The optional `lsp.servers` block configures stdio language servers by file extension. If `lsp.servers` is omitted, Glint registers the Rust default shown above. If present, its configured servers replace that default. The `mcp` and `plugins` blocks use the schemas in `EXTENSIONS.md`.
 
-The optional `mcp.servers` and `plugins` blocks configure stdio/Streamable HTTP MCP servers and local/Git plugins. See `EXTENSIONS.md` for the complete schemas, plugin manifest conventions, hooks, OAuth, approval policy, and commands.
+Core state lives below `~/.glint`: configuration, optional `auth.json`, default plugin cache and state, MCP OAuth state, and sessions. `plugins.cache_dir` can instead place plugin cache and install state at an explicit path, including an absolute one. The startup working directory remains the workspace. It is the root for coding tools and LSP, the default and relative cwd for MCP processes, MCP's advertised root, and hook process cwd. Plugins resolve relative sources from `~/.glint`, while hooks retain `GLINT_PLUGIN_ROOT` and `CLAUDE_PLUGIN_ROOT` for plugin-owned resources.
 
 ## Architecture
 
@@ -92,7 +84,7 @@ agent thread -> AgentEvent -> AppEvent::Agent -> App::update -> ui::render
 ```
 
 - `src/main.rs`: config load, terminal lifecycle, render loop, Crossterm polling, agent event draining.
-- `src/config.rs`: YAML config and model metadata load, base URL trim, API key env resolution.
+- `src/config.rs`: user YAML schema, runtime LLM/LSP configuration, and extension-section parsing.
 - `src/app.rs`: central state machine; route state changes through `App::update`.
 - `src/commands/`: slash-command registry and matching.
 - `src/context/`: runtime context and initial model-message construction.

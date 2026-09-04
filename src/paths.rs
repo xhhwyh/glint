@@ -52,10 +52,7 @@ impl GlintPaths {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        path::Path,
-        sync::{Mutex, OnceLock},
-    };
+    use std::{path::Path, process::Command};
 
     use super::GlintPaths;
 
@@ -74,51 +71,32 @@ mod tests {
 
     #[test]
     fn discover_ignores_legacy_config_environment_overrides() {
-        let _environment = environment_lock().lock().unwrap();
-        let _restore = EnvironmentRestore::capture(&["GLINT_CONFIG", "XDG_CONFIG_HOME"]);
-        unsafe {
-            std::env::set_var("GLINT_CONFIG", "/tmp/legacy-glint.yaml");
-            std::env::set_var("XDG_CONFIG_HOME", "/tmp/legacy-xdg");
+        if std::env::var_os("GLINT_PATHS_CHILD_TEST").is_some() {
+            let paths = GlintPaths::discover().unwrap();
+            assert_eq!(paths.root(), Path::new("/tmp/glint-paths-child/.glint"));
+            assert_eq!(
+                paths.config(),
+                Path::new("/tmp/glint-paths-child/.glint/config.yaml")
+            );
+            return;
         }
 
-        let home = std::env::var_os("HOME").expect("test process has HOME");
-        let paths = GlintPaths::discover().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "paths::tests::discover_ignores_legacy_config_environment_overrides",
+            ])
+            .env("GLINT_PATHS_CHILD_TEST", "1")
+            .env("HOME", "/tmp/glint-paths-child")
+            .env("GLINT_CONFIG", "/tmp/legacy-glint.yaml")
+            .env("XDG_CONFIG_HOME", "/tmp/legacy-xdg")
+            .output()
+            .unwrap();
 
-        assert_eq!(paths.root(), Path::new(&home).join(".glint"));
-        assert_eq!(paths.config(), Path::new(&home).join(".glint/config.yaml"));
-    }
-
-    fn environment_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    struct EnvironmentRestore {
-        values: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    }
-
-    impl EnvironmentRestore {
-        fn capture(names: &[&'static str]) -> Self {
-            Self {
-                values: names
-                    .iter()
-                    .map(|name| (*name, std::env::var_os(name)))
-                    .collect(),
-            }
-        }
-    }
-
-    impl Drop for EnvironmentRestore {
-        fn drop(&mut self) {
-            for (name, value) in &self.values {
-                unsafe {
-                    if let Some(value) = value {
-                        std::env::set_var(name, value);
-                    } else {
-                        std::env::remove_var(name);
-                    }
-                }
-            }
-        }
+        assert!(
+            output.status.success(),
+            "child path assertion failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

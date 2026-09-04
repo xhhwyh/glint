@@ -42,7 +42,7 @@ Use `git branch -d` so Git verifies the branch has merged. If merge happened via
 
 `GlintPaths::discover` derives one fixed state root from `HOME`: `~/.glint`. It never reads configuration from the workspace, source tree, or an override environment variable. The user-editable document is always `~/.glint/config.yaml`; the default system prompt and built-in provider catalog are embedded in the executable. There is no initialization subcommand or configuration-path option.
 
-The model setup UI owns built-in provider selection and credentials. Built-in provider metadata remains embedded; enabling one with its API key makes all of its shipped models available. Credentials prefer the OS keyring and use protected `~/.glint/auth.json` only when a fresh install cannot access the keyring. Never add API keys to YAML or environment-based LLM settings.
+The model setup UI owns built-in provider selection and credentials. Built-in provider metadata remains embedded; enabling one with its API key makes all of its shipped models available. An existing protected `~/.glint/auth.json` is authoritative; otherwise credentials prefer the OS keyring. A fresh installation falls back to that protected file when the keyring is unavailable. If a configured provider's keyring becomes unavailable, startup enters setup/repair; the first explicit key save creates and switches to the file backend. Never add API keys to YAML or environment-based LLM settings.
 
 The persisted model schema is intentionally small:
 
@@ -74,7 +74,7 @@ lsp:
 
 The optional `lsp.servers` block configures stdio language servers by file extension. If `lsp.servers` is omitted, Glint registers the Rust default shown above. If present, its configured servers replace that default. The `mcp` and `plugins` blocks use the schemas in `EXTENSIONS.md`.
 
-Global state lives below `~/.glint`: configuration, optional `auth.json`, plugin cache and state, MCP OAuth state, and sessions. The startup working directory remains the workspace. It is the root for coding tools and LSP, the default and relative cwd for MCP processes, MCP's advertised root, and hook process cwd. Plugins resolve relative sources from `~/.glint`, while hooks retain `GLINT_PLUGIN_ROOT` and `CLAUDE_PLUGIN_ROOT` for plugin-owned resources.
+Core state lives below `~/.glint`: configuration, optional `auth.json`, default plugin cache and state, MCP OAuth state, and sessions. `plugins.cache_dir` can instead place plugin cache and install state at an explicit path, including an absolute one. The startup working directory remains the workspace. It is the root for coding tools and LSP, the default and relative cwd for MCP processes, MCP's advertised root, and hook process cwd. Plugins resolve relative sources from `~/.glint`, while hooks retain `GLINT_PLUGIN_ROOT` and `CLAUDE_PLUGIN_ROOT` for plugin-owned resources.
 
 ## Architecture
 
@@ -84,7 +84,7 @@ agent thread -> AgentEvent -> AppEvent::Agent -> App::update -> ui::render
 ```
 
 - `src/main.rs`: config load, terminal lifecycle, render loop, Crossterm polling, agent event draining.
-- `src/config.rs`: YAML config and model metadata load, base URL trim, API key env resolution.
+- `src/config.rs`: user YAML schema, runtime LLM/LSP configuration, and extension-section parsing.
 - `src/app.rs`: central state machine; route state changes through `App::update`.
 - `src/commands/`: slash-command registry and matching.
 - `src/context/`: runtime context and initial model-message construction.

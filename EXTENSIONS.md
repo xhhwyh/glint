@@ -2,7 +2,7 @@
 
 Glint loads plugins and MCP servers from optional blocks in its fixed user configuration, `~/.glint/config.yaml`. Plugin contributions are merged before the agent, LSP manager, MCP manager, slash-command registry, and system prompt are created. Treat plugins and MCP servers as trusted code: command hooks and stdio servers run local processes with the Glint user's permissions.
 
-Global extension state stays below `~/.glint`: plugin cache and install state are under `plugins/`, and MCP-owned OAuth state is under `mcp/`. The directory from which Glint starts is the workspace: coding tools and LSP use it as their root; MCP uses it as its advertised root and default/relative process cwd; hooks run there. Relative plugin and marketplace sources instead resolve from `~/.glint`. Hook resource variables retain the plugin root, so workspace execution does not make plugin-owned resources ambiguous.
+By default, extension state stays below `~/.glint`: plugin cache and install state are under `plugins/`, and MCP-owned OAuth state is under `mcp/`. An explicit `plugins.cache_dir` moves the plugin cache and install state to that path, including when it is absolute. The directory from which Glint starts is the workspace: coding tools and LSP use it as their root; MCP uses it as its advertised root and default/relative process cwd; hooks run there. Relative plugin and marketplace sources instead resolve from `~/.glint`. Hook resource variables retain the plugin root, so workspace execution does not make plugin-owned resources ambiguous.
 
 ## MCP configuration
 
@@ -111,7 +111,7 @@ Use the built-in commands to manage marketplaces and installed plugins:
 /reload-plugins
 ```
 
-Marketplace additions and installed-plugin state are stored in `~/.glint/plugins/state.json` by default. If `plugins.cache_dir` is set, the state file is stored inside that directory. Mutations reload skills, commands, hooks, MCP servers, and LSP servers into the current session without restarting Glint.
+Marketplace additions and installed-plugin state are stored in `~/.glint/plugins/state.json` by default. If `plugins.cache_dir` is set, the state file is stored inside that directory; an absolute cache path is intentionally outside `~/.glint`. Mutations reload skills, commands, hooks, MCP servers, and LSP servers into the current session without restarting Glint.
 
 `/plugins` opens the full-screen plugin manager. Its `Installed` tab lists installed plugins, their enabled state, source, path, and registered commands, skills, agents, hooks, MCP servers, LSP servers, and settings. Press `Space` to enable or disable a marketplace-installed plugin and `Enter` to inspect it. The `Marketplaces` tab lists configured marketplaces and their available plugins. Select `Add marketplace` to enter a source; Git download activity is captured and displayed inside the TUI instead of writing to the terminal. Press `Space` on a marketplace plugin to install or uninstall it.
 

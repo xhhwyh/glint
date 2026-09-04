@@ -28,7 +28,7 @@ Use `/model` while chatting to switch among configured models or choose `Add mod
 
 ## Configuration and credentials
 
-All Glint state has one fixed root, `~/.glint`. The user-editable settings file is `~/.glint/config.yaml`; Glint creates a concise file and omits empty optional sections. A typical file looks like this:
+Core Glint state has one fixed root, `~/.glint`. The user-editable settings file is `~/.glint/config.yaml`; Glint creates a concise file and omits empty optional sections. A typical file looks like this:
 
 ```yaml
 version: 1
@@ -45,9 +45,9 @@ custom_providers:
     models: [code-large, code-fast]
 ```
 
-Built-in provider metadata and keys are deliberately absent from this file. API keys prefer the operating-system keyring. If the keyring is unavailable on a fresh install, Glint stores them in `~/.glint/auth.json`, with protected directory and file permissions on Unix. Never add credentials to YAML, commands, logs, or transcripts.
+Built-in provider metadata and keys are deliberately absent from this file. An existing protected `~/.glint/auth.json` is authoritative; otherwise Glint prefers the operating-system keyring. If the keyring is unavailable on a fresh install, it creates the protected file instead. If a configured provider's keyring becomes unavailable, Glint opens setup for repair; the first explicit key save creates and switches to the file backend. Never add credentials to YAML, commands, logs, or transcripts.
 
-Optional `mcp`, `plugins`, and `lsp` blocks also belong in this file. Their schemas, persistence locations, and workspace behavior are documented in [EXTENSIONS.md](EXTENSIONS.md). The core contributor-facing schema is in [AGENTS.md](AGENTS.md).
+Optional `mcp`, `plugins`, and `lsp` blocks also belong in this file. MCP and session state remain below `~/.glint`; plugin cache and install state do too by default. An explicit `plugins.cache_dir`, including an absolute path, moves that plugin cache and state outside the root. Their schemas and workspace behavior are documented in [EXTENSIONS.md](EXTENSIONS.md). The core contributor-facing schema is in [AGENTS.md](AGENTS.md).
 
 ## Upgrading and uninstalling
 
@@ -59,7 +59,7 @@ Rerun the installer to update. To remove the installer-managed binary:
 rm ~/.local/bin/glint
 ```
 
-This intentionally leaves `~/.glint`—configuration, credentials, plugin state, MCP state, and saved conversations—intact.
+This intentionally leaves `~/.glint`—configuration, credentials, default plugin state, MCP state, and saved conversations—intact. It also leaves any explicitly configured plugin cache directory intact.
 
 ## Develop
 
