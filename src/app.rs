@@ -20,7 +20,7 @@ use crate::{
     },
     approval::{AgentControl, ApprovalFocus, ApprovalPrompt},
     commands::{SlashCommand, SlashCommandKind, matching_slash_commands},
-    config::{Config, ModelCatalog, ModelCatalogEntry, ProviderCatalogEntry},
+    config::Config,
     configuration::{AvailableProvider, ConfigurationManager},
     event::{
         AppEvent, ExtensionMouseAction, KeyAction, KeyInput, McpMouseAction, MouseAction,
@@ -54,7 +54,7 @@ use crate::{
 };
 
 #[cfg(test)]
-use crate::config::{LlmConfig, LlmProviderConfig, LspConfig};
+use crate::config::{LlmConfig, LlmProviderConfig, LspConfig, ModelCatalog};
 #[cfg(test)]
 use crate::{
     credentials::{CredentialId, FileCredentialStore},
@@ -706,6 +706,7 @@ impl App {
     pub fn update(&mut self, event: AppEvent) {
         match event {
             AppEvent::Key(key) => self.update_key(key),
+            AppEvent::Mouse(_) | AppEvent::ExtensionMouse(_) if self.model_setup.is_some() => {}
             AppEvent::Mouse(mouse) => self.update_mouse(mouse),
             AppEvent::ExtensionMouse(mouse) => self.update_extension_mouse(mouse),
             AppEvent::Agent(event) => self.update_agent(event),
@@ -1773,7 +1774,7 @@ impl App {
             return;
         };
 
-        let mut selected_llm = match self.configuration.select_model(&provider_name, &model_name) {
+        let selected = match self.configuration.select_model(&provider_name, &model_name) {
             Ok(selected) => selected,
             Err(_) => {
                 if let Some(picker) = self.model_picker.as_mut() {
@@ -1782,27 +1783,8 @@ impl App {
                 return;
             }
         };
-        let api_key = selected_llm.api_key.clone();
-        if selected_llm
-            .switch_model(&provider_name, &model_name, Some(api_key))
-            .is_err()
-        {
-            if let Some(picker) = self.model_picker.as_mut() {
-                picker.error = Some(model_configuration_error());
-            }
-            return;
-        }
-        let providers = match self.configuration.available_providers() {
-            Ok(providers) => providers,
-            Err(_) => {
-                if let Some(picker) = self.model_picker.as_mut() {
-                    picker.error = Some(model_configuration_error());
-                }
-                return;
-            }
-        };
-        self.config.llm = selected_llm;
-        self.config.model_catalog = self.model_catalog_from_available(&providers);
+        self.config.llm = selected.llm;
+        self.config.model_catalog = selected.model_catalog;
 
         let command = self.input.take_trimmed();
         let command = if command.is_empty() {
@@ -1906,76 +1888,13 @@ impl App {
     }
 
     fn refresh_model_runtime(&mut self) -> Result<bool> {
-        let providers = self.configuration.available_providers()?;
-        if providers.is_empty() {
+        if self.configuration.user_config().llm.is_none() {
             return Ok(false);
         }
-        let selection = self
-            .configuration
-            .user_config()
-            .llm
-            .as_ref()
-            .context("model selection was not repaired")?
-            .clone();
-        let mut llm = self
-            .configuration
-            .select_model(&selection.provider, &selection.model)?;
-        let api_key = llm.api_key.clone();
-        llm.switch_model(&selection.provider, &selection.model, Some(api_key))?;
-        self.config.llm = llm;
-        self.config.model_catalog = self.model_catalog_from_available(&providers);
+        let runtime = self.configuration.build_model_runtime()?;
+        self.config.llm = runtime.llm;
+        self.config.model_catalog = runtime.model_catalog;
         Ok(true)
-    }
-
-    fn model_catalog_from_available(&self, providers: &[AvailableProvider]) -> ModelCatalog {
-        let mut catalog = ModelCatalog::default();
-        for provider in providers {
-            let unit = self
-                .provider_catalog
-                .builtin(&provider.id)
-                .map(|definition| definition.unit.clone())
-                .unwrap_or_default();
-            catalog.providers.insert(
-                provider.id.clone(),
-                ProviderCatalogEntry {
-                    description: provider.description.clone(),
-                    unit,
-                },
-            );
-            catalog.models.insert(
-                provider.id.clone(),
-                provider
-                    .models
-                    .iter()
-                    .filter_map(|model| {
-                        let metadata = &model.metadata;
-                        let entry = ModelCatalogEntry {
-                            positioning: metadata.positioning.clone(),
-                            context: metadata
-                                .context
-                                .map(|value| value.to_string())
-                                .unwrap_or_default(),
-                            max_tokens: metadata.max_tokens.clone(),
-                            price: metadata.price.clone(),
-                            input: metadata.input.clone(),
-                            output: metadata.output.clone(),
-                            cache_read: metadata.cache_read.clone(),
-                            cache_write: metadata.cache_write.clone(),
-                        };
-                        let has_metadata = !entry.positioning.is_empty()
-                            || !entry.context.is_empty()
-                            || !entry.max_tokens.is_empty()
-                            || !entry.price.is_empty()
-                            || !entry.input.is_empty()
-                            || !entry.output.is_empty()
-                            || !entry.cache_read.is_empty()
-                            || !entry.cache_write.is_empty();
-                        has_metadata.then_some((model.name.clone(), entry))
-                    })
-                    .collect(),
-            );
-        }
-        catalog
     }
 
     fn set_model_setup_error(&mut self) {
@@ -3419,6 +3338,7 @@ impl App {
     fn input_mouse_enabled(&self) -> bool {
         self.status == AgentStatus::Idle
             && self.approval.is_none()
+            && self.model_setup.is_none()
             && self.model_picker.is_none()
             && self.resume_picker.is_none()
             && self.status_view.is_none()
@@ -4423,17 +4343,24 @@ fn read_trusted_persisted_output_preview(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, fs, path::PathBuf, time::Duration};
+    use std::{
+        collections::HashMap,
+        fs,
+        path::{Path, PathBuf},
+        sync::{Arc, Mutex, atomic::AtomicUsize},
+        time::Duration,
+    };
 
     use crate::{
         agent::provider::{FinishReason, ToolCall, ToolResult},
         agent::should_auto_compact,
         commands::SLASH_COMMANDS,
+        config::UserConfig,
         configuration::ConfigurationManager,
-        credentials::FileCredentialStore,
+        credentials::{CredentialStore, FileCredentialStore},
         execution::ExecutionRegion,
         paths::GlintPaths,
-        persistence::UserConfigStore,
+        persistence::{UserConfigRepository, UserConfigStore},
         plugins::PluginsConfig,
         provider_catalog::ProviderCatalog,
         runtime::AssistantRecord,
@@ -4447,6 +4374,132 @@ mod tests {
 
     fn app() -> App {
         App::test_empty()
+    }
+
+    #[derive(Clone)]
+    struct CountingUserConfigStore {
+        config: Arc<Mutex<Option<UserConfig>>>,
+        save_calls: Arc<AtomicUsize>,
+        path: PathBuf,
+    }
+
+    impl CountingUserConfigStore {
+        fn new(path: PathBuf) -> Self {
+            Self {
+                config: Arc::new(Mutex::new(None)),
+                save_calls: Arc::new(AtomicUsize::new(0)),
+                path,
+            }
+        }
+
+        fn reset_save_count(&self) {
+            self.save_calls
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn save_count(&self) -> usize {
+            self.save_calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl UserConfigRepository for CountingUserConfigStore {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn load(&self) -> Result<Option<UserConfig>> {
+            Ok(self.config.lock().unwrap().clone())
+        }
+
+        fn save(&self, config: &UserConfig) -> Result<()> {
+            self.save_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            *self.config.lock().unwrap() = Some(config.clone());
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FaultCredentialStore {
+        values: Arc<Mutex<HashMap<String, String>>>,
+        get_calls: Arc<AtomicUsize>,
+        fail_get_call: Arc<Mutex<Option<usize>>>,
+    }
+
+    impl FaultCredentialStore {
+        fn get_count(&self) -> usize {
+            self.get_calls.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn fail_get_call(&self, call: usize) {
+            *self.fail_get_call.lock().unwrap() = Some(call);
+        }
+    }
+
+    impl CredentialStore for FaultCredentialStore {
+        fn get(&self, id: &CredentialId) -> Result<Option<String>> {
+            let call = self
+                .get_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if *self.fail_get_call.lock().unwrap() == Some(call) {
+                bail!("injected credential read failure");
+            }
+            Ok(self.values.lock().unwrap().get(id.as_str()).cloned())
+        }
+
+        fn set(&self, id: &CredentialId, api_key: &str) -> Result<()> {
+            self.values
+                .lock()
+                .unwrap()
+                .insert(id.as_str().to_owned(), api_key.to_owned());
+            Ok(())
+        }
+
+        fn delete(&self, id: &CredentialId) -> Result<()> {
+            self.values.lock().unwrap().remove(id.as_str());
+            Ok(())
+        }
+    }
+
+    fn app_with_counting_stores() -> (App, CountingUserConfigStore, FaultCredentialStore) {
+        let home = std::env::temp_dir().join(format!(
+            "glint-model-counting-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = GlintPaths::from_home(home);
+        let repository = CountingUserConfigStore::new(paths.config());
+        let credentials = FaultCredentialStore::default();
+        let mut configuration = ConfigurationManager::new(
+            paths.clone(),
+            ProviderCatalog::embedded().unwrap(),
+            Box::new(repository.clone()),
+            Box::new(credentials.clone()),
+        )
+        .unwrap();
+        configuration
+            .save_builtin("deepseek", Some("test-key"))
+            .unwrap();
+        let runtime = configuration.build_model_runtime().unwrap();
+        let config = Config {
+            config_path: paths.config(),
+            llm: runtime.llm,
+            model_catalog: runtime.model_catalog,
+            lsp: LspConfig::default(),
+            mcp: Default::default(),
+            extensions: Default::default(),
+            system_prompt: "system".to_owned(),
+            plugins: Default::default(),
+            base_lsp: LspConfig::default(),
+            base_mcp: Default::default(),
+            base_system_prompt: "system".to_owned(),
+        };
+        repository.reset_save_count();
+        (
+            App::new(config, configuration).unwrap(),
+            repository,
+            credentials,
+        )
     }
 
     fn send_key(app: &mut App, action: KeyAction) {
@@ -4477,13 +4530,13 @@ mod tests {
             .as_ref()
             .expect("selected model")
             .clone();
-        let llm = configuration
+        let model_runtime = configuration
             .select_model(&selection.provider, &selection.model)
             .expect("runtime model configuration");
         let config = Config {
             config_path: paths.config(),
-            llm,
-            model_catalog: ModelCatalog::default(),
+            llm: model_runtime.llm,
+            model_catalog: model_runtime.model_catalog,
             lsp: LspConfig::default(),
             mcp: Default::default(),
             extensions: Default::default(),
@@ -7479,5 +7532,99 @@ mod tests {
                 .any(|provider| provider.id == "test")
         );
         assert_eq!(app.config.llm.api_key, "test-key");
+    }
+
+    #[test]
+    fn setup_save_delete_and_start_do_not_add_runtime_refresh_writes() {
+        let (mut app, repository, _) = app_with_counting_stores();
+        open_model_picker_through_update(&mut app);
+        send_key(&mut app, KeyAction::Down);
+        send_key(&mut app, KeyAction::Submit);
+
+        send_key(&mut app, KeyAction::Submit);
+        send_key(&mut app, KeyAction::Tab);
+        send_key(&mut app, KeyAction::Submit);
+        assert_eq!(repository.save_count(), 1, "provider save only");
+
+        repository.reset_save_count();
+        send_key(&mut app, KeyAction::Up);
+        send_key(&mut app, KeyAction::Submit);
+        assert_eq!(repository.save_count(), 0, "Start Glint is read-only");
+        assert!(app.model_setup.is_none());
+
+        open_model_picker_through_update(&mut app);
+        send_key(&mut app, KeyAction::Down);
+        send_key(&mut app, KeyAction::Submit);
+        repository.reset_save_count();
+        send_key(&mut app, KeyAction::Delete);
+        send_key(&mut app, KeyAction::Submit);
+        assert_eq!(repository.save_count(), 1, "provider delete only");
+        assert!(app.model_setup.is_some());
+    }
+
+    #[test]
+    fn model_switch_has_no_fallible_refresh_after_persistence() {
+        let (mut app, repository, credentials) = app_with_counting_stores();
+        open_model_picker_through_update(&mut app);
+        send_key(&mut app, KeyAction::Submit);
+        send_key(&mut app, KeyAction::Down);
+        let rejected_post_persistence_read = credentials.get_count() + 3;
+        credentials.fail_get_call(rejected_post_persistence_read);
+
+        send_key(&mut app, KeyAction::Submit);
+
+        let persisted = repository.load().unwrap().unwrap().llm.unwrap();
+        assert_eq!(persisted.model, "deepseek-v4-pro");
+        assert_eq!(app.config.llm.model, "deepseek-v4-pro");
+        assert!(app.model_picker.is_none());
+        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.runtime.ui_messages(), app.messages);
+        assert_eq!(app.runtime.model_history().len(), 2);
+        assert_eq!(repository.save_count(), 1);
+        assert_eq!(credentials.get_count(), rejected_post_persistence_read - 1);
+    }
+
+    #[test]
+    fn model_setup_disables_input_and_hidden_chat_mouse_actions() {
+        let (mut app, id) = app_with_execution_hitboxes();
+        app.scroll = 5;
+        app.model_setup = Some(SetupState::welcome(&app.provider_catalog));
+
+        assert!(!app.input_mouse_enabled());
+        app.update(AppEvent::Mouse(MouseAction::ScrollUp { column: 0, row: 0 }));
+        app.update(AppEvent::Mouse(MouseAction::LeftDown { column: 1, row: 4 }));
+
+        assert_eq!(app.scroll, 5);
+        assert!(!app.is_execution_expanded(&id));
+        assert!(app.text_selection.is_none());
+    }
+
+    #[test]
+    fn model_setup_suppresses_extension_mouse_actions() {
+        let mut app = app();
+        app.resume_picker = Some(ResumePicker {
+            sessions: vec![
+                TranscriptSessionSummary {
+                    path: PathBuf::from("one.jsonl"),
+                    session_id: "one".to_owned(),
+                    title: "One".to_owned(),
+                    last_timestamp: 1,
+                },
+                TranscriptSessionSummary {
+                    path: PathBuf::from("two.jsonl"),
+                    session_id: "two".to_owned(),
+                    title: "Two".to_owned(),
+                    last_timestamp: 2,
+                },
+            ],
+            selected: 0,
+        });
+        app.model_setup = Some(SetupState::welcome(&app.provider_catalog));
+
+        app.update(AppEvent::ExtensionMouse(ExtensionMouseAction::Resume(
+            ResumeMouseAction::SelectSession(1),
+        )));
+
+        assert_eq!(app.resume_picker.as_ref().unwrap().selected, 0);
     }
 }

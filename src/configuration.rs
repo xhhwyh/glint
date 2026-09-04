@@ -35,6 +35,11 @@ pub struct AvailableModel {
     pub metadata: ModelMetadata,
 }
 
+pub struct ModelRuntimeConfig {
+    pub llm: LlmConfig,
+    pub model_catalog: ModelCatalog,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderStatus {
     pub id: String,
@@ -167,7 +172,7 @@ impl ConfigurationManager {
     }
 
     pub fn build_runtime(&self, _workspace: &Path) -> Result<Config> {
-        let llm = self.build_llm_config(&self.user)?;
+        let model_runtime = self.build_model_runtime()?;
         let runtime_extensions = RuntimeExtensions::from_user_config(&self.user)?;
         let base_lsp = runtime_extensions.lsp;
         let base_mcp = runtime_extensions.mcp;
@@ -185,20 +190,57 @@ impl ConfigurationManager {
         } else {
             format!("{base_system_prompt}\n\n{extension_prompt}")
         };
-        let model_catalog = self.runtime_model_catalog()?;
         Ok(Config {
             config_path: self.paths.config(),
-            llm,
+            llm: model_runtime.llm,
             lsp: plugin_result.lsp,
             mcp: plugin_result.mcp,
             extensions: plugin_result.catalog,
-            model_catalog,
+            model_catalog: model_runtime.model_catalog,
             system_prompt,
             plugins,
             base_lsp,
             base_mcp,
             base_system_prompt,
         })
+    }
+
+    pub fn build_model_runtime(&self) -> Result<ModelRuntimeConfig> {
+        let providers = self.available_providers()?;
+        let selection =
+            self.user.llm.as_ref().context(
+                "no model is configured; run `glint` in an interactive terminal to add one",
+            )?;
+        let provider = providers
+            .iter()
+            .find(|provider| provider.id == selection.provider)
+            .with_context(|| {
+                format!(
+                    "configured provider '{}' is unavailable",
+                    selection.provider
+                )
+            })?;
+        if !provider
+            .models
+            .iter()
+            .any(|model| model.name == selection.model)
+        {
+            bail!(
+                "configured model '{}' is unavailable for provider '{}'",
+                selection.model,
+                selection.provider
+            );
+        }
+        let api_key = required_credential(self.credentials.as_ref(), &credential_id(provider))?;
+        let model_catalog = runtime_model_catalog(&self.catalog, &providers);
+        let llm = llm_from_available(
+            &self.user,
+            providers,
+            &selection.provider,
+            &selection.model,
+            api_key,
+        )?;
+        Ok(ModelRuntimeConfig { llm, model_catalog })
     }
 
     pub fn save_builtin(&mut self, provider_id: &str, api_key: Option<&str>) -> Result<()> {
@@ -309,7 +351,7 @@ impl ConfigurationManager {
         Ok(())
     }
 
-    pub fn select_model(&mut self, provider_id: &str, model: &str) -> Result<LlmConfig> {
+    pub fn select_model(&mut self, provider_id: &str, model: &str) -> Result<ModelRuntimeConfig> {
         let providers = self.available_providers()?;
         let provider = providers
             .iter()
@@ -336,10 +378,13 @@ impl ConfigurationManager {
             temperature,
             max_tokens,
         });
-        let runtime = llm_from_available(&staged, providers, provider_id, model, api_key)?;
+        let model_catalog = runtime_model_catalog(&self.catalog, &providers);
+        let mut llm = llm_from_available(&staged, providers, provider_id, model, api_key)?;
+        let selected_api_key = llm.api_key.clone();
+        llm.switch_model(provider_id, model, Some(selected_api_key))?;
         self.repository.save(&staged)?;
         self.user = staged;
-        Ok(runtime)
+        Ok(ModelRuntimeConfig { llm, model_catalog })
     }
 
     fn persist_provider_change(
@@ -379,71 +424,36 @@ impl ConfigurationManager {
         self.user = staged;
         Ok(())
     }
+}
 
-    fn build_llm_config(&self, user: &UserConfig) -> Result<LlmConfig> {
-        let providers = available_providers(&self.catalog, user, self.credentials.as_ref())?;
-        let selection = user
-            .llm
-            .as_ref()
-            .context("no model is configured; run `glint` in an interactive terminal to add one")?;
-        let selected = providers
-            .iter()
-            .find(|provider| provider.id == selection.provider)
-            .with_context(|| {
-                format!(
-                    "configured provider '{}' is unavailable",
-                    selection.provider
-                )
-            })?;
-        if !selected
+fn runtime_model_catalog(
+    catalog: &ProviderCatalog,
+    providers: &[AvailableProvider],
+) -> ModelCatalog {
+    let mut runtime = ModelCatalog::default();
+    for provider in providers {
+        let unit = catalog
+            .builtin(&provider.id)
+            .map(|definition| definition.unit.clone())
+            .unwrap_or_default();
+        runtime.providers.insert(
+            provider.id.clone(),
+            ProviderCatalogEntry {
+                description: provider.description.clone(),
+                unit,
+            },
+        );
+        let models = provider
             .models
             .iter()
-            .any(|model| model.name == selection.model)
-        {
-            bail!(
-                "configured model '{}' is unavailable for provider '{}'",
-                selection.model,
-                selection.provider
-            );
-        }
-        let api_key = required_credential(self.credentials.as_ref(), &credential_id(selected))?;
-        llm_from_available(
-            user,
-            providers,
-            &selection.provider,
-            &selection.model,
-            api_key,
-        )
+            .filter_map(|model| {
+                let entry = metadata_catalog_entry(model.metadata.clone());
+                (!catalog_entry_is_empty(&entry)).then_some((model.name.clone(), entry))
+            })
+            .collect();
+        runtime.models.insert(provider.id.clone(), models);
     }
-
-    fn runtime_model_catalog(&self) -> Result<ModelCatalog> {
-        let providers = self.available_providers()?;
-        let mut runtime = ModelCatalog::default();
-        for provider in providers {
-            let unit = self
-                .catalog
-                .builtin(&provider.id)
-                .map(|definition| definition.unit.clone())
-                .unwrap_or_default();
-            runtime.providers.insert(
-                provider.id.clone(),
-                ProviderCatalogEntry {
-                    description: provider.description.clone(),
-                    unit,
-                },
-            );
-            let models = provider
-                .models
-                .into_iter()
-                .filter_map(|model| {
-                    let entry = metadata_catalog_entry(model.metadata);
-                    (!catalog_entry_is_empty(&entry)).then_some((model.name, entry))
-                })
-                .collect();
-            runtime.models.insert(provider.id, models);
-        }
-        Ok(runtime)
-    }
+    runtime
 }
 
 fn validate_loaded_user(user: &UserConfig, catalog: &ProviderCatalog) -> Result<()> {
@@ -1450,12 +1460,33 @@ mod tests {
 
         let runtime = manager.select_model("deepseek", "deepseek-v4-pro").unwrap();
 
-        assert_eq!(runtime.model, "deepseek-v4-pro");
-        assert_eq!(runtime.api_key, "secret");
+        assert_eq!(runtime.llm.model, "deepseek-v4-pro");
+        assert_eq!(runtime.llm.api_key, "secret");
         let persisted = repository.load().unwrap().unwrap().llm.unwrap();
         assert_eq!(persisted.model, "deepseek-v4-pro");
         assert_eq!(persisted.temperature, 0.2);
         assert_eq!(persisted.max_tokens, 1234);
+    }
+
+    #[test]
+    fn build_model_runtime_projects_persisted_selection_without_writing() {
+        let mut fixture = ManagerFixture::new();
+        fixture.enable_builtin("deepseek", "secret");
+        fixture.user.llm = Some(UserLlmConfig {
+            provider: "deepseek".into(),
+            model: "deepseek-v4-pro".into(),
+            temperature: 0.2,
+            max_tokens: 1234,
+        });
+        let repository = fixture.repository.clone();
+        let manager = fixture.manager();
+
+        let runtime = manager.build_model_runtime().unwrap();
+
+        assert_eq!(runtime.llm.provider, "deepseek");
+        assert_eq!(runtime.llm.model, "deepseek-v4-pro");
+        assert!(runtime.model_catalog.providers.contains_key("deepseek"));
+        assert_eq!(repository.save_count(), 0);
     }
 
     #[test]
@@ -1561,6 +1592,7 @@ mod tests {
     struct MemoryUserConfigStore {
         config: Arc<Mutex<Option<UserConfig>>>,
         fail_save: Arc<Mutex<bool>>,
+        save_calls: Arc<std::sync::atomic::AtomicUsize>,
         path: PathBuf,
     }
 
@@ -1571,6 +1603,10 @@ mod tests {
 
         fn fail_saves(&self) {
             *self.fail_save.lock().unwrap() = true;
+        }
+
+        fn save_count(&self) -> usize {
+            self.save_calls.load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
@@ -1584,6 +1620,8 @@ mod tests {
         }
 
         fn save(&self, config: &UserConfig) -> Result<()> {
+            self.save_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if *self.fail_save.lock().unwrap() {
                 bail!("injected user config save failure");
             }
