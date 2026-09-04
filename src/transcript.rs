@@ -1208,7 +1208,7 @@ fn project_directory_component(cwd: &str) -> String {
 
     let mut encoded = String::from("workspace-");
     for byte in cwd.as_bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') {
+        if byte.is_ascii_alphanumeric() || *byte == b'-' {
             encoded.push(char::from(*byte));
         } else {
             use std::fmt::Write as _;
@@ -1457,6 +1457,16 @@ mod tests {
             assert!(!component.contains(['/', '\\', ':']), "{cwd}: {component}");
             assert!(directory.starts_with(sessions_root), "{cwd}: {directory:?}");
         }
+    }
+
+    #[test]
+    fn project_directory_encoding_does_not_alias_literal_escape_text() {
+        let sessions_root = Path::new("/fixed/.glint/sessions");
+
+        assert_ne!(
+            transcript_project_dir(sessions_root, "/a/b"),
+            transcript_project_dir(sessions_root, "/a_2fb")
+        );
     }
 
     #[test]

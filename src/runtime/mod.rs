@@ -32,7 +32,7 @@ use crate::{
         self, SubagentOutcome, SubagentRequest, SubagentSteering, TaskManager, TaskRequest,
         TaskSnapshot, TaskWaitResponse,
     },
-    tools::{DynamicTool, ReadFileState},
+    tools::{DynamicTool, ReadFileState, ToolContext},
     transcript::{
         AssistantTranscript, CompactTrigger, TranscriptSessionSummary, TranscriptStore,
         WorkspaceUsageStats,
@@ -172,6 +172,7 @@ pub struct SessionRuntime {
     transcript_cwd: String,
     sessions_root: PathBuf,
     mcp_root: PathBuf,
+    tool_context: ToolContext,
     agent_tx: Sender<AgentEvent>,
     agent_events: Receiver<AgentEvent>,
     agent_control_tx: Option<mpsc::Sender<AgentControl>>,
@@ -197,15 +198,17 @@ impl SessionRuntime {
         cwd: String,
         sessions_root: PathBuf,
         mcp_root: PathBuf,
+        user_home: PathBuf,
         lsp_config: LspConfig,
         mcp_config: McpConfig,
         hooks: Vec<PluginHook>,
     ) -> Result<Self> {
         TranscriptStore::prune_archive_older_than_in_background(sessions_root.clone(), 30);
         let transcript = TranscriptStore::create_new(&sessions_root, &cwd)?;
+        let tool_context = ToolContext::new(&cwd, user_home);
         let runtime = Self::from_transcript(
             transcript,
-            cwd.clone(),
+            tool_context,
             sessions_root,
             mcp_root,
             lsp_config,
@@ -220,7 +223,7 @@ impl SessionRuntime {
 
     fn from_transcript(
         transcript: TranscriptStore,
-        transcript_cwd: String,
+        tool_context: ToolContext,
         sessions_root: PathBuf,
         mcp_root: PathBuf,
         lsp_config: LspConfig,
@@ -229,7 +232,8 @@ impl SessionRuntime {
     ) -> Self {
         let (agent_tx, agent_events) = mpsc::channel();
         let (task_request_tx, task_requests) = mpsc::channel();
-        let workspace = PathBuf::from(&transcript_cwd);
+        let workspace = tool_context.workspace().to_path_buf();
+        let transcript_cwd = workspace.display().to_string();
         let lsp_manager = LspManager::new(lsp_config, workspace.clone());
         let mcp_manager = McpManager::new(mcp_config, workspace.clone(), mcp_root.clone());
         let hook_runner = HookRunner::new(hooks, workspace);
@@ -239,6 +243,7 @@ impl SessionRuntime {
             transcript_cwd,
             sessions_root,
             mcp_root,
+            tool_context,
             agent_tx,
             agent_events,
             agent_control_tx: None,
@@ -279,6 +284,10 @@ impl SessionRuntime {
 
     pub fn conversation_permissions(&self) -> ConversationPermissions {
         self.conversation_permissions.clone()
+    }
+
+    pub(crate) fn tool_context(&self) -> ToolContext {
+        self.tool_context.clone()
     }
 
     pub fn mcp_status_text(&self) -> String {
@@ -928,6 +937,7 @@ impl SessionRuntime {
                 lsp_manager: self.lsp_manager.clone(),
                 dynamic_tools: self.mcp_manager.dynamic_tools(),
                 hook_runner: self.hook_runner.clone(),
+                tool_context: self.tool_context.clone(),
             },
             self.agent_tx.clone(),
             control_rx,
@@ -1023,7 +1033,7 @@ impl SessionRuntime {
             .join(format!("glint-runtime-test-state-{}", uuid::Uuid::new_v4()));
         Self::from_transcript(
             TranscriptStore::test_empty(path),
-            transcript_cwd,
+            ToolContext::new(transcript_cwd, state_root.clone()),
             state_root.join("sessions"),
             state_root.join("mcp"),
             LspConfig::default(),
@@ -1118,7 +1128,7 @@ mod tests {
         let legacy = TranscriptStore::test_empty(state_root.join("projects/legacy/session.jsonl"));
         let mut runtime = SessionRuntime::from_transcript(
             legacy,
-            "/work/project".to_owned(),
+            ToolContext::new("/work/project", state_root.clone()),
             sessions_root.clone(),
             state_root.join("mcp"),
             LspConfig::default(),

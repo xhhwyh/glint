@@ -56,8 +56,8 @@ approval policy. Use arrow keys to select or scroll, `Tab`/`Left`/`Right` to swi
 variable and header names and redacts URL credentials and query strings.
 
 Select `＋ Add MCP server` to add a standalone stdio, Streamable HTTP, or OAuth server. The form
-accepts inherited environment-variable names for secrets, validates the configuration, appends it
-to the selected configuration file without reformatting the rest of the file, and activates the server immediately.
+accepts inherited environment-variable names for secrets, validates the configuration, atomically
+updates only the `mcp` value in `~/.glint/config.yaml`, and activates the server immediately.
 Use `Up`/`Down`/`Tab` to choose a field, `Left`/`Right` to change transport or approval, `Enter` to
 save, and `Esc` to cancel.
 
@@ -92,7 +92,7 @@ plugins:
     - https://example.com/glint-marketplace.json
 ```
 
-Local paths are resolved relative to the working directory. Git sources are cloned into the cache, fetched on later launches, optionally checked out at `ref`, and can select a monorepo plugin root with `subdir`. Subdirectory checkouts use Git sparse checkout and reject absolute paths, `..`, and symlink escapes.
+Relative local plugin and marketplace paths are resolved from `~/.glint`; they do not follow the process working directory. `~/` paths use the home directory captured when Glint discovers its fixed paths. Git sources are cloned into the cache, fetched on later launches, optionally checked out at `ref`, and can select a monorepo plugin root with `subdir`. Subdirectory checkouts use Git sparse checkout and reject absolute paths, `..`, and symlink escapes.
 
 Marketplaces can be GitHub `owner/repo` shorthands, Git URLs, local marketplace directories/files, or remote JSON catalogs. Glint understands relative plugin paths and the Claude marketplace `github`, `url`, and `git-subdir` source objects. Remote JSON catalogs cannot use relative plugin paths because the catalog does not include the referenced files. NPM marketplace sources are reported as unsupported.
 
@@ -178,7 +178,7 @@ Claude-style event maps are also accepted, including `UserPromptSubmit`, `PreToo
 }
 ```
 
-The event payload is JSON on stdin. The hook receives `GLINT_PLUGIN`, `GLINT_HOOK_EVENT`, `GLINT_PLUGIN_ROOT`, and `CLAUDE_PLUGIN_ROOT`; when settings are declared, `GLINT_PLUGIN_SETTINGS` contains their JSON. Its working directory is the plugin root. Exit `0` with no output to allow. Exit `2` to deny using stderr as the reason, or return JSON:
+The event payload is JSON on stdin. The hook receives `GLINT_PLUGIN`, `GLINT_HOOK_EVENT`, `GLINT_PLUGIN_ROOT`, and `CLAUDE_PLUGIN_ROOT`; when settings are declared, `GLINT_PLUGIN_SETTINGS` contains their JSON. Its working directory is the active workspace. Existing path-shaped command arguments such as `python3 hooks/check.py` are resolved to an existing file inside the plugin root before launch; `${GLINT_PLUGIN_ROOT}` and `${CLAUDE_PLUGIN_ROOT}` remain the explicit forms for plugin-owned resources. Exit `0` with no output to allow. Exit `2` to deny using stderr as the reason, or return JSON:
 
 ```json
 {"decision":"deny","reason":"policy reason"}

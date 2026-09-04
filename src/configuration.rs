@@ -16,7 +16,7 @@ use crate::{
     persistence::{UserConfigRepository, UserConfigStore},
     plugins::PluginManager,
     provider_catalog::{ModelMetadata, PromptCacheConfig, ProviderCatalog},
-    services::mcp::{McpServerConfig, persist_mcp_server},
+    services::mcp::{McpServerConfig, upsert_mcp_server_value},
 };
 
 const DEFAULT_TEMPERATURE: f32 = 0.7;
@@ -225,8 +225,8 @@ impl ConfigurationManager {
                 self.repository.path().display()
             )
         })?;
-        let updated_mcp = persist_mcp_server(self.repository.path(), name, server)?;
-        staged.mcp = Some(updated_mcp);
+        staged.mcp = Some(upsert_mcp_server_value(staged.mcp.as_ref(), name, server)?);
+        self.repository.save(&staged)?;
         self.user = staged;
         Ok(())
     }
@@ -1468,36 +1468,83 @@ mod tests {
 
     #[test]
     fn failed_mcp_write_leaves_disk_and_manager_unchanged() {
-        let home = std::env::temp_dir().join(format!(
-            "glint-manager-mcp-rollback-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let paths = GlintPaths::from_home(&home);
-        let mut manager = ConfigurationManager::new(
-            paths.clone(),
-            home.join("workspace"),
-            ProviderCatalog::embedded().unwrap(),
-            Box::new(UserConfigStore::new(paths.clone())),
-            Box::new(crate::credentials::FileCredentialStore::new(paths.auth())),
-        )
-        .unwrap();
-        manager
-            .save_builtin("deepseek", Some("deepseek-key"))
-            .unwrap();
+        let fixture = ManagerFixture::new();
+        let repository = fixture.repository.clone();
+        let mut manager = fixture.manager();
         let before_user = manager.user_config().clone();
-        let before_disk = fs::read(paths.config()).unwrap();
-        let temporary = paths
-            .config()
-            .with_extension(format!("yaml.tmp-{}", std::process::id()));
-        fs::create_dir_all(&temporary).unwrap();
+        let before_disk = repository.load().unwrap().unwrap();
+        repository.fail_saves();
 
         let error = manager
             .upsert_mcp_server("demo", &test_mcp_server("demo-mcp"))
             .unwrap_err();
 
-        assert!(format!("{error:#}").contains("failed to write temporary config"));
+        assert!(format!("{error:#}").contains("user config save failure"));
         assert_eq!(manager.user_config(), &before_user);
-        assert_eq!(fs::read(paths.config()).unwrap(), before_disk);
+        assert_eq!(repository.load().unwrap().unwrap(), before_disk);
+    }
+
+    #[test]
+    fn mcp_upsert_loads_once_and_saves_the_exact_loaded_document() {
+        let home = std::env::temp_dir().join(format!(
+            "glint-manager-mcp-single-load-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = GlintPaths::from_home(&home);
+        fs::create_dir_all(paths.root()).unwrap();
+        let initial = UserConfig::default();
+        fs::write(paths.config(), serde_yaml::to_string(&initial).unwrap()).unwrap();
+        let mut exact = initial.clone();
+        exact.custom_providers.insert(
+            "Exact".to_owned(),
+            CustomProviderConfig {
+                base_url: "https://exact.example/v1".to_owned(),
+                models: vec!["exact-model".to_owned()],
+            },
+        );
+        exact.plugins = Some(serde_yaml::from_str("entries: []").unwrap());
+        let mut intervening = initial;
+        intervening.custom_providers.insert(
+            "Intervening".to_owned(),
+            CustomProviderConfig {
+                base_url: "https://intervening.example/v1".to_owned(),
+                models: vec!["intervening-model".to_owned()],
+            },
+        );
+        let repository = ChangingUserConfigStore::new(paths.config(), exact.clone(), intervening);
+        let mut manager = ConfigurationManager::new(
+            paths.clone(),
+            home.join("workspace"),
+            ProviderCatalog::embedded().unwrap(),
+            Box::new(repository.clone()),
+            Box::new(MemoryCredentialStore::default()),
+        )
+        .unwrap();
+
+        manager
+            .upsert_mcp_server("demo", &test_mcp_server("demo-mcp"))
+            .unwrap();
+
+        assert_eq!(repository.load_count(), 2);
+        assert_eq!(repository.save_count(), 1);
+        let saved = repository.saved().unwrap();
+        assert_eq!(saved.custom_providers, exact.custom_providers);
+        assert_eq!(saved.plugins, exact.plugins);
+        assert!(saved.mcp.is_some());
+        assert_eq!(manager.user_config(), &saved);
+
+        manager
+            .save_builtin("deepseek", Some("deepseek-key"))
+            .unwrap();
+        let saved_after_provider = repository.saved().unwrap();
+        assert_eq!(repository.load_count(), 2);
+        assert_eq!(repository.save_count(), 2);
+        assert_eq!(
+            saved_after_provider.custom_providers,
+            exact.custom_providers
+        );
+        assert_eq!(saved_after_provider.plugins, exact.plugins);
+        assert_eq!(saved_after_provider.mcp, saved.mcp);
         fs::remove_dir_all(home).ok();
     }
 
@@ -1745,6 +1792,73 @@ mod tests {
         fail_save: Arc<Mutex<bool>>,
         save_calls: Arc<std::sync::atomic::AtomicUsize>,
         path: PathBuf,
+    }
+
+    #[derive(Clone)]
+    struct ChangingUserConfigStore {
+        path: PathBuf,
+        exact: UserConfig,
+        intervening: UserConfig,
+        loads: Arc<std::sync::atomic::AtomicUsize>,
+        saves: Arc<std::sync::atomic::AtomicUsize>,
+        saved: Arc<Mutex<Option<UserConfig>>>,
+    }
+
+    impl ChangingUserConfigStore {
+        fn new(path: PathBuf, exact: UserConfig, intervening: UserConfig) -> Self {
+            Self {
+                path,
+                exact,
+                intervening,
+                loads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                saves: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                saved: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        fn load_count(&self) -> usize {
+            self.loads.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn save_count(&self) -> usize {
+            self.saves.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn saved(&self) -> Option<UserConfig> {
+            self.saved.lock().unwrap().clone()
+        }
+    }
+
+    impl UserConfigRepository for ChangingUserConfigStore {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn load(&self) -> Result<Option<UserConfig>> {
+            let call = self
+                .loads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if call == 0 {
+                return Ok(Some(UserConfig::default()));
+            }
+            if call == 1 {
+                fs::write(
+                    &self.path,
+                    serde_yaml::to_string(&self.intervening).unwrap(),
+                )
+                .unwrap();
+                return Ok(Some(self.exact.clone()));
+            }
+            bail!("unexpected extra configuration load")
+        }
+
+        fn save(&self, config: &UserConfig) -> Result<()> {
+            self.saves
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            *self.saved.lock().unwrap() = Some(config.clone());
+            fs::write(&self.path, serde_yaml::to_string(config).unwrap()).unwrap();
+            Ok(())
+        }
     }
 
     impl MemoryUserConfigStore {

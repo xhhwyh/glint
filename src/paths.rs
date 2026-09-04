@@ -23,6 +23,12 @@ impl GlintPaths {
         &self.root
     }
 
+    pub fn home(&self) -> &Path {
+        self.root
+            .parent()
+            .expect("Glint root is always constructed below a home directory")
+    }
+
     pub fn config(&self) -> PathBuf {
         self.root.join("config.yaml")
     }
@@ -55,6 +61,7 @@ mod tests {
         let paths = GlintPaths::from_home("/users/alice");
 
         assert_eq!(paths.root(), Path::new("/users/alice/.glint"));
+        assert_eq!(paths.home(), Path::new("/users/alice"));
         assert_eq!(paths.config(), Path::new("/users/alice/.glint/config.yaml"));
         assert_eq!(paths.auth(), Path::new("/users/alice/.glint/auth.json"));
         assert_eq!(paths.plugins(), Path::new("/users/alice/.glint/plugins"));

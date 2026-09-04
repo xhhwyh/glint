@@ -32,7 +32,10 @@ use crate::{
     services::tool_results::ToolResultBudget,
     settings::ProjectSettings,
     tasks::{SubagentSteering, TaskRequest},
-    tools::{DynamicTool, ReadFileState, ToolRegistry},
+    tools::{
+        DynamicTool, ReadFileState, ToolContext, ToolRegistry, current_tool_context,
+        with_tool_context,
+    },
 };
 
 const MAX_TOOL_ITERATIONS: usize = 8;
@@ -53,6 +56,7 @@ pub struct AgentRunInput {
     pub lsp_manager: LspManager,
     pub dynamic_tools: Vec<Arc<dyn DynamicTool>>,
     pub hook_runner: HookRunner,
+    pub tool_context: ToolContext,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -82,16 +86,20 @@ pub fn spawn_agent_loop(
     thread::spawn(move || {
         let mut provider = OpenAiProvider::new(input.llm.clone());
         let registry = main_tool_registry(&input);
+        let tool_context = input.tool_context.clone();
 
-        match run_agent_loop(
-            input,
-            &mut provider,
-            &registry,
-            &tx,
-            &control_rx,
-            None,
-            true,
-        ) {
+        let outcome = with_tool_context(tool_context, || {
+            run_agent_loop(
+                input,
+                &mut provider,
+                &registry,
+                &tx,
+                &control_rx,
+                None,
+                true,
+            )
+        });
+        match outcome {
             Ok(_) => {
                 tx.send(AgentEvent::AssistantFinished).ok();
             }
@@ -113,8 +121,8 @@ pub fn spawn_subagent_loop(
     thread::spawn(move || {
         let mut provider = OpenAiProvider::new(input.llm.clone());
         let registry = subagent_tool_registry(&input);
-        let cwd = PathBuf::from(input.runtime_context.current_dir.clone());
-        let result = crate::tools::with_tool_cwd(cwd, || {
+        let tool_context = input.tool_context.clone();
+        let result = with_tool_context(tool_context, || {
             run_agent_loop(
                 input,
                 &mut provider,
@@ -176,6 +184,7 @@ fn run_agent_loop(
     steering: Option<&SubagentSteering>,
     approvals_enabled: bool,
 ) -> Result<AgentRunOutcome> {
+    let workspace = input.tool_context.workspace().to_path_buf();
     input.hook_runner.run(
         HookEvent::AgentStart,
         json!({"cwd": input.runtime_context.current_dir}),
@@ -204,6 +213,7 @@ fn run_agent_loop(
             approvals_enabled,
         },
         &input.hook_runner,
+        &workspace,
     );
     input
         .hook_runner
@@ -222,9 +232,10 @@ fn run_model_turns(
     tool_result_budget: &ToolResultBudget,
     config: RunModelTurnsConfig,
     hook_runner: &HookRunner,
+    workspace: &std::path::Path,
 ) -> Result<AgentRunOutcome> {
     let mut tool_iterations = 0;
-    let mut project_settings = ProjectSettings::load();
+    let mut project_settings = ProjectSettings::load(workspace);
     let mut conversation_permissions = config.initial_permissions;
 
     loop {
@@ -429,6 +440,7 @@ fn append_concurrent_tool_batch(
     let call_count = calls.len();
     let cancelled = Arc::new(AtomicBool::new(false));
     let (result_tx, result_rx) = mpsc::channel();
+    let tool_context = current_tool_context().map_err(anyhow::Error::msg)?;
 
     for (index, call) in calls.into_iter().enumerate() {
         tx.send(AgentEvent::ToolStarted {
@@ -444,19 +456,22 @@ fn append_concurrent_tool_batch(
         let tool_result_budget = state.tool_result_budget.clone();
         let hook_runner = state.hook_runner.clone();
         let registry = registry.clone();
+        let tool_context = tool_context.clone();
         thread::spawn(move || {
-            let tool_name = call.name.clone();
-            let mut is_cancelled = || cancelled.load(Ordering::Relaxed);
-            let result = registry.execute_approved_with_cancel(&call, &mut is_cancelled);
-            let result = apply_after_tool_hook(&hook_runner, &call, result);
-            let result = tool_result_budget.apply(&tool_name, result);
-            result_tx
-                .send(CompletedTool {
-                    index,
-                    call,
-                    result,
-                })
-                .ok();
+            with_tool_context(tool_context, || {
+                let tool_name = call.name.clone();
+                let mut is_cancelled = || cancelled.load(Ordering::Relaxed);
+                let result = registry.execute_approved_with_cancel(&call, &mut is_cancelled);
+                let result = apply_after_tool_hook(&hook_runner, &call, result);
+                let result = tool_result_budget.apply(&tool_name, result);
+                result_tx
+                    .send(CompletedTool {
+                        index,
+                        call,
+                        result,
+                    })
+                    .ok();
+            });
         });
     }
     drop(result_tx);
@@ -843,6 +858,7 @@ fn summarize_tool_output(output: &str) -> String {
 mod tests {
     use std::{
         collections::VecDeque,
+        fs,
         sync::{Arc, mpsc},
     };
 
@@ -951,6 +967,7 @@ mod tests {
             lsp_manager: LspManager::new(LspConfig::default(), PathBuf::from("/workspace")),
             dynamic_tools: Vec::new(),
             hook_runner: HookRunner::default(),
+            tool_context: ToolContext::new("/workspace", "/home/tester"),
         }
     }
 
@@ -1288,6 +1305,7 @@ mod tests {
             root: std::env::current_dir().unwrap(),
             permissions: ProjectPermissions::default(),
         };
+        let tool_context = ToolContext::new(project_settings.root.clone(), "/home/tester");
         let mut conversation_permissions = ConversationPermissions::default();
         let budget = ToolResultBudget::new(std::env::temp_dir());
         let mut state = tool_state(
@@ -1297,30 +1315,32 @@ mod tests {
         );
         let mut messages = Vec::new();
 
-        append_tool_turn(
-            &mut messages,
-            ModelResponse {
-                assistant_text: None,
-                tool_calls: vec![
-                    ToolCall {
-                        id: "read-cargo".to_owned(),
-                        name: "Read".to_owned(),
-                        arguments: json!({ "file_path": "Cargo.toml" }),
-                    },
-                    ToolCall {
-                        id: "read-main".to_owned(),
-                        name: "Read".to_owned(),
-                        arguments: json!({ "file_path": "src/main.rs" }),
-                    },
-                ],
-                finish_reason: FinishReason::ToolCalls,
-                usage: None,
-            },
-            &registry,
-            &tx,
-            &control_rx,
-            &mut state,
-        )
+        with_tool_context(tool_context, || {
+            append_tool_turn(
+                &mut messages,
+                ModelResponse {
+                    assistant_text: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "read-cargo".to_owned(),
+                            name: "Read".to_owned(),
+                            arguments: json!({ "file_path": "Cargo.toml" }),
+                        },
+                        ToolCall {
+                            id: "read-main".to_owned(),
+                            name: "Read".to_owned(),
+                            arguments: json!({ "file_path": "src/main.rs" }),
+                        },
+                    ],
+                    finish_reason: FinishReason::ToolCalls,
+                    usage: None,
+                },
+                &registry,
+                &tx,
+                &control_rx,
+                &mut state,
+            )
+        })
         .unwrap();
 
         let tool_ids = messages
@@ -1329,6 +1349,67 @@ mod tests {
             .map(|message| message.tool_call_id.as_deref())
             .collect::<Vec<_>>();
         assert_eq!(tool_ids, [Some("read-cargo"), Some("read-main")]);
+    }
+
+    #[test]
+    fn concurrent_tool_workers_inherit_the_scoped_workspace() {
+        let workspace = std::env::temp_dir().join(format!(
+            "glint-concurrent-tool-workspace-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(workspace.join("one.txt"), "workspace-one").unwrap();
+        fs::write(workspace.join("two.txt"), "workspace-two").unwrap();
+        let registry = ToolRegistry::new();
+        let (tx, _rx) = mpsc::channel();
+        let control_rx = control_rx();
+        let mut project_settings = ProjectSettings {
+            root: workspace.clone(),
+            permissions: ProjectPermissions::default(),
+        };
+        let mut conversation_permissions = ConversationPermissions::default();
+        let budget = ToolResultBudget::new(std::env::temp_dir());
+        let mut state = tool_state(
+            &mut project_settings,
+            &mut conversation_permissions,
+            &budget,
+        );
+        let mut messages = Vec::new();
+        let response = ModelResponse {
+            assistant_text: None,
+            tool_calls: ["one.txt", "two.txt"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, file_path)| ToolCall {
+                    id: format!("read-{index}"),
+                    name: "Read".to_owned(),
+                    arguments: json!({"file_path": file_path}),
+                })
+                .collect(),
+            finish_reason: FinishReason::ToolCalls,
+            usage: None,
+        };
+
+        let context = ToolContext::new(workspace.clone(), workspace.clone());
+        with_tool_context(context, || {
+            append_tool_turn(
+                &mut messages,
+                response,
+                &registry,
+                &tx,
+                &control_rx,
+                &mut state,
+            )
+        })
+        .unwrap();
+
+        let outputs = messages
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>();
+        assert!(outputs.contains(&"workspace-one"));
+        assert!(outputs.contains(&"workspace-two"));
+        fs::remove_dir_all(workspace).ok();
     }
 
     #[test]

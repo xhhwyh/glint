@@ -28,7 +28,7 @@ pub use read_state::ReadFileState;
 use subagent::SubagentTool;
 use task_control::{TaskCancelTool, TaskListTool, TaskSendTool, TaskWaitTool};
 use todo_write::TodoWriteTool;
-pub(crate) use utils::with_tool_cwd;
+pub(crate) use utils::{ToolContext, current_tool_context, with_tool_context};
 use utils::{error, normalize_path_argument, requires_path_approval, truncate_summary};
 
 pub(crate) fn sanitize_tool_name(value: &str) -> String {
@@ -646,6 +646,14 @@ mod tests {
         *,
     };
 
+    fn current_test_tool_context() -> ToolContext {
+        let workspace = env::current_dir().expect("cwd should exist");
+        let home = env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| workspace.clone());
+        ToolContext::new(workspace, home)
+    }
+
     #[test]
     fn main_and_subagent_registries_expose_bash_without_terminal_run() {
         let main = ToolRegistry::with_task_requests(None);
@@ -796,7 +804,9 @@ mod tests {
             name: "Edit".to_owned(),
             arguments: json!({ "file_path": "src/main.rs", "old_string": "a", "new_string": "b" }),
         };
-        let result = registry.execute_approved(&edit);
+        let result = with_tool_context(current_test_tool_context(), || {
+            registry.execute_approved(&edit)
+        });
         assert!(result.is_error);
         assert!(result.content.contains("not registered"));
 
@@ -836,11 +846,13 @@ mod tests {
         let cwd = env::current_dir().expect("cwd should exist");
         let cargo_toml = cwd.join("Cargo.toml");
 
-        assert_eq!(
-            display_path(cargo_toml.to_str().expect("utf-8 path")),
-            "Cargo.toml"
-        );
-        assert_eq!(display_path("Cargo.toml"), "Cargo.toml");
+        with_tool_context(current_test_tool_context(), || {
+            assert_eq!(
+                display_path(cargo_toml.to_str().expect("utf-8 path")),
+                "Cargo.toml"
+            );
+            assert_eq!(display_path("Cargo.toml"), "Cargo.toml");
+        });
     }
 
     #[test]
@@ -849,12 +861,14 @@ mod tests {
             return;
         };
         let cwd = env::current_dir().expect("cwd should exist");
-        let Ok(relative_cwd) = cwd.strip_prefix(home) else {
+        let Ok(relative_cwd) = cwd.strip_prefix(&home) else {
             return;
         };
         let path = format!("~/{}/Cargo.toml", display_path_string(relative_cwd));
 
-        assert_eq!(display_path(&path), "Cargo.toml");
+        with_tool_context(ToolContext::new(cwd, home), || {
+            assert_eq!(display_path(&path), "Cargo.toml");
+        });
     }
 
     #[test]
@@ -865,10 +879,126 @@ mod tests {
         ));
         fs::write(&path, "outside").expect("write temp file");
         let canonical = path.canonicalize().expect("canonical temp file");
-        let resolved = resolve_tool_path(path.to_str().expect("utf-8 path"));
+        let resolved = with_tool_context(current_test_tool_context(), || {
+            resolve_tool_path(path.to_str().expect("utf-8 path"))
+        });
         fs::remove_file(&path).ok();
 
         assert_eq!(resolved.expect("path should resolve"), canonical);
+    }
+
+    #[test]
+    fn scoped_tool_context_resolves_workspace_and_explicit_home() {
+        let root = env::temp_dir().join(format!("glint-tool-context-{}", uuid::Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let home = root.join("injected-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        fs::write(workspace.join("workspace.txt"), "workspace").unwrap();
+        fs::write(home.join("home.txt"), "home").unwrap();
+        let context = ToolContext::new(workspace.clone(), home.clone());
+
+        with_tool_context(context, || {
+            assert_eq!(
+                resolve_tool_path("workspace.txt").unwrap(),
+                workspace.join("workspace.txt").canonicalize().unwrap()
+            );
+            assert_eq!(
+                resolve_tool_path("~/home.txt").unwrap(),
+                home.join("home.txt").canonicalize().unwrap()
+            );
+        });
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn real_tools_ignore_changed_ambient_cwd_and_home() {
+        const CHILD_ROOT: &str = "GLINT_TOOL_CONTEXT_EXECUTION_CHILD";
+        if let Some(root) = env::var_os(CHILD_ROOT).map(PathBuf::from) {
+            let ambient = root.join("ambient");
+            let workspace = root.join("workspace");
+            let home = root.join("injected-home");
+            assert_eq!(env::current_dir().unwrap(), ambient);
+            assert_eq!(
+                env::var_os("HOME").map(PathBuf::from),
+                Some(root.join("ambient-home"))
+            );
+            with_tool_context(ToolContext::new(&workspace, &home), || {
+                let registry = ToolRegistry::new();
+                let workspace_read = registry.execute(&ToolCall {
+                    id: "workspace-read".to_owned(),
+                    name: "Read".to_owned(),
+                    arguments: json!({"file_path": "edit.txt"}),
+                });
+                assert_eq!(workspace_read.content, "before");
+                let home_read = registry.execute(&ToolCall {
+                    id: "home-read".to_owned(),
+                    name: "Read".to_owned(),
+                    arguments: json!({"file_path": "~/home.txt"}),
+                });
+                assert_eq!(home_read.content, "injected-home");
+                let bash = registry.execute_approved(&ToolCall {
+                    id: "bash".to_owned(),
+                    name: "Bash".to_owned(),
+                    arguments: json!({"command": "python3 -c 'import os; print(os.getcwd()); print(os.environ[\"HOME\"]); print(os.path.expanduser(\"~\"))'"}),
+                });
+                let bash_lines = bash.content.lines().collect::<Vec<_>>();
+                assert_eq!(
+                    bash_lines[0],
+                    workspace.canonicalize().unwrap().display().to_string()
+                );
+                assert_eq!(bash_lines[1], home.display().to_string());
+                assert_eq!(bash_lines[2], home.display().to_string());
+                let edit = registry.execute_approved(&ToolCall {
+                    id: "edit".to_owned(),
+                    name: "Edit".to_owned(),
+                    arguments: json!({
+                        "file_path": "edit.txt",
+                        "old_string": "before",
+                        "new_string": "after"
+                    }),
+                });
+                assert!(!edit.is_error, "{}", edit.content);
+                assert_eq!(
+                    fs::read_to_string(workspace.join("edit.txt")).unwrap(),
+                    "after"
+                );
+            });
+            return;
+        }
+
+        let root = env::temp_dir().join(format!(
+            "glint-tool-context-execution-{}",
+            uuid::Uuid::new_v4()
+        ));
+        for directory in [
+            root.join("ambient"),
+            root.join("ambient-home"),
+            root.join("workspace"),
+            root.join("injected-home"),
+        ] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        fs::write(root.join("workspace/edit.txt"), "before").unwrap();
+        fs::write(root.join("injected-home/home.txt"), "injected-home").unwrap();
+        let output = std::process::Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tools::tests::real_tools_ignore_changed_ambient_cwd_and_home",
+            ])
+            .env(CHILD_ROOT, &root)
+            .env("HOME", root.join("ambient-home"))
+            .current_dir(root.join("ambient"))
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -882,7 +1012,9 @@ mod tests {
             arguments: json!({ "file_path": cargo_toml }),
         };
 
-        let normalized = registry.normalize_for_context(&call);
+        let normalized = with_tool_context(current_test_tool_context(), || {
+            registry.normalize_for_context(&call)
+        });
 
         assert_eq!(normalized.arguments["file_path"], "Cargo.toml");
 
@@ -901,7 +1033,9 @@ mod tests {
             name: "Read".to_owned(),
             arguments: json!({ "file_path": external }),
         };
-        let normalized = registry.normalize_for_context(&call);
+        let normalized = with_tool_context(current_test_tool_context(), || {
+            registry.normalize_for_context(&call)
+        });
         fs::remove_file(&canonical).ok();
 
         assert_eq!(
@@ -1148,7 +1282,9 @@ mod tests {
             arguments: json!({ "command": "sleep 5" }),
         };
 
-        let result = registry.execute_approved_with_cancel(&call, &mut || true);
+        let result = with_tool_context(current_test_tool_context(), || {
+            registry.execute_approved_with_cancel(&call, &mut || true)
+        });
 
         assert!(result.is_error);
         assert_eq!(result.content, "cancelled");
@@ -1204,7 +1340,9 @@ mod tests {
             }),
         };
 
-        let result = registry.execute_approved(&edit);
+        let result = with_tool_context(current_test_tool_context(), || {
+            registry.execute_approved(&edit)
+        });
 
         assert!(result.is_error);
         assert!(result.content.contains("has not been read yet"));
@@ -1244,9 +1382,11 @@ mod tests {
             }),
         };
 
-        assert!(!registry.execute(&read).is_error);
-        assert!(!registry.execute_approved(&edit).is_error);
-        assert!(!registry.execute_approved(&edit_again).is_error);
+        with_tool_context(current_test_tool_context(), || {
+            assert!(!registry.execute(&read).is_error);
+            assert!(!registry.execute_approved(&edit).is_error);
+            assert!(!registry.execute_approved(&edit_again).is_error);
+        });
 
         let path = read.arguments["file_path"].as_str().expect("path");
         assert_eq!(fs::read_to_string(path).expect("read temp file"), "final");
@@ -1279,8 +1419,10 @@ mod tests {
             }),
         };
 
-        assert!(!registry.execute(&read).is_error);
-        let result = registry.execute_approved(&edit);
+        let result = with_tool_context(current_test_tool_context(), || {
+            assert!(!registry.execute(&read).is_error);
+            registry.execute_approved(&edit)
+        });
 
         assert!(result.is_error);
         assert!(result.content.contains("only partially read"));

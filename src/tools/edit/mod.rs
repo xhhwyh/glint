@@ -217,7 +217,10 @@ mod tests {
             }),
         };
 
-        let result = edit_approved(&call, &read_state, Some(&manager));
+        let context = crate::tools::ToolContext::new(env::temp_dir(), env::temp_dir());
+        let result = crate::tools::with_tool_context(context, || {
+            edit_approved(&call, &read_state, Some(&manager))
+        });
         let updated = fs::read_to_string(&path).expect("read updated");
         fs::remove_file(&path).ok();
         manager.shutdown();

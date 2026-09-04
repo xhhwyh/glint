@@ -14,16 +14,49 @@ use crate::agent::provider::{ToolCall, ToolResult};
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 thread_local! {
-    static TOOL_CWD: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    static TOOL_CONTEXT: RefCell<Option<ToolContext>> = const { RefCell::new(None) };
 }
 
-pub(crate) fn with_tool_cwd<R>(cwd: PathBuf, f: impl FnOnce() -> R) -> R {
-    let previous = TOOL_CWD.with(|slot| slot.replace(Some(cwd)));
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ToolContext {
+    workspace: PathBuf,
+    user_home: PathBuf,
+}
+
+impl ToolContext {
+    pub(crate) fn new(workspace: impl Into<PathBuf>, user_home: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace: workspace.into(),
+            user_home: user_home.into(),
+        }
+    }
+
+    pub(crate) fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
+    pub(crate) fn with_workspace(&self, workspace: impl Into<PathBuf>) -> Self {
+        Self::new(workspace, self.user_home.clone())
+    }
+
+    pub(crate) fn user_home(&self) -> &Path {
+        &self.user_home
+    }
+}
+
+pub(crate) fn with_tool_context<R>(context: ToolContext, f: impl FnOnce() -> R) -> R {
+    let previous = TOOL_CONTEXT.with(|slot| slot.replace(Some(context)));
     let result = f();
-    TOOL_CWD.with(|slot| {
+    TOOL_CONTEXT.with(|slot| {
         slot.replace(previous);
     });
     result
+}
+
+pub(crate) fn current_tool_context() -> Result<ToolContext, String> {
+    TOOL_CONTEXT
+        .with(|slot| slot.borrow().clone())
+        .ok_or_else(|| "tool context is not installed".to_owned())
 }
 
 pub(super) fn requires_path_approval(call: &ToolCall) -> bool {
@@ -208,12 +241,13 @@ pub(super) fn resolve_tool_path(path: &str) -> Result<PathBuf, String> {
 }
 
 pub(super) fn expand_home_path(path: &str) -> PathBuf {
-    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+    let Ok(context) = current_tool_context() else {
         return PathBuf::from(path);
     };
+    let home = context.user_home();
 
     if path == "~" {
-        return home;
+        return home.to_path_buf();
     }
 
     path.strip_prefix("~/")
@@ -285,10 +319,7 @@ pub(super) fn display_path(path: &str) -> String {
 }
 
 pub(super) fn current_tool_dir() -> Result<PathBuf, String> {
-    if let Some(cwd) = TOOL_CWD.with(|slot| slot.borrow().clone()) {
-        return Ok(cwd);
-    }
-    std::env::current_dir().map_err(|err| format!("failed to read current directory: {err}"))
+    current_tool_context().map(|context| context.workspace)
 }
 
 pub(super) fn display_relative_path(path: &Path) -> String {

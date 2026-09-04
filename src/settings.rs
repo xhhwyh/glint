@@ -20,8 +20,8 @@ pub struct ProjectSettings {
 }
 
 impl ProjectSettings {
-    pub fn load() -> Self {
-        let root = project_root();
+    pub fn load(workspace: &Path) -> Self {
+        let root = project_root(workspace);
         let permissions = load_project_permissions(&root).unwrap_or_default();
         Self { root, permissions }
     }
@@ -60,14 +60,14 @@ struct PermissionsFile {
     extra: Map<String, Value>,
 }
 
-pub fn project_root() -> PathBuf {
-    let mut current = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+pub fn project_root(workspace: &Path) -> PathBuf {
+    let mut current = workspace.to_path_buf();
     loop {
         if current.join("Cargo.toml").exists() {
             return current;
         }
         if !current.pop() {
-            return std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            return workspace.to_path_buf();
         }
     }
 }
@@ -214,5 +214,23 @@ mod tests {
             json!(["Bash(git status *)", "Bash(cargo test *)"])
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn loads_permissions_from_the_explicit_workspace() {
+        let root =
+            std::env::temp_dir().join(format!("glint-settings-workspace-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join(".glint")).unwrap();
+        fs::write(
+            settings_path(&root),
+            json!({"permissions": {"allow": ["Bash(cargo test *)"]}}).to_string(),
+        )
+        .unwrap();
+
+        let settings = ProjectSettings::load(&root);
+
+        assert_eq!(settings.root, root);
+        assert!(settings.allows_bash("cargo test --lib"));
+        fs::remove_dir_all(settings.root).ok();
     }
 }

@@ -1,7 +1,7 @@
 mod config;
 mod manager;
 
-pub(crate) use config::persist_mcp_server;
+pub(crate) use config::upsert_mcp_server_value;
 pub use config::{
     McpApprovalPolicy, McpConfig, McpOAuthConfig, McpServerConfig, McpTransportConfig,
 };

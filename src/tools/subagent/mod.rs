@@ -13,7 +13,7 @@ mod description;
 
 use super::{
     ToolBehavior,
-    utils::{error, missing_arg, ok, string_arg},
+    utils::{current_tool_dir, error, missing_arg, ok, string_arg},
 };
 
 const START_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -131,13 +131,10 @@ fn subagent_cwd(call: &ToolCall) -> Result<String, String> {
             if path.is_absolute() {
                 path
             } else {
-                std::env::current_dir()
-                    .map_err(|error| format!("failed to resolve current directory: {error}"))?
-                    .join(path)
+                current_tool_dir()?.join(path)
             }
         }
-        None => std::env::current_dir()
-            .map_err(|error| format!("failed to resolve current directory: {error}"))?,
+        None => current_tool_dir()?,
     };
     let cwd = cwd
         .canonicalize()
@@ -150,6 +147,8 @@ fn subagent_cwd(call: &ToolCall) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use serde_json::json;
 
@@ -192,16 +191,22 @@ mod tests {
     #[test]
     fn starts_subagent_via_task_request() {
         let (task_tx, task_rx) = mpsc::channel();
-        let cwd = std::env::current_dir().unwrap();
+        let workspace = std::env::temp_dir().join(format!(
+            "glint-subagent-request-workspace-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cwd = workspace.join("child");
+        fs::create_dir_all(&cwd).unwrap();
         let call = ToolCall {
             id: "call".to_owned(),
             name: "Subagent".to_owned(),
             arguments: json!({
                 "description": "inspect parser",
                 "prompt": "look at parser",
-                "cwd": cwd
+                "cwd": "child"
             }),
         };
+        let expected_cwd = cwd.canonicalize().unwrap();
         let worker = std::thread::spawn(move || {
             let TaskRequest::StartSubagent { request, response } = task_rx.recv().expect("request")
             else {
@@ -210,6 +215,7 @@ mod tests {
             assert_eq!(request.description, "inspect parser");
             assert_eq!(request.prompt, "look at parser");
             assert_eq!(request.tool_call_id, "call");
+            assert_eq!(PathBuf::from(&request.cwd), expected_cwd);
             response
                 .send(crate::tasks::SubagentStartResponse::started(
                     request.task_id,
@@ -217,11 +223,38 @@ mod tests {
                 .unwrap();
         });
 
-        let result = subagent(&call, Some(&task_tx));
+        let context = crate::tools::ToolContext::new(workspace.clone(), workspace.clone());
+        let result = crate::tools::with_tool_context(context, || subagent(&call, Some(&task_tx)));
         worker.join().unwrap();
 
         assert!(!result.is_error);
         assert!(result.content.contains("Started Codex subagent"));
         assert!(result.content.contains("Use TaskWait for its result"));
+        fs::remove_dir_all(workspace).ok();
+    }
+
+    #[test]
+    fn relative_subagent_cwd_uses_the_scoped_tool_workspace() {
+        let workspace =
+            std::env::temp_dir().join(format!("glint-subagent-workspace-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(workspace.join("child")).unwrap();
+        let call = ToolCall {
+            id: "call".to_owned(),
+            name: "Subagent".to_owned(),
+            arguments: json!({
+                "description": "inspect child",
+                "prompt": "look at child",
+                "cwd": "child"
+            }),
+        };
+
+        let context = crate::tools::ToolContext::new(workspace.clone(), workspace.clone());
+        let cwd = crate::tools::with_tool_context(context, || subagent_cwd(&call)).unwrap();
+
+        assert_eq!(
+            PathBuf::from(cwd),
+            workspace.join("child").canonicalize().unwrap()
+        );
+        fs::remove_dir_all(workspace).ok();
     }
 }
