@@ -1085,11 +1085,7 @@ fn resolve_source_with_mode(
     let repository_source = git_repository_url(source)
         .with_context(|| format!("plugin source '{source}' does not exist"))?;
 
-    let cache_root = config
-        .cache_dir
-        .clone()
-        .map(|path| resolve_user_path(&path, cwd))
-        .unwrap_or_else(default_plugin_cache_dir);
+    let cache_root = plugin_cache_dir(config, cwd);
     fs::create_dir_all(&cache_root)
         .with_context(|| format!("failed to create plugin cache {}", cache_root.display()))?;
     let cache_identity = format!(
@@ -1248,7 +1244,7 @@ fn plugin_state_path(config: &PluginsConfig, cwd: &Path) -> PathBuf {
         .cache_dir
         .clone()
         .map(|path| resolve_user_path(&path, cwd).join("state.json"))
-        .unwrap_or_else(default_plugin_state_path)
+        .unwrap_or_else(|| cwd.join("plugins/state.json"))
 }
 
 fn marketplace_manifest_path(path: &Path) -> Result<PathBuf> {
@@ -2210,18 +2206,12 @@ fn resolve_user_path(path: &Path, cwd: &Path) -> PathBuf {
     }
 }
 
-fn default_plugin_cache_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".glint/plugins/cache")
-}
-
-fn default_plugin_state_path() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".glint/plugins/state.json")
+fn plugin_cache_dir(config: &PluginsConfig, glint_root: &Path) -> PathBuf {
+    config
+        .cache_dir
+        .as_ref()
+        .map(|path| resolve_user_path(path, glint_root))
+        .unwrap_or_else(|| glint_root.join("plugins/cache"))
 }
 
 fn enabled_by_default() -> bool {
@@ -2736,6 +2726,30 @@ mod tests {
             split_marketplace_git_ref("anthropics/claude-code#v1"),
             ("anthropics/claude-code", Some("v1"))
         );
+    }
+
+    #[test]
+    fn relative_plugin_paths_and_default_state_use_glint_root() {
+        let glint_root = Path::new("/users/alice/.glint");
+        let config = PluginsConfig::default();
+
+        assert_eq!(
+            resolve_user_path(Path::new("plugins/local"), glint_root),
+            Path::new("/users/alice/.glint/plugins/local")
+        );
+        assert_eq!(
+            plugin_cache_dir(&config, glint_root),
+            Path::new("/users/alice/.glint/plugins/cache")
+        );
+        assert_eq!(
+            plugin_state_path(&config, glint_root),
+            Path::new("/users/alice/.glint/plugins/state.json")
+        );
+
+        let root = test_dir("default-plugin-state-root").join(".glint");
+        save_plugin_state(&config, &root, &PluginState::default()).unwrap();
+        assert!(root.join("plugins/state.json").is_file());
+        fs::remove_dir_all(root.parent().unwrap()).ok();
     }
 
     #[test]

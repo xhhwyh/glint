@@ -167,7 +167,7 @@ pub(crate) fn persist_mcp_server(path: &Path, name: &str, server: &McpServerConf
     let _: serde_yaml::Value = serde_yaml::from_str(&content)
         .with_context(|| format!("failed to parse existing config {}", path.display()))?;
     let snippet = server_yaml(name, server)?;
-    let updated = insert_server_yaml(&content, &snippet)?;
+    let updated = insert_server_yaml(&content, name, &snippet)?;
 
     let temporary = path.with_extension(format!("yaml.tmp-{}", std::process::id()));
     fs::write(&temporary, updated)
@@ -275,7 +275,7 @@ fn approval_label(approval: McpApprovalPolicy) -> &'static str {
     }
 }
 
-fn insert_server_yaml(content: &str, snippet: &str) -> Result<String> {
+fn insert_server_yaml(content: &str, name: &str, snippet: &str) -> Result<String> {
     let mut lines = content.lines().map(str::to_owned).collect::<Vec<_>>();
     let indented = snippet
         .trim_end()
@@ -298,8 +298,16 @@ fn insert_server_yaml(content: &str, snippet: &str) -> Result<String> {
     match servers_index {
         Some(servers_index) => {
             ensure_block_key(&lines[servers_index], "servers")?;
-            let insert_at = section_end(&lines, servers_index + 1, 2);
-            lines.splice(insert_at..insert_at, indented);
+            let servers_end = section_end(&lines, servers_index + 1, 2);
+            if let Some(server_index) = (servers_index + 1..servers_end)
+                .find(|index| yaml_key_line(&lines[*index], 4, name))
+            {
+                ensure_block_key(&lines[server_index], name)?;
+                let server_end = section_end(&lines, server_index + 1, 4);
+                lines.splice(server_index..server_end, indented);
+            } else {
+                lines.splice(servers_end..servers_end, indented);
+            }
         }
         None => {
             let mut addition = vec!["  servers:".to_owned()];
@@ -491,6 +499,87 @@ servers:
         assert!(persisted.contains("\nmcp:\n  servers:\n    remote:\n"));
         assert!(persisted.contains("      approval: allow\n"));
         assert!(persisted.contains("      bearer_token_env: MCP_TOKEN\n"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn persists_mcp_without_changing_new_schema_fields_or_omissions() {
+        let root =
+            std::env::temp_dir().join(format!("glint-mcp-new-schema-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.yaml");
+        let original = "version: 1\nllm:\n  provider: deepseek\n  model: deepseek-chat\n  temperature: 0.7\n  max_tokens: 8196\nconfigured_providers:\n- deepseek\ncustom_providers:\n  Team Gateway:\n    base_url: https://llm.example.test/v1\n    models:\n    - code-large\n";
+        fs::write(&path, original).unwrap();
+        let server = McpServerConfig {
+            enabled: true,
+            startup_timeout_ms: default_startup_timeout_ms(),
+            tool_timeout_ms: default_tool_timeout_ms(),
+            approval: McpApprovalPolicy::Prompt,
+            tool_approval: BTreeMap::new(),
+            enabled_tools: None,
+            disabled_tools: Vec::new(),
+            transport: McpTransportConfig::Stdio {
+                command: "demo-mcp".to_owned(),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                env_vars: Vec::new(),
+                cwd: None,
+            },
+        };
+
+        persist_mcp_server(&path, "demo", &server).unwrap();
+
+        let persisted = fs::read_to_string(&path).unwrap();
+        assert!(persisted.starts_with(original));
+        assert!(persisted.contains("mcp:\n  servers:\n    demo:\n"));
+        assert!(!persisted.contains("plugins:"));
+        assert!(!persisted.contains("lsp:"));
+        let value: serde_yaml::Value = serde_yaml::from_str(&persisted).unwrap();
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["llm"]["provider"], "deepseek");
+        assert_eq!(value["configured_providers"][0], "deepseek");
+        assert_eq!(
+            value["custom_providers"]["Team Gateway"]["models"][0],
+            "code-large"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn persists_mcp_server_updates_existing_server_in_place() {
+        let root =
+            std::env::temp_dir().join(format!("glint-mcp-update-server-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.yaml");
+        fs::write(
+            &path,
+            "version: 1\nmcp:\n  servers:\n    demo:\n      transport: stdio\n      command: old-mcp\nplugins:\n  entries: []\n",
+        )
+        .unwrap();
+        let server = McpServerConfig {
+            enabled: true,
+            startup_timeout_ms: default_startup_timeout_ms(),
+            tool_timeout_ms: default_tool_timeout_ms(),
+            approval: McpApprovalPolicy::Prompt,
+            tool_approval: BTreeMap::new(),
+            enabled_tools: None,
+            disabled_tools: Vec::new(),
+            transport: McpTransportConfig::Stdio {
+                command: "new-mcp".to_owned(),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                env_vars: Vec::new(),
+                cwd: None,
+            },
+        };
+
+        persist_mcp_server(&path, "demo", &server).unwrap();
+
+        let persisted = fs::read_to_string(&path).unwrap();
+        assert_eq!(persisted.matches("    demo:\n").count(), 1);
+        assert!(!persisted.contains("old-mcp"));
+        assert!(persisted.contains("      command: new-mcp\n"));
+        assert!(persisted.ends_with("plugins:\n  entries: []\n"));
         fs::remove_dir_all(root).ok();
     }
 }

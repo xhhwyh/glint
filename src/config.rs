@@ -214,7 +214,8 @@ impl RuntimeExtensions {
     pub fn from_user_config(config: &UserConfig) -> Result<Self> {
         let mcp: McpConfig =
             parse_optional_section(config.mcp.as_ref(), "mcp")?.unwrap_or_default();
-        mcp.validate()?;
+        mcp.validate()
+            .context("failed to parse mcp in ~/.glint/config.yaml")?;
         let plugins: PluginsConfig =
             parse_optional_section(config.plugins.as_ref(), "plugins")?.unwrap_or_default();
         let lsp = parse_optional_section::<FileLspConfig>(config.lsp.as_ref(), "lsp")?
@@ -233,7 +234,7 @@ fn parse_optional_section<T: for<'de> Deserialize<'de>>(
         .cloned()
         .map(serde_yaml::from_value)
         .transpose()
-        .with_context(|| format!("failed to parse {section} in user configuration"))
+        .with_context(|| format!("failed to parse {section} in ~/.glint/config.yaml"))
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -395,7 +396,46 @@ mod tests {
         let error = RuntimeExtensions::from_user_config(&malformed)
             .err()
             .expect("invalid MCP section should fail");
-        assert!(format!("{error:#}").contains("failed to parse mcp"));
+        assert!(format!("{error:#}").contains("failed to parse mcp in ~/.glint/config.yaml"));
+
+        let invalid = UserConfig {
+            mcp: Some(
+                serde_yaml::from_str("servers:\n  docs:\n    transport: stdio\n    command: ''")
+                    .unwrap(),
+            ),
+            ..UserConfig::default()
+        };
+        let error = RuntimeExtensions::from_user_config(&invalid)
+            .err()
+            .expect("invalid MCP values should fail");
+        assert!(format!("{error:#}").contains("failed to parse mcp in ~/.glint/config.yaml"));
+    }
+
+    #[test]
+    fn runtime_extension_errors_name_each_fixed_config_section() {
+        for (section, config) in [
+            (
+                "plugins",
+                UserConfig {
+                    plugins: Some(serde_yaml::Value::String("invalid".into())),
+                    ..UserConfig::default()
+                },
+            ),
+            (
+                "lsp",
+                UserConfig {
+                    lsp: Some(serde_yaml::Value::String("invalid".into())),
+                    ..UserConfig::default()
+                },
+            ),
+        ] {
+            let error = RuntimeExtensions::from_user_config(&config)
+                .err()
+                .expect("invalid extension section should fail");
+            assert!(format!("{error:#}").contains(&format!(
+                "failed to parse {section} in ~/.glint/config.yaml"
+            )));
+        }
     }
 
     #[cfg(unix)]

@@ -170,6 +170,8 @@ struct PendingTaskWait {
 pub struct SessionRuntime {
     transcript: TranscriptStore,
     transcript_cwd: String,
+    sessions_root: PathBuf,
+    mcp_root: PathBuf,
     agent_tx: Sender<AgentEvent>,
     agent_events: Receiver<AgentEvent>,
     agent_control_tx: Option<mpsc::Sender<AgentControl>>,
@@ -193,13 +195,23 @@ pub struct SessionRuntime {
 impl SessionRuntime {
     pub fn create_new(
         cwd: String,
+        sessions_root: PathBuf,
+        mcp_root: PathBuf,
         lsp_config: LspConfig,
         mcp_config: McpConfig,
         hooks: Vec<PluginHook>,
     ) -> Result<Self> {
-        TranscriptStore::prune_archive_older_than_in_background(30);
-        let transcript = TranscriptStore::create_new(&cwd)?;
-        let runtime = Self::from_transcript(transcript, cwd.clone(), lsp_config, mcp_config, hooks);
+        TranscriptStore::prune_archive_older_than_in_background(sessions_root.clone(), 30);
+        let transcript = TranscriptStore::create_new(&sessions_root, &cwd)?;
+        let runtime = Self::from_transcript(
+            transcript,
+            cwd.clone(),
+            sessions_root,
+            mcp_root,
+            lsp_config,
+            mcp_config,
+            hooks,
+        );
         runtime
             .hook_runner
             .run(HookEvent::SessionStart, json!({"cwd": cwd}))?;
@@ -209,19 +221,24 @@ impl SessionRuntime {
     fn from_transcript(
         transcript: TranscriptStore,
         transcript_cwd: String,
+        sessions_root: PathBuf,
+        mcp_root: PathBuf,
         lsp_config: LspConfig,
         mcp_config: McpConfig,
         hooks: Vec<PluginHook>,
     ) -> Self {
         let (agent_tx, agent_events) = mpsc::channel();
         let (task_request_tx, task_requests) = mpsc::channel();
-        let lsp_manager = LspManager::new(lsp_config, PathBuf::from(&transcript_cwd));
-        let mcp_manager = McpManager::new(mcp_config, PathBuf::from(&transcript_cwd));
-        let hook_runner = HookRunner::new(hooks);
+        let workspace = PathBuf::from(&transcript_cwd);
+        let lsp_manager = LspManager::new(lsp_config, workspace.clone());
+        let mcp_manager = McpManager::new(mcp_config, workspace.clone(), mcp_root.clone());
+        let hook_runner = HookRunner::new(hooks, workspace);
         let progress_state = transcript.progress_state();
         Self {
             transcript,
             transcript_cwd,
+            sessions_root,
+            mcp_root,
             agent_tx,
             agent_events,
             agent_control_tx: None,
@@ -278,14 +295,18 @@ impl SessionRuntime {
         self.mcp_manager.shutdown();
         let root = PathBuf::from(&self.transcript_cwd);
         self.lsp_manager = LspManager::new(lsp, root.clone());
-        self.mcp_manager = McpManager::new(mcp, root);
-        self.hook_runner = HookRunner::new(hooks);
+        self.mcp_manager = McpManager::new(mcp, root, self.mcp_root.clone());
+        self.hook_runner = HookRunner::new(hooks, PathBuf::from(&self.transcript_cwd));
     }
 
     pub fn reload_mcp(&mut self, mcp: McpConfig) {
         self.decline_pending_elicitations();
         self.mcp_manager.shutdown();
-        self.mcp_manager = McpManager::new_background(mcp, PathBuf::from(&self.transcript_cwd));
+        self.mcp_manager = McpManager::new_background(
+            mcp,
+            PathBuf::from(&self.transcript_cwd),
+            self.mcp_root.clone(),
+        );
     }
 
     pub fn reconnect_mcp(&self, server: &str) -> Result<()> {
@@ -314,11 +335,11 @@ impl SessionRuntime {
     }
 
     pub fn sessions(&self) -> Result<Vec<TranscriptSessionSummary>> {
-        TranscriptStore::sessions(&self.transcript_cwd)
+        TranscriptStore::sessions(&self.sessions_root, &self.transcript_cwd)
     }
 
     pub fn workspace_usage_stats(&self) -> Result<WorkspaceUsageStats> {
-        TranscriptStore::workspace_usage_stats(&self.transcript_cwd)
+        TranscriptStore::workspace_usage_stats(&self.sessions_root, &self.transcript_cwd)
     }
 
     pub fn load_path(&mut self, path: PathBuf) -> Result<LoadedTranscript> {
@@ -336,22 +357,22 @@ impl SessionRuntime {
     }
 
     pub fn create_new_session(&mut self) -> Result<LoadedTranscript> {
-        let transcript = self.transcript.create_new_sibling()?;
+        let transcript = TranscriptStore::create_new(&self.sessions_root, &self.transcript_cwd)?;
         self.transcript = transcript;
         self.reset_session_state();
         Ok(self.loaded_transcript())
     }
 
     pub fn archive_current_session(&mut self) -> Result<LoadedTranscript> {
-        let transcript = self.transcript.create_new_sibling()?;
-        self.transcript.archive_current()?;
+        let transcript = TranscriptStore::create_new(&self.sessions_root, &self.transcript_cwd)?;
+        self.transcript.archive_current(&self.sessions_root)?;
         self.transcript = transcript;
         self.reset_session_state();
         Ok(self.loaded_transcript())
     }
 
     pub fn delete_current_session(&mut self) -> Result<LoadedTranscript> {
-        let transcript = self.transcript.create_new_sibling()?;
+        let transcript = TranscriptStore::create_new(&self.sessions_root, &self.transcript_cwd)?;
         self.transcript.delete_current()?;
         self.transcript = transcript;
         self.reset_session_state();
@@ -996,9 +1017,15 @@ impl SessionRuntime {
 
     #[cfg(test)]
     pub(crate) fn test_empty(path: PathBuf, transcript_cwd: String) -> Self {
+        let state_root = path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(format!("glint-runtime-test-state-{}", uuid::Uuid::new_v4()));
         Self::from_transcript(
             TranscriptStore::test_empty(path),
             transcript_cwd,
+            state_root.join("sessions"),
+            state_root.join("mcp"),
             LspConfig::default(),
             McpConfig::default(),
             Vec::new(),
@@ -1075,9 +1102,40 @@ fn percent(value: u64, total: u64) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::progress::TodoUpdate;
     use crate::tasks::{SubagentBackend, TaskRequest};
+
+    #[test]
+    fn new_session_after_legacy_resume_uses_explicit_sessions_root() {
+        let state_root = std::env::temp_dir().join(format!(
+            "glint-runtime-session-root-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let sessions_root = state_root.join("sessions");
+        let legacy = TranscriptStore::test_empty(state_root.join("projects/legacy/session.jsonl"));
+        let mut runtime = SessionRuntime::from_transcript(
+            legacy,
+            "/work/project".to_owned(),
+            sessions_root.clone(),
+            state_root.join("mcp"),
+            LspConfig::default(),
+            McpConfig::default(),
+            Vec::new(),
+        );
+
+        runtime.create_new_session().unwrap();
+
+        assert!(
+            runtime
+                .transcript
+                .tool_results_dir()
+                .starts_with(&sessions_root)
+        );
+        fs::remove_dir_all(state_root).ok();
+    }
 
     fn runtime() -> SessionRuntime {
         SessionRuntime::test_empty(

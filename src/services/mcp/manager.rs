@@ -327,15 +327,20 @@ impl ClientHandler for GlintClientHandler {
 }
 
 impl McpManager {
-    pub fn new(config: McpConfig, cwd: PathBuf) -> Self {
-        Self::start(config, cwd, true)
+    pub fn new(config: McpConfig, workspace: PathBuf, mcp_root: PathBuf) -> Self {
+        Self::start(config, workspace, mcp_root, true)
     }
 
-    pub fn new_background(config: McpConfig, cwd: PathBuf) -> Self {
-        Self::start(config, cwd, false)
+    pub fn new_background(config: McpConfig, workspace: PathBuf, mcp_root: PathBuf) -> Self {
+        Self::start(config, workspace, mcp_root, false)
     }
 
-    fn start(config: McpConfig, cwd: PathBuf, wait_until_ready: bool) -> Self {
+    fn start(
+        config: McpConfig,
+        workspace: PathBuf,
+        mcp_root: PathBuf,
+        wait_until_ready: bool,
+    ) -> Self {
         let state = Arc::new(RwLock::new(ManagerState::default()));
         initialize_statuses(&state, &config);
         let (commands, command_rx) = tokio_mpsc::unbounded_channel();
@@ -347,7 +352,8 @@ impl McpManager {
             .spawn(move || {
                 run_worker(
                     config,
-                    cwd,
+                    workspace,
+                    mcp_root,
                     command_rx,
                     worker_state,
                     ready_tx,
@@ -575,7 +581,8 @@ impl DynamicTool for McpDynamicTool {
 
 fn run_worker(
     config: McpConfig,
-    cwd: PathBuf,
+    workspace: PathBuf,
+    mcp_root: PathBuf,
     command_rx: tokio_mpsc::UnboundedReceiver<ManagerCommand>,
     state: Arc<RwLock<ManagerState>>,
     ready: mpsc::Sender<()>,
@@ -601,7 +608,8 @@ fn run_worker(
     };
     runtime.block_on(worker_loop(
         config,
-        cwd,
+        workspace,
+        mcp_root,
         command_rx,
         state,
         ready,
@@ -611,7 +619,8 @@ fn run_worker(
 
 async fn worker_loop(
     config: McpConfig,
-    cwd: PathBuf,
+    workspace: PathBuf,
+    mcp_root: PathBuf,
     mut commands: tokio_mpsc::UnboundedReceiver<ManagerCommand>,
     state: Arc<RwLock<ManagerState>>,
     ready: mpsc::Sender<()>,
@@ -624,7 +633,7 @@ async fn worker_loop(
     let mut oauth_clients = BTreeMap::new();
     for (name, server) in config.servers.iter().filter(|(_, server)| server.enabled) {
         let oauth_client = if server_oauth(server).is_some() {
-            match restore_oauth_client(name, server, &cwd).await {
+            match restore_oauth_client(name, server, &mcp_root).await {
                 Ok(Some(client)) => {
                     oauth_clients.insert(name.clone(), client.clone());
                     Some(client)
@@ -648,7 +657,7 @@ async fn worker_loop(
         match connect_server(
             name,
             server,
-            &cwd,
+            &workspace,
             notification_tx.clone(),
             elicitations.clone(),
             oauth_client,
@@ -690,7 +699,7 @@ async fn worker_loop(
                     let result = reconnect_server(
                         &server,
                         &config,
-                        &cwd,
+                        &workspace,
                         notification_tx.clone(),
                         elicitations.clone(),
                         oauth_clients.get(&server).cloned(),
@@ -703,7 +712,7 @@ async fn worker_loop(
                     let result = begin_oauth_authorization(
                         &server,
                         &config,
-                        &cwd,
+                        &mcp_root,
                         &mut oauth_states,
                     ).await;
                     response.send(result).ok();
@@ -713,7 +722,7 @@ async fn worker_loop(
                         &server,
                         &callback_url,
                         &config,
-                        &cwd,
+                        &workspace,
                         notification_tx.clone(),
                         elicitations.clone(),
                         &mut oauth_states,
@@ -727,7 +736,7 @@ async fn worker_loop(
                     let result = logout_oauth(
                         &server,
                         &config,
-                        &cwd,
+                        &mcp_root,
                         &mut oauth_states,
                         &mut oauth_clients,
                         &mut services,
@@ -1069,7 +1078,7 @@ fn server_oauth(config: &McpServerConfig) -> Option<(&str, &super::McpOAuthConfi
     }
 }
 
-async fn new_oauth_state(name: &str, url: &str, cwd: &Path) -> Result<OAuthState> {
+async fn new_oauth_state(name: &str, url: &str, mcp_root: &Path) -> Result<OAuthState> {
     let mut state = OAuthState::new(url, None)
         .await
         .with_context(|| format!("failed to initialize OAuth for MCP server '{name}'"))?;
@@ -1077,7 +1086,7 @@ async fn new_oauth_state(name: &str, url: &str, cwd: &Path) -> Result<OAuthState
         bail!("OAuth for MCP server '{name}' entered an invalid initial state");
     };
     manager.set_credential_store(FileCredentialStore::new(oauth_credential_path(
-        cwd, name, url,
+        mcp_root, name, url,
     )));
     Ok(state)
 }
@@ -1085,12 +1094,12 @@ async fn new_oauth_state(name: &str, url: &str, cwd: &Path) -> Result<OAuthState
 async fn restore_oauth_client(
     name: &str,
     config: &McpServerConfig,
-    cwd: &Path,
+    mcp_root: &Path,
 ) -> Result<Option<McpOAuthClient>> {
     let Some((url, _)) = server_oauth(config) else {
         return Ok(None);
     };
-    let mut state = new_oauth_state(name, url, cwd).await?;
+    let mut state = new_oauth_state(name, url, mcp_root).await?;
     let restored = match &mut state {
         OAuthState::Unauthorized(manager) => manager.initialize_from_store().await?,
         _ => false,
@@ -1108,7 +1117,7 @@ async fn restore_oauth_client(
 async fn begin_oauth_authorization(
     name: &str,
     config: &McpConfig,
-    cwd: &Path,
+    mcp_root: &Path,
     oauth_states: &mut BTreeMap<String, OAuthState>,
 ) -> Result<String> {
     let server = config
@@ -1128,7 +1137,7 @@ async fn begin_oauth_authorization(
         bail!("MCP server '{name}' cannot configure both bearer_token_env and oauth");
     }
 
-    let mut oauth_state = new_oauth_state(name, url, cwd).await?;
+    let mut oauth_state = new_oauth_state(name, url, mcp_root).await?;
     let scopes = oauth.scopes.iter().map(String::as_str).collect::<Vec<_>>();
     oauth_state
         .start_authorization(&scopes, &oauth.redirect_uri, Some("Glint"))
@@ -1147,7 +1156,7 @@ async fn complete_oauth_authorization(
     name: &str,
     callback_url: &str,
     config: &McpConfig,
-    cwd: &Path,
+    workspace: &Path,
     notifications: tokio_mpsc::UnboundedSender<NotificationEvent>,
     elicitations: mpsc::Sender<McpElicitation>,
     oauth_states: &mut BTreeMap<String, OAuthState>,
@@ -1180,7 +1189,7 @@ async fn complete_oauth_authorization(
     reconnect_server(
         name,
         config,
-        cwd,
+        workspace,
         notifications,
         elicitations,
         Some(client),
@@ -1194,7 +1203,7 @@ async fn complete_oauth_authorization(
 async fn logout_oauth(
     name: &str,
     config: &McpConfig,
-    cwd: &Path,
+    mcp_root: &Path,
     oauth_states: &mut BTreeMap<String, OAuthState>,
     oauth_clients: &mut BTreeMap<String, McpOAuthClient>,
     services: &mut BTreeMap<String, McpService>,
@@ -1212,7 +1221,7 @@ async fn logout_oauth(
     if let Some(mut service) = services.remove(name) {
         let _ = service.close_with_timeout(Duration::from_secs(2)).await;
     }
-    FileCredentialStore::new(oauth_credential_path(cwd, name, url))
+    FileCredentialStore::new(oauth_credential_path(mcp_root, name, url))
         .clear()
         .await?;
     set_failed(
@@ -1499,11 +1508,8 @@ fn exposed_tool_name(server: &str, tool: &str) -> String {
     )
 }
 
-fn oauth_credential_path(cwd: &Path, server: &str, url: &str) -> PathBuf {
-    let root = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| cwd.to_path_buf())
-        .join(".glint/mcp/oauth");
+fn oauth_credential_path(mcp_root: &Path, server: &str, url: &str) -> PathBuf {
+    let root = mcp_root.join("oauth");
     let filename = format!(
         "{}-{:016x}.json",
         sanitize_tool_name(server),
@@ -1583,6 +1589,22 @@ mod tests {
 
     use super::*;
     use crate::tools::ToolRegistry;
+
+    #[test]
+    fn process_cwd_is_workspace_relative_and_oauth_state_is_mcp_rooted() {
+        let workspace = Path::new("/work/project");
+        let mcp_root = Path::new("/users/alice/.glint/mcp");
+
+        assert_eq!(resolve_server_cwd(None, workspace), workspace);
+        assert_eq!(
+            resolve_server_cwd(Some("services/docs"), workspace),
+            Path::new("/work/project/services/docs")
+        );
+        assert!(
+            oauth_credential_path(mcp_root, "docs", "https://example.test/mcp")
+                .starts_with("/users/alice/.glint/mcp/oauth")
+        );
+    }
 
     #[test]
     fn oauth_credentials_are_persisted_and_cleared() {
@@ -1714,7 +1736,8 @@ for line in sys.stdin:
                 },
             )]),
         };
-        let manager = McpManager::new(config, std::env::temp_dir());
+        let root = std::env::temp_dir();
+        let manager = McpManager::new(config, root.clone(), root.join("glint-mcp-state"));
         let registry = ToolRegistry::new().with_dynamic_tools(manager.dynamic_tools());
         let names = registry
             .specs()

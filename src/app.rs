@@ -542,8 +542,12 @@ impl App {
         let transcript_cwd = std::env::current_dir()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|_| current_dir.clone());
+        let sessions_root = configuration.paths().sessions();
+        let mcp_root = configuration.paths().mcp();
         let runtime = SessionRuntime::create_new(
             transcript_cwd,
+            sessions_root,
+            mcp_root,
             config.lsp.clone(),
             config.mcp.clone(),
             config.extensions.hooks.clone(),
@@ -1589,11 +1593,12 @@ impl App {
             SlashCommandKind::Plugins => self.open_plugins_view(),
             SlashCommandKind::PluginPrompt(index) => self.run_plugin_prompt(index),
             SlashCommandKind::ReloadPlugins => {
+                let glint_root = self.plugin_root();
                 let result = PluginManager::refresh(
                     &self.config.plugins,
                     self.config.base_mcp.clone(),
                     self.config.base_lsp.clone(),
-                    &plugin_command_cwd(),
+                    &glint_root,
                 );
                 self.apply_plugin_mutation("/reload-plugins", result);
             }
@@ -2761,12 +2766,12 @@ impl App {
     }
 
     fn set_plugin_enabled(&mut self, spec: String, enabled: bool) {
-        let cwd = plugin_command_cwd();
+        let glint_root = self.plugin_root();
         match PluginManager::set_enabled(
             &self.config.plugins,
             self.config.base_mcp.clone(),
             self.config.base_lsp.clone(),
-            &cwd,
+            &glint_root,
             &spec,
             enabled,
         ) {
@@ -2798,7 +2803,7 @@ impl App {
         let plugins = self.config.plugins.clone();
         let mcp = self.config.base_mcp.clone();
         let lsp = self.config.base_lsp.clone();
-        let cwd = plugin_command_cwd();
+        let glint_root = self.plugin_root();
         if let Some(view) = self.plugins_view.as_mut() {
             view.screen = PluginsScreen::Operation(PluginOperationView {
                 title,
@@ -2823,7 +2828,7 @@ impl App {
                             "Resolving marketplace source and downloading Git data...".to_owned(),
                         ))
                         .ok();
-                    PluginManager::add_marketplace(&plugins, mcp, lsp, &cwd, &source)
+                    PluginManager::add_marketplace(&plugins, mcp, lsp, &glint_root, &source)
                 }
                 PluginUiMutation::Install(spec) => {
                     sender
@@ -2831,7 +2836,7 @@ impl App {
                             "Resolving plugin source and downloading Git data...".to_owned(),
                         ))
                         .ok();
-                    PluginManager::install(&plugins, mcp, lsp, &cwd, &spec)
+                    PluginManager::install(&plugins, mcp, lsp, &glint_root, &spec)
                 }
                 PluginUiMutation::Uninstall(spec) => {
                     sender
@@ -2839,7 +2844,7 @@ impl App {
                             "Removing plugin registration...".to_owned(),
                         ))
                         .ok();
-                    PluginManager::uninstall(&plugins, mcp, lsp, &cwd, &spec)
+                    PluginManager::uninstall(&plugins, mcp, lsp, &glint_root, &spec)
                 }
             });
             sender
@@ -3507,11 +3512,12 @@ impl App {
 
     fn run_plugin_manager_command(&mut self, prompt: &str) -> bool {
         if prompt == "/reload-plugins" || prompt == "/plugins reload" {
+            let glint_root = self.plugin_root();
             let result = PluginManager::refresh(
                 &self.config.plugins,
                 self.config.base_mcp.clone(),
                 self.config.base_lsp.clone(),
-                &plugin_command_cwd(),
+                &glint_root,
             );
             self.apply_plugin_mutation(prompt, result);
             return true;
@@ -3523,11 +3529,12 @@ impl App {
         if prompt == "/plugins marketplace update"
             || prompt.starts_with("/plugins marketplace update ")
         {
+            let glint_root = self.plugin_root();
             let result = PluginManager::refresh(
                 &self.config.plugins,
                 self.config.base_mcp.clone(),
                 self.config.base_lsp.clone(),
-                &plugin_command_cwd(),
+                &glint_root,
             );
             self.apply_plugin_mutation(prompt, result);
             return true;
@@ -3564,41 +3571,41 @@ impl App {
             );
             return true;
         }
-        let cwd = plugin_command_cwd();
+        let glint_root = self.plugin_root();
         let result = match operation {
             "/plugins marketplace add " => PluginManager::add_marketplace(
                 &self.config.plugins,
                 self.config.base_mcp.clone(),
                 self.config.base_lsp.clone(),
-                &cwd,
+                &glint_root,
                 argument,
             ),
             "/plugins marketplace remove " => PluginManager::remove_marketplace(
                 &self.config.plugins,
                 self.config.base_mcp.clone(),
                 self.config.base_lsp.clone(),
-                &cwd,
+                &glint_root,
                 argument,
             ),
             "/plugins install " => PluginManager::install(
                 &self.config.plugins,
                 self.config.base_mcp.clone(),
                 self.config.base_lsp.clone(),
-                &cwd,
+                &glint_root,
                 argument,
             ),
             "/plugins uninstall " => PluginManager::uninstall(
                 &self.config.plugins,
                 self.config.base_mcp.clone(),
                 self.config.base_lsp.clone(),
-                &cwd,
+                &glint_root,
                 argument,
             ),
             "/plugins enable " => PluginManager::set_enabled(
                 &self.config.plugins,
                 self.config.base_mcp.clone(),
                 self.config.base_lsp.clone(),
-                &cwd,
+                &glint_root,
                 argument,
                 true,
             ),
@@ -3606,7 +3613,7 @@ impl App {
                 &self.config.plugins,
                 self.config.base_mcp.clone(),
                 self.config.base_lsp.clone(),
-                &cwd,
+                &glint_root,
                 argument,
                 false,
             ),
@@ -3614,6 +3621,10 @@ impl App {
         };
         self.apply_plugin_mutation(prompt, result);
         true
+    }
+
+    fn plugin_root(&self) -> PathBuf {
+        self.configuration.paths().root().to_path_buf()
     }
 
     fn apply_plugin_mutation(&mut self, command: &str, result: Result<PluginMutationResult>) {
@@ -4124,10 +4135,6 @@ fn current_dir_label() -> String {
     std::env::current_dir()
         .map(|path| home_relative_path(&path))
         .unwrap_or_else(|_| "?".to_owned())
-}
-
-fn plugin_command_cwd() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 fn home_relative_path(path: &Path) -> String {
@@ -6304,6 +6311,35 @@ mod tests {
         ));
         assert!(app.pending_plugin_operation.is_none());
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn reload_plugins_resolves_relative_source_from_configuration_root() {
+        let mut app = app();
+        let glint_root = app.configuration.paths().root().to_path_buf();
+        let plugin = glint_root.join("plugins/local");
+        fs::create_dir_all(plugin.join(".glint-plugin")).unwrap();
+        fs::write(
+            plugin.join(".glint-plugin/plugin.json"),
+            r#"{"name":"rooted","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        app.config.plugins = PluginsConfig {
+            entries: vec![crate::plugins::PluginEntryConfig::Source(
+                "plugins/local".to_owned(),
+            )],
+            ..Default::default()
+        };
+
+        assert!(app.run_plugin_manager_command("/reload-plugins"));
+
+        assert_eq!(app.config.extensions.plugins[0].name, "rooted");
+        assert!(
+            app.config.extensions.plugins[0]
+                .root
+                .starts_with(&glint_root)
+        );
+        fs::remove_dir_all(glint_root).ok();
     }
 
     #[test]

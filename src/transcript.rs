@@ -234,8 +234,8 @@ struct EntryKind {
 }
 
 impl TranscriptStore {
-    pub fn create_new(cwd: &str) -> Result<Self> {
-        let project_dir = transcript_project_dir(cwd)?;
+    pub fn create_new(sessions_root: &Path, cwd: &str) -> Result<Self> {
+        let project_dir = transcript_project_dir(sessions_root, cwd);
         Self::create_new_in_project_dir(project_dir)
     }
 
@@ -243,15 +243,6 @@ impl TranscriptStore {
         fs::create_dir_all(&project_dir).context("failed to create transcript directory")?;
         let session_id = new_id();
         Ok(Self::empty(project_dir.join(format!("{session_id}.jsonl"))))
-    }
-
-    pub fn create_new_sibling(&self) -> Result<Self> {
-        let project_dir = self
-            .path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
-        Self::create_new_in_project_dir(project_dir)
     }
 
     pub fn load_path(path: PathBuf) -> Result<Self> {
@@ -264,8 +255,8 @@ impl TranscriptStore {
         self.session_dir().join("tool-results")
     }
 
-    pub fn archive_current(&self) -> Result<()> {
-        self.archive_current_in_dir(archive_dir()?)
+    pub fn archive_current(&self, sessions_root: &Path) -> Result<()> {
+        self.archive_current_in_dir(archive_dir(sessions_root))
     }
 
     pub fn delete_current(&self) -> Result<()> {
@@ -279,45 +270,36 @@ impl TranscriptStore {
         Ok(())
     }
 
-    pub fn prune_archive_older_than(days: u64) -> Result<()> {
-        let archive_dir = archive_dir()?;
+    pub fn prune_archive_older_than(sessions_root: &Path, days: u64) -> Result<()> {
+        let archive_dir = archive_dir(sessions_root);
         let cutoff = SystemTime::now()
             .checked_sub(Duration::from_secs(days.saturating_mul(SECONDS_PER_DAY)))
             .unwrap_or(UNIX_EPOCH);
         prune_archive_entries_before(&archive_dir, cutoff)
     }
 
-    pub fn prune_archive_older_than_in_background(days: u64) {
+    pub fn prune_archive_older_than_in_background(sessions_root: PathBuf, days: u64) {
         let _ = std::thread::Builder::new()
             .name("glint-archive-prune".to_owned())
             .spawn(move || {
-                let _ = Self::prune_archive_older_than(days);
+                let _ = Self::prune_archive_older_than(&sessions_root, days);
             });
     }
 
-    pub fn sessions(cwd: &str) -> Result<Vec<TranscriptSessionSummary>> {
-        let project_dir = transcript_project_dir(cwd)?;
-        if !project_dir.exists() {
-            return Ok(Vec::new());
-        }
-
+    pub fn sessions(sessions_root: &Path, cwd: &str) -> Result<Vec<TranscriptSessionSummary>> {
         let mut sessions = Vec::new();
-        for entry in fs::read_dir(project_dir).context("failed to read transcript directory")? {
-            let path = entry.context("failed to read transcript entry")?.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
-                continue;
-            }
-            if let Ok(Some(summary)) = session_summary(&path) {
-                sessions.push(summary);
-            }
+        for directory in session_search_dirs(sessions_root, cwd) {
+            append_session_summaries(&directory, &mut sessions)?;
         }
         sessions.sort_by_key(|session| Reverse(session.last_timestamp));
         Ok(sessions)
     }
 
-    pub fn workspace_usage_stats(cwd: &str) -> Result<WorkspaceUsageStats> {
-        let project_dir = transcript_project_dir(cwd)?;
-        workspace_usage_stats_in_project_dir(&project_dir)
+    pub fn workspace_usage_stats(sessions_root: &Path, cwd: &str) -> Result<WorkspaceUsageStats> {
+        workspace_usage_stats_in_project_dirs(&[
+            transcript_project_dir(sessions_root, cwd),
+            legacy_project_dir(sessions_root, cwd),
+        ])
     }
 
     pub fn start_turn(&mut self, cwd: String, provider: String, model: String) -> Result<()> {
@@ -965,28 +947,48 @@ fn session_summary(path: &Path) -> Result<Option<TranscriptSessionSummary>> {
     }))
 }
 
-fn workspace_usage_stats_in_project_dir(project_dir: &Path) -> Result<WorkspaceUsageStats> {
-    if !project_dir.exists() {
-        return Ok(WorkspaceUsageStats::default());
+fn workspace_usage_stats_in_project_dirs(project_dirs: &[PathBuf]) -> Result<WorkspaceUsageStats> {
+    let mut stats = UsageStatsAccumulator::default();
+    for project_dir in project_dirs {
+        if !project_dir.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(project_dir).context("failed to read transcript directory")? {
+            let path = entry.context("failed to read transcript entry")?.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(store) = TranscriptStore::load_path(path) else {
+                continue;
+            };
+            if store.entries.is_empty() {
+                continue;
+            }
+            stats.session_count += 1;
+            stats.accumulate(&store);
+        }
     }
 
-    let mut stats = UsageStatsAccumulator::default();
-    for entry in fs::read_dir(project_dir).context("failed to read transcript directory")? {
+    Ok(stats.finish())
+}
+
+fn append_session_summaries(
+    directory: &Path,
+    sessions: &mut Vec<TranscriptSessionSummary>,
+) -> Result<()> {
+    if !directory.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(directory).context("failed to read transcript directory")? {
         let path = entry.context("failed to read transcript entry")?.path();
         if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
             continue;
         }
-        let Ok(store) = TranscriptStore::load_path(path) else {
-            continue;
-        };
-        if store.entries.is_empty() {
-            continue;
+        if let Ok(Some(summary)) = session_summary(&path) {
+            sessions.push(summary);
         }
-        stats.session_count += 1;
-        stats.accumulate(&store);
     }
-
-    Ok(stats.finish())
+    Ok(())
 }
 
 #[derive(Default)]
@@ -1170,17 +1172,35 @@ fn prune_archive_entries_before(archive_dir: &Path, cutoff: SystemTime) -> Resul
     Ok(())
 }
 
-fn archive_dir() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".glint").join("archive"))
+fn archive_dir(sessions_root: &Path) -> PathBuf {
+    sessions_root.join("archive")
 }
 
-fn transcript_project_dir(cwd: &str) -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home)
-        .join(".glint")
+fn transcript_project_dir(sessions_root: &Path, cwd: &str) -> PathBuf {
+    sessions_root.join(sanitize_cwd(cwd))
+}
+
+fn legacy_project_dir(sessions_root: &Path, cwd: &str) -> PathBuf {
+    glint_root(sessions_root)
         .join("projects")
-        .join(sanitize_cwd(cwd)))
+        .join(sanitize_cwd(cwd))
+}
+
+fn legacy_archive_dir(sessions_root: &Path) -> PathBuf {
+    glint_root(sessions_root).join("archive")
+}
+
+fn glint_root(sessions_root: &Path) -> &Path {
+    sessions_root.parent().unwrap_or(sessions_root)
+}
+
+fn session_search_dirs(sessions_root: &Path, cwd: &str) -> [PathBuf; 4] {
+    [
+        transcript_project_dir(sessions_root, cwd),
+        archive_dir(sessions_root),
+        legacy_project_dir(sessions_root, cwd),
+        legacy_archive_dir(sessions_root),
+    ]
 }
 
 fn sanitize_cwd(cwd: &str) -> String {
@@ -1367,6 +1387,83 @@ mod tests {
         assert_eq!(fresh.token_usages().count(), 0);
 
         fs::remove_dir_all(project_dir).ok();
+    }
+
+    #[test]
+    fn new_session_and_archive_use_explicit_sessions_root() {
+        let glint_root = std::env::temp_dir().join(format!(
+            "glint-explicit-session-root-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let sessions_root = glint_root.join("sessions");
+        let cwd = "/work/project";
+        let mut store = TranscriptStore::create_new(&sessions_root, cwd).unwrap();
+        store.append_user("new session".to_owned()).unwrap();
+        let original = store.path.clone();
+
+        assert!(original.starts_with(&sessions_root));
+        store.archive_current(&sessions_root).unwrap();
+        assert!(!original.exists());
+        assert!(sessions_root.join("archive").exists());
+        fs::remove_dir_all(glint_root).ok();
+    }
+
+    #[test]
+    fn session_summaries_include_new_and_legacy_roots() {
+        let glint_root = std::env::temp_dir().join(format!(
+            "glint-session-summary-roots-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let sessions_root = glint_root.join("sessions");
+        let cwd = "/work/project";
+        let mut current = TranscriptStore::create_new(&sessions_root, cwd).unwrap();
+        current.append_user("current session".to_owned()).unwrap();
+        let legacy_project = glint_root.join("projects").join(sanitize_cwd(cwd));
+        let mut legacy = TranscriptStore::create_new_in_project_dir(legacy_project).unwrap();
+        legacy.append_user("legacy project".to_owned()).unwrap();
+        let legacy_archive = glint_root.join("archive");
+        let mut archived = TranscriptStore::create_new_in_project_dir(legacy_archive).unwrap();
+        archived.append_user("legacy archive".to_owned()).unwrap();
+
+        let summaries = TranscriptStore::sessions(&sessions_root, cwd).unwrap();
+        let titles = summaries
+            .iter()
+            .map(|summary| summary.title.as_str())
+            .collect::<Vec<_>>();
+        assert!(titles.contains(&"current session"));
+        assert!(titles.contains(&"legacy project"));
+        assert!(titles.contains(&"legacy archive"));
+        fs::remove_dir_all(glint_root).ok();
+    }
+
+    #[test]
+    fn loading_legacy_session_does_not_rewrite_or_move_it() {
+        let glint_root = std::env::temp_dir().join(format!(
+            "glint-legacy-resume-in-place-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let legacy_project = glint_root.join("projects/legacy");
+        let mut legacy = TranscriptStore::create_new_in_project_dir(legacy_project).unwrap();
+        legacy.append_user("legacy session".to_owned()).unwrap();
+        let path = legacy.path.clone();
+        let before = fs::read(&path).unwrap();
+
+        let loaded = TranscriptStore::load_path(path.clone()).unwrap();
+
+        assert_eq!(loaded.path, path);
+        assert_eq!(fs::read(&loaded.path).unwrap(), before);
+        assert!(!glint_root.join("sessions").exists());
+
+        let mut loaded = loaded;
+        loaded.append_user("continued in place".to_owned()).unwrap();
+        assert_eq!(loaded.path, path);
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("continued in place")
+        );
+        assert!(!glint_root.join("sessions").exists());
+        fs::remove_dir_all(glint_root).ok();
     }
 
     #[test]
@@ -1779,7 +1876,7 @@ mod tests {
             })
             .unwrap();
 
-        let stats = workspace_usage_stats_in_project_dir(&project_dir).unwrap();
+        let stats = workspace_usage_stats_in_project_dirs(&[project_dir.clone()]).unwrap();
 
         assert_eq!(stats.session_count, 1);
         assert_eq!(stats.turn_count, 1);

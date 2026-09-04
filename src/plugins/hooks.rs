@@ -1,6 +1,7 @@
 use std::{
     fs,
     io::Write,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -14,6 +15,7 @@ use super::{HookEvent, PluginHook};
 #[derive(Clone, Default)]
 pub struct HookRunner {
     hooks: Vec<PluginHook>,
+    workspace: PathBuf,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -35,8 +37,8 @@ enum HookDecision {
 }
 
 impl HookRunner {
-    pub fn new(hooks: Vec<PluginHook>) -> Self {
-        Self { hooks }
+    pub fn new(hooks: Vec<PluginHook>, workspace: PathBuf) -> Self {
+        Self { hooks, workspace }
     }
 
     pub fn run(&self, event: HookEvent, payload: Value) -> Result<HookOutcome> {
@@ -46,7 +48,7 @@ impl HookRunner {
             .iter()
             .filter(|hook| hook.event == event && hook_matches(hook, &payload))
         {
-            let output = run_hook(hook, event, &payload)?;
+            let output = run_hook(hook, event, &payload, &self.workspace)?;
             if matches!(output.decision, HookDecision::Deny) {
                 bail!(
                     "plugin '{}' denied {event:?}: {}",
@@ -77,7 +79,12 @@ fn hook_matches(hook: &PluginHook, payload: &Value) -> bool {
     matcher.split('|').any(|candidate| candidate.trim() == name)
 }
 
-fn run_hook(hook: &PluginHook, event: HookEvent, payload: &Value) -> Result<HookOutput> {
+fn run_hook(
+    hook: &PluginHook,
+    event: HookEvent,
+    payload: &Value,
+    workspace: &Path,
+) -> Result<HookOutput> {
     let root = hook
         .root
         .as_ref()
@@ -105,6 +112,7 @@ fn run_hook(hook: &PluginHook, event: HookEvent, payload: &Value) -> Result<Hook
         .args(args)
         .env("GLINT_PLUGIN", &hook.plugin)
         .env("GLINT_HOOK_EVENT", format!("{event:?}"))
+        .current_dir(workspace)
         .stdin(Stdio::piped())
         .stdout(stdout)
         .stderr(stderr);
@@ -113,7 +121,6 @@ fn run_hook(hook: &PluginHook, event: HookEvent, payload: &Value) -> Result<Hook
     }
     if let Some(root) = &hook.root {
         command
-            .current_dir(root)
             .env("GLINT_PLUGIN_ROOT", root)
             .env("CLAUDE_PLUGIN_ROOT", root);
     }
@@ -218,15 +225,19 @@ mod tests {
             "deny",
             "print('{\"decision\":\"deny\",\"reason\":\"blocked\"}')",
         );
-        let replace = HookRunner::new(vec![PluginHook {
-            event: HookEvent::PromptSubmit,
-            command: format!("python3 {}", replace_script.display()),
-            matcher: None,
-            timeout_ms: 2_000,
-            plugin: "replace".to_owned(),
-            root: None,
-            settings: Some(serde_json::json!({"mode":"strict"})),
-        }]);
+        let workspace = std::env::current_dir().unwrap();
+        let replace = HookRunner::new(
+            vec![PluginHook {
+                event: HookEvent::PromptSubmit,
+                command: format!("python3 {}", replace_script.display()),
+                matcher: None,
+                timeout_ms: 2_000,
+                plugin: "replace".to_owned(),
+                root: None,
+                settings: Some(serde_json::json!({"mode":"strict"})),
+            }],
+            workspace.clone(),
+        );
         let outcome = replace
             .run(
                 HookEvent::PromptSubmit,
@@ -235,15 +246,18 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.replacement.unwrap()["prompt"], "changed");
 
-        let deny = HookRunner::new(vec![PluginHook {
-            event: HookEvent::PromptSubmit,
-            command: format!("python3 {}", deny_script.display()),
-            matcher: None,
-            timeout_ms: 2_000,
-            plugin: "deny".to_owned(),
-            root: None,
-            settings: None,
-        }]);
+        let deny = HookRunner::new(
+            vec![PluginHook {
+                event: HookEvent::PromptSubmit,
+                command: format!("python3 {}", deny_script.display()),
+                matcher: None,
+                timeout_ms: 2_000,
+                plugin: "deny".to_owned(),
+                root: None,
+                settings: None,
+            }],
+            workspace,
+        );
         let error = deny
             .run(
                 HookEvent::PromptSubmit,
@@ -254,6 +268,45 @@ mod tests {
 
         fs::remove_file(replace_script).ok();
         fs::remove_file(deny_script).ok();
+    }
+
+    #[test]
+    fn hook_runs_in_workspace_with_plugin_root_environment() {
+        if Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("glint-hook-roots-{}", uuid::Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let plugin_root = root.join("plugin");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&plugin_root).unwrap();
+        let check_script = script(
+            "roots",
+            &format!(
+                "import os\nassert os.getcwd() == {:?}\nassert os.environ['GLINT_PLUGIN_ROOT'] == {:?}\n",
+                workspace.display().to_string(),
+                plugin_root.display().to_string()
+            ),
+        );
+        let runner = HookRunner::new(
+            vec![PluginHook {
+                event: HookEvent::SessionStart,
+                command: format!("python3 {}", check_script.display()),
+                matcher: None,
+                timeout_ms: 2_000,
+                plugin: "rooted".to_owned(),
+                root: Some(plugin_root),
+                settings: None,
+            }],
+            workspace,
+        );
+
+        runner
+            .run(HookEvent::SessionStart, serde_json::json!({}))
+            .unwrap();
+
+        fs::remove_file(check_script).ok();
+        fs::remove_dir_all(root).ok();
     }
 
     fn script(label: &str, body: &str) -> std::path::PathBuf {
