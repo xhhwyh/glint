@@ -36,11 +36,11 @@ mod transcript;
 mod ui;
 
 use std::{
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use app::{App, ExecutionRepaintRequest};
 use clap::Parser;
 use cli::Cli;
@@ -55,20 +55,23 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use event::{AppEvent, KeyAction, KeyInput, MouseAction};
+use provider_catalog::ProviderCatalog;
 use ratatui::{Terminal, backend::CrosstermBackend};
+use setup::{SetupOutcome, SetupState, apply_setup_effect};
 
 const MAX_TERMINAL_EVENTS_PER_FRAME: usize = 64;
 
 fn main() -> Result<()> {
     let _cli = Cli::parse();
-    let workspace = std::env::current_dir()?;
+    let workspace = std::env::current_dir().context("failed to resolve current directory")?;
     let paths = paths::GlintPaths::discover()?;
     let mut configuration = ConfigurationManager::discover(paths, &workspace)?;
     configuration.repair_selection()?;
-    if configuration.available_providers()?.is_empty() {
-        anyhow::bail!("no model is configured; run `glint` in an interactive terminal to add one");
-    }
-    let config = configuration.build_runtime(&workspace)?;
+    let choice = bootstrap_choice(
+        !configuration.available_providers()?.is_empty(),
+        io::stdout().is_terminal(),
+    )?;
+    let catalog = ProviderCatalog::embedded()?;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(
@@ -79,17 +82,88 @@ fn main() -> Result<()> {
     )?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    let result = run(&mut terminal, config);
+    let result = (|| -> Result<()> {
+        match choice {
+            BootstrapChoice::Chat => run(&mut terminal, configuration.build_runtime(&workspace)?),
+            BootstrapChoice::Setup => {
+                let initial_state = if configuration
+                    .provider_statuses()?
+                    .iter()
+                    .any(|status| status.configured)
+                {
+                    SetupState::provider_list(&catalog, &configuration)?
+                } else {
+                    SetupState::welcome(&catalog)
+                };
+                match run_setup(&mut terminal, &mut configuration, initial_state, &catalog)? {
+                    SetupOutcome::StartGlint => {
+                        run(&mut terminal, configuration.build_runtime(&workspace)?)
+                    }
+                    SetupOutcome::Exit => Ok(()),
+                }
+            }
+        }
+    })();
 
-    disable_raw_mode()?;
-    execute!(
+    let raw_mode_result = disable_raw_mode();
+    let screen_result = execute!(
         terminal.backend_mut(),
         PopKeyboardEnhancementFlags,
         DisableMouseCapture,
         LeaveAlternateScreen
-    )?;
-    terminal.show_cursor()?;
-    result
+    );
+    let cursor_result = terminal.show_cursor();
+    let cleanup_error = raw_mode_result
+        .err()
+        .or_else(|| screen_result.err())
+        .or_else(|| cursor_result.err());
+    match (result, cleanup_error) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Some(error)) => Err(error.into()),
+        (Ok(()), None) => Ok(()),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BootstrapChoice {
+    Setup,
+    Chat,
+}
+
+fn bootstrap_choice(has_available_models: bool, interactive: bool) -> Result<BootstrapChoice> {
+    if has_available_models {
+        return Ok(BootstrapChoice::Chat);
+    }
+    if interactive {
+        return Ok(BootstrapChoice::Setup);
+    }
+    bail!("no model is configured; run `glint` in an interactive terminal to add one")
+}
+
+fn run_setup(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    manager: &mut ConfigurationManager,
+    mut state: SetupState,
+    catalog: &ProviderCatalog,
+) -> Result<SetupOutcome> {
+    loop {
+        terminal.draw(|frame| ui::setup::render(frame, &state, catalog))?;
+        let Event::Key(key) = term_event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        let input = KeyInput::from(key);
+        if input.action == KeyAction::Quit {
+            return Ok(SetupOutcome::Exit);
+        }
+        if let Some(effect) = state.update(input.action)
+            && let Some(outcome) = apply_setup_effect(manager, &mut state, effect)?
+        {
+            return Ok(outcome);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -314,6 +388,30 @@ fn base64_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[test]
+    fn unconfigured_interactive_startup_enters_setup() {
+        assert_eq!(
+            bootstrap_choice(false, true).unwrap(),
+            BootstrapChoice::Setup
+        );
+    }
+
+    #[test]
+    fn configured_startup_bypasses_setup() {
+        assert_eq!(bootstrap_choice(true, true).unwrap(), BootstrapChoice::Chat);
+    }
+
+    #[test]
+    fn unconfigured_non_interactive_startup_explains_setup() {
+        let error = bootstrap_choice(false, false).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("run `glint` in an interactive terminal to add one")
+        );
+    }
 
     #[derive(Clone, Default)]
     struct RecordingWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);

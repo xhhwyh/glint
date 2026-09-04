@@ -1,7 +1,7 @@
 use std::process::Command;
 
 #[test]
-fn help_works_without_configuration_and_omits_legacy_options() {
+fn help_has_no_init_or_config_override() {
     let home = temp_home("help");
     std::fs::create_dir_all(&home).unwrap();
 
@@ -43,7 +43,7 @@ fn legacy_config_option_is_rejected() {
 }
 
 #[test]
-fn legacy_init_subcommand_is_rejected() {
+fn legacy_init_is_rejected_by_clap() {
     let home = temp_home("init");
     std::fs::create_dir_all(&home).unwrap();
 
@@ -54,7 +54,7 @@ fn legacy_init_subcommand_is_rejected() {
 }
 
 #[test]
-fn unconfigured_run_explains_interactive_setup() {
+fn non_interactive_unconfigured_run_explains_interactive_setup() {
     let home = temp_home("unconfigured");
     let workspace = home.join("workspace");
     std::fs::create_dir_all(workspace.join(".glint")).unwrap();
@@ -83,7 +83,8 @@ fn glint(home: &std::path::Path) -> Command {
     command
         .current_dir(std::env::temp_dir())
         .env("HOME", home)
-        .env_remove("XDG_CONFIG_HOME");
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("GLINT_CONFIG");
     command
 }
 

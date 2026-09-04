@@ -10,6 +10,7 @@ mod model_picker;
 mod plugins;
 mod progress;
 mod resume;
+pub(crate) mod setup;
 mod star;
 mod status;
 mod status_bar;
