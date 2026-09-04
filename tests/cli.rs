@@ -57,13 +57,19 @@ fn legacy_init_is_rejected_by_clap() {
 fn non_interactive_unconfigured_run_explains_interactive_setup() {
     let home = temp_home("unconfigured");
     let workspace = home.join("workspace");
+    let redirected = home.join("redirected");
+    let xdg = home.join("xdg");
     std::fs::create_dir_all(workspace.join(".glint")).unwrap();
+    std::fs::create_dir_all(xdg.join("glint")).unwrap();
     std::fs::write(workspace.join("config.yaml"), "legacy config").unwrap();
     std::fs::write(workspace.join(".glint/config.yaml"), "project config").unwrap();
+    std::fs::write(&redirected, "redirected config").unwrap();
+    std::fs::write(xdg.join("glint/config.yaml"), "xdg config").unwrap();
 
     let output = glint(&home)
         .current_dir(&workspace)
-        .env("GLINT_CONFIG", "/ignored/legacy.yaml")
+        .env("GLINT_CONFIG", &redirected)
+        .env("XDG_CONFIG_HOME", &xdg)
         .output()
         .unwrap();
 
@@ -73,7 +79,8 @@ fn non_interactive_unconfigured_run_explains_interactive_setup() {
         stderr
             .contains("no model is configured; run `glint` in an interactive terminal to add one")
     );
-    assert!(!stderr.contains("ignored/legacy.yaml"));
+    assert!(!stderr.contains(&redirected.display().to_string()));
+    assert!(!stderr.contains(&xdg.join("glint/config.yaml").display().to_string()));
     assert!(!stderr.contains(&workspace.join("config.yaml").display().to_string()));
     assert!(!stderr.contains(&workspace.join(".glint/config.yaml").display().to_string()));
 }

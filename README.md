@@ -2,78 +2,64 @@
 
 Glint is a Rust terminal coding agent for OpenAI-compatible LLM endpoints. It provides a Ratatui interface, streaming responses, conversation resume, approvals, local tools, MCP, plugins, LSP integration, and subagents.
 
-## Install
+## Install and start
 
-Glint currently supports macOS, Linux, and Windows through WSL. Native Windows is not supported yet.
-The installer requires `curl` and a POSIX-compatible shell such as `sh`, `bash`, or `zsh`.
-
-Install the latest release:
+Glint supports macOS, Linux, and Windows through WSL. Native Windows is not supported yet. The installer requires `curl` and a POSIX-compatible shell such as `sh`, `bash`, or `zsh`.
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/xhhwyh/glint/releases/latest/download/glint-installer.sh | sh
 ```
 
-The installer places `glint` in `~/.local/bin`. Start it from the project you want Glint to work on:
+The installer puts `glint` in `~/.local/bin`. Launch it from the workspace you want it to work on:
 
 ```bash
 cd your-project
 glint
 ```
 
-Verify the installation without loading a configuration:
+`glint --version` and `glint --help` work before setup.
 
-```bash
-glint --version
-glint --help
+## First run and models
+
+On the first interactive launch, Glint opens Welcome. Choose `Add model`, select a built-in provider, enter its masked API key, and save. The provider list then shows it as configured and enables every model that Glint ships for that provider; setup never checks the key over the network. The first saved built-in provider selects its embedded default model; a first custom provider selects its first model. Add other providers if wanted, then choose `Start Glint`.
+
+Use `/model` while chatting to switch among configured models or choose `Add model` to return to provider management. The normal picker shows only providers with a readable credential and their configured models. Built-in providers expose their complete embedded model lists. A custom provider asks for a display name, an OpenAI-compatible base URL, a masked key, and one or more model-name rows. Add or remove rows as needed; model names are validated locally and kept in their entered order.
+
+## Configuration and credentials
+
+All Glint state has one fixed root, `~/.glint`. The user-editable settings file is `~/.glint/config.yaml`; Glint creates a concise file and omits empty optional sections. A typical file looks like this:
+
+```yaml
+version: 1
+llm:
+  provider: deepseek
+  model: deepseek-v4-flash
+  temperature: 0.7
+  max_tokens: 8196
+configured_providers:
+  - deepseek
+custom_providers:
+  Team Gateway:
+    base_url: https://llm.example.com/v1
+    models: [code-large, code-fast]
 ```
 
-## Configure
+Built-in provider metadata and keys are deliberately absent from this file. API keys prefer the operating-system keyring. If the keyring is unavailable on a fresh install, Glint stores them in `~/.glint/auth.json`, with protected directory and file permissions on Unix. Never add credentials to YAML, commands, logs, or transcripts.
 
-Create a starter configuration:
+Optional `mcp`, `plugins`, and `lsp` blocks also belong in this file. Their schemas, persistence locations, and workspace behavior are documented in [EXTENSIONS.md](EXTENSIONS.md). The core contributor-facing schema is in [AGENTS.md](AGENTS.md).
 
-```bash
-glint init
-```
+## Upgrading and uninstalling
 
-This writes `$XDG_CONFIG_HOME/glint/config.yaml` when `XDG_CONFIG_HOME` is set, or `~/.config/glint/config.yaml` otherwise. Edit the endpoint and model, then export the environment variable named by `api_key_env`:
+This release does not import a previous working-directory configuration. After upgrading, start Glint interactively and set providers up again; API keys must be re-entered. You may manually copy compatible `mcp`, `plugins`, and `lsp` blocks into `~/.glint/config.yaml`.
 
-```bash
-export LLM_API_KEY="your-api-key"
-glint
-```
-
-Never put an API key in `config.yaml`.
-
-Glint selects its configuration in this order:
-
-1. `glint --config PATH`
-2. `GLINT_CONFIG`
-3. `.glint/config.yaml` in the current project
-4. the user configuration path above
-5. `config.yaml` in the current directory for compatibility with older checkouts
-
-`glint init` refuses to overwrite an existing file. Use an explicit destination when you want another configuration:
-
-```bash
-glint init --config ./my-glint.yaml
-glint --config ./my-glint.yaml
-```
-
-The complete LLM, LSP, MCP, and plugin schemas are documented in [AGENTS.md](AGENTS.md) and [EXTENSIONS.md](EXTENSIONS.md).
-Commands that update configuration, such as adding an MCP server, write back to the same file Glint selected at startup.
-
-## Update or uninstall
-
-Rerun the install command to update to the latest release.
-
-Remove an installer-managed Glint binary with:
+Rerun the installer to update. To remove the installer-managed binary:
 
 ```bash
 rm ~/.local/bin/glint
 ```
 
-User configuration, plugin state, and saved conversations live under the configuration path and `~/.glint`; uninstalling the binary does not delete them.
+This intentionally leaves `~/.glint`—configuration, credentials, plugin state, MCP state, and saved conversations—intact.
 
 ## Develop
 
@@ -86,7 +72,7 @@ cargo fmt --check
 cargo clippy -- -D warnings
 ```
 
-For local development, the checked-in `config.yaml` remains the final fallback, so `cargo run` continues to work from the repository root after its selected API-key environment variable is exported.
+Run `cargo run` from any workspace. An unconfigured non-interactive launch reports that setup needs an interactive terminal.
 
 ## Release
 

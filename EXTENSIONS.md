@@ -1,6 +1,8 @@
 # Plugins and MCP
 
-Glint loads plugins and MCP servers from the configuration file selected at startup. Plugin contributions are merged before the agent, LSP manager, MCP manager, slash-command registry, and system prompt are created. Treat plugins and MCP servers as trusted code: command hooks and stdio servers run local processes with the Glint user's permissions.
+Glint loads plugins and MCP servers from optional blocks in its fixed user configuration, `~/.glint/config.yaml`. Plugin contributions are merged before the agent, LSP manager, MCP manager, slash-command registry, and system prompt are created. Treat plugins and MCP servers as trusted code: command hooks and stdio servers run local processes with the Glint user's permissions.
+
+Global extension state stays below `~/.glint`: plugin cache and install state are under `plugins/`, and MCP-owned OAuth state is under `mcp/`. The directory from which Glint starts is the workspace: coding tools and LSP use it as their root; MCP uses it as its advertised root and default/relative process cwd; hooks run there. Relative plugin and marketplace sources instead resolve from `~/.glint`. Hook resource variables retain the plugin root, so workspace execution does not make plugin-owned resources ambiguous.
 
 ## MCP configuration
 
@@ -56,7 +58,7 @@ approval policy. Use arrow keys to select or scroll, `Tab`/`Left`/`Right` to swi
 variable and header names and redacts URL credentials and query strings.
 
 Select `＋ Add MCP server` to add a standalone stdio, Streamable HTTP, or OAuth server. The form
-accepts inherited environment-variable names for secrets, validates the configuration, atomically
+accepts environment-variable names for MCP-server secrets, validates the configuration, atomically
 updates only the `mcp` value in `~/.glint/config.yaml`, and activates the server immediately.
 Use `Up`/`Down`/`Tab` to choose a field, `Left`/`Right` to change transport or approval, `Enter` to
 save, and `Esc` to cancel.
