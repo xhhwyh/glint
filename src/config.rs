@@ -119,6 +119,8 @@ pub struct UserConfig {
     pub plugins: Option<serde_yaml::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lsp: Option<serde_yaml::Value>,
+    #[serde(default, flatten)]
+    extra: BTreeMap<String, serde_yaml::Value>,
 }
 
 impl Default for UserConfig {
@@ -131,6 +133,7 @@ impl Default for UserConfig {
             mcp: None,
             plugins: None,
             lsp: None,
+            extra: BTreeMap::new(),
         }
     }
 }
@@ -345,6 +348,13 @@ mod tests {
         let saved = store.load().unwrap().unwrap();
         assert_eq!(saved.llm.unwrap().model, "two");
         assert_eq!((saved.mcp, saved.plugins, saved.lsp), extensions);
+    }
+
+    #[test]
+    fn user_config_rejects_duplicate_known_top_level_keys() {
+        let error = serde_yaml::from_str::<UserConfig>("version: 1\nversion: 2\n").unwrap_err();
+
+        assert!(error.to_string().contains("duplicate field `version`"));
     }
 
     #[test]

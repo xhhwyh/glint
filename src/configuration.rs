@@ -1467,6 +1467,63 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_persistence_preserves_unknown_top_level_values() {
+        let home = std::env::temp_dir().join(format!(
+            "glint-manager-unknown-top-level-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = GlintPaths::from_home(&home);
+        fs::create_dir_all(paths.root()).unwrap();
+        fs::write(
+            paths.config(),
+            "version: 1\nfuture_mapping:\n  nested:\n    - 1\n    - true\n    - label\nfuture_scalar: preserve-me\n",
+        )
+        .unwrap();
+        let mut manager = ConfigurationManager::new(
+            paths.clone(),
+            home.join("workspace"),
+            ProviderCatalog::embedded().unwrap(),
+            Box::new(UserConfigStore::new(paths.clone())),
+            Box::new(crate::credentials::FileCredentialStore::new(paths.auth())),
+        )
+        .unwrap();
+
+        manager
+            .upsert_mcp_server("demo", &test_mcp_server("demo-mcp"))
+            .unwrap();
+        manager
+            .save_builtin("deepseek", Some("deepseek-key"))
+            .unwrap();
+        manager
+            .select_model("deepseek", "deepseek-v4-flash")
+            .unwrap();
+        manager
+            .save_custom(
+                "Gateway",
+                "https://gateway.example/v1",
+                Some("gateway-key"),
+                vec!["gateway-model".to_owned()],
+            )
+            .unwrap();
+
+        let raw: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(paths.config()).unwrap()).unwrap();
+        let mapping = raw.as_mapping().unwrap();
+        assert_eq!(
+            mapping.get("future_mapping"),
+            Some(&serde_yaml::from_str("nested: [1, true, label]").unwrap())
+        );
+        assert_eq!(
+            mapping.get("future_scalar"),
+            Some(&serde_yaml::Value::String("preserve-me".to_owned()))
+        );
+        assert!(mapping.contains_key("mcp"));
+        assert!(mapping.contains_key("llm"));
+        assert!(mapping.contains_key("custom_providers"));
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
     fn failed_mcp_write_leaves_disk_and_manager_unchanged() {
         let fixture = ManagerFixture::new();
         let repository = fixture.repository.clone();

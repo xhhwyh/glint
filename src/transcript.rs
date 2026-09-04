@@ -1205,8 +1205,10 @@ fn session_search_dirs(sessions_root: &Path, cwd: &str) -> [PathBuf; 4] {
 
 fn project_directory_component(cwd: &str) -> String {
     const MAX_ENCODED_BYTES: usize = 200;
+    const COMPLETE_PREFIX: &str = "workspace-v1-full-";
+    const TRUNCATED_PREFIX: &str = "workspace-v1-truncated-";
 
-    let mut encoded = String::from("workspace-");
+    let mut encoded = String::new();
     for byte in cwd.as_bytes() {
         if byte.is_ascii_alphanumeric() || *byte == b'-' {
             encoded.push(char::from(*byte));
@@ -1215,13 +1217,13 @@ fn project_directory_component(cwd: &str) -> String {
             write!(&mut encoded, "_{byte:02x}").expect("writing to a string cannot fail");
         }
     }
-    if encoded.len() > MAX_ENCODED_BYTES {
-        encoded.truncate(MAX_ENCODED_BYTES - 17);
-        use std::fmt::Write as _;
-        write!(&mut encoded, "-{:016x}", stable_path_hash(cwd))
-            .expect("writing to a string cannot fail");
+    if COMPLETE_PREFIX.len() + encoded.len() <= MAX_ENCODED_BYTES {
+        return format!("{COMPLETE_PREFIX}{encoded}");
     }
-    encoded
+
+    let suffix = format!("-{:016x}", stable_path_hash(cwd));
+    encoded.truncate(MAX_ENCODED_BYTES - TRUNCATED_PREFIX.len() - suffix.len());
+    format!("{TRUNCATED_PREFIX}{encoded}{suffix}")
 }
 
 fn stable_path_hash(value: &str) -> u64 {
@@ -1467,6 +1469,29 @@ mod tests {
             transcript_project_dir(sessions_root, "/a/b"),
             transcript_project_dir(sessions_root, "/a_2fb")
         );
+    }
+
+    #[test]
+    fn truncated_project_directory_cannot_alias_a_complete_short_encoding() {
+        let long = "a".repeat(191);
+        let short = format!("{}-21bb27edcef40be6", "a".repeat(173));
+
+        assert_ne!(
+            project_directory_component(&long),
+            project_directory_component(&short)
+        );
+    }
+
+    #[test]
+    fn project_directory_format_marks_the_complete_and_truncated_boundary() {
+        let longest_complete = project_directory_component(&"a".repeat(182));
+        let first_truncated = project_directory_component(&"a".repeat(183));
+
+        assert_eq!(longest_complete.len(), 200);
+        assert!(longest_complete.starts_with("workspace-v1-full-"));
+        assert_eq!(first_truncated.len(), 200);
+        assert!(first_truncated.starts_with("workspace-v1-truncated-"));
+        assert_ne!(longest_complete, first_truncated);
     }
 
     #[test]
