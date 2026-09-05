@@ -249,11 +249,7 @@ impl ConfigurationManager {
         }
 
         let mut custom = self.user.custom_providers.iter().collect::<Vec<_>>();
-        custom.sort_by(|(left, _), (right, _)| {
-            left.to_ascii_lowercase()
-                .cmp(&right.to_ascii_lowercase())
-                .then_with(|| left.cmp(right))
-        });
+        custom.sort_by(|(left, _), (right, _)| compare_custom_provider_names(left, right));
         for (name, provider) in custom {
             statuses.push(ProviderStatus {
                 id: name.clone(),
@@ -961,11 +957,7 @@ fn available_providers(
     }
 
     let mut custom = user.custom_providers.iter().collect::<Vec<_>>();
-    custom.sort_by(|(left, _), (right, _)| {
-        left.to_ascii_lowercase()
-            .cmp(&right.to_ascii_lowercase())
-            .then_with(|| left.cmp(right))
-    });
+    custom.sort_by(|(left, _), (right, _)| compare_custom_provider_names(left, right));
     for (name, provider) in custom {
         if !credential_is_present(credentials, &CredentialId::custom(name))? {
             continue;
@@ -973,6 +965,12 @@ fn available_providers(
         providers.push(custom_available_provider(name, provider));
     }
     Ok(providers)
+}
+
+pub(crate) fn compare_custom_provider_names(left: &str, right: &str) -> std::cmp::Ordering {
+    left.to_ascii_lowercase()
+        .cmp(&right.to_ascii_lowercase())
+        .then_with(|| left.cmp(right))
 }
 
 fn custom_available_provider(name: &str, provider: &CustomProviderConfig) -> AvailableProvider {

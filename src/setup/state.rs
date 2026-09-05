@@ -3,7 +3,10 @@ use std::fmt;
 use anyhow::Result;
 
 use crate::{
-    configuration::{ConfigurationManager, ConfigurationMutationErrorKind, ProviderStatus},
+    configuration::{
+        ConfigurationManager, ConfigurationMutationErrorKind, ProviderStatus,
+        compare_custom_provider_names,
+    },
     credentials::CredentialStoreStatus,
     event::KeyAction,
     input::InputState,
@@ -414,9 +417,11 @@ impl ProviderListState {
                 }
             })
             .collect::<Vec<_>>();
+        let mut custom = user.custom_providers.iter().collect::<Vec<_>>();
+        custom.sort_by(|(left, _), (right, _)| compare_custom_provider_names(left, right));
         rows.extend(
-            user.custom_providers
-                .iter()
+            custom
+                .into_iter()
                 .map(|(name, provider)| ProviderListRow::Custom {
                     name: name.clone(),
                     base_url: provider.base_url.clone(),
@@ -1491,6 +1496,59 @@ mod tests {
                 .rows
                 .iter()
                 .any(|row| row.provider_id() == Some("Gateway") && !row.status_unavailable())
+        );
+    }
+
+    #[test]
+    fn committed_fallback_preserves_case_insensitive_provider_and_action_order() {
+        let fixture = ManagerFixture::new();
+        let mut manager = fixture.manager();
+        for name in ["Zulu", "alpha"] {
+            manager
+                .save_custom(
+                    name,
+                    "https://llm.example/v1",
+                    Some("key"),
+                    vec!["model".into()],
+                )
+                .unwrap();
+        }
+        let catalog = test_catalog();
+        let mut state = SetupState::provider_list(&catalog, &manager).unwrap();
+        let builtin_names = catalog
+            .providers()
+            .iter()
+            .map(|provider| provider.name.as_str());
+
+        assert_eq!(
+            provider_list(&state)
+                .rows
+                .iter()
+                .map(ProviderListRow::display_name)
+                .collect::<Vec<_>>(),
+            builtin_names
+                .clone()
+                .chain(["alpha", "Zulu", "Custom provider", "Start Glint"])
+                .collect::<Vec<_>>()
+        );
+
+        state.show_saved_refresh_failure(&manager);
+
+        assert_eq!(
+            provider_list(&state)
+                .rows
+                .iter()
+                .map(ProviderListRow::display_name)
+                .collect::<Vec<_>>(),
+            builtin_names
+                .chain(["alpha", "Zulu", "Custom provider", "Refresh providers"])
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !provider_list(&state)
+                .rows
+                .iter()
+                .any(|row| matches!(row, ProviderListRow::StartGlint))
         );
     }
 
