@@ -1862,6 +1862,7 @@ impl App {
                 | SetupEffect::SaveCustom { .. }
                 | SetupEffect::DeleteProvider { .. }
         );
+        let projection_refresh = mutation || matches!(effect, SetupEffect::RefreshProviders);
         let outcome = {
             let state = self.model_setup.as_mut().expect("setup state is active");
             apply_setup_effect(&mut self.configuration, state, effect)
@@ -1880,14 +1881,16 @@ impl App {
                 Ok(false) | Err(_) => self.set_model_setup_error(),
             },
             Some(SetupOutcome::Exit) => self.model_setup = None,
-            None if mutation
+            None if projection_refresh
                 && self
                     .model_setup
                     .as_ref()
                     .is_some_and(|state| state.error.is_none())
                 && self.refresh_model_runtime().is_err() =>
             {
-                self.set_model_setup_error();
+                if let Some(state) = self.model_setup.as_mut() {
+                    state.show_saved_refresh_failure(&self.configuration);
+                }
             }
             None => {}
         }
@@ -7620,6 +7623,48 @@ mod tests {
         send_key(&mut app, KeyAction::Submit);
         assert_eq!(repository.save_count(), 1, "provider delete only");
         assert!(app.model_setup.is_some());
+    }
+
+    #[test]
+    fn committed_setup_save_runtime_refresh_failure_retries_without_another_write() {
+        let (mut app, repository, credentials) = app_with_counting_stores();
+        repository.reset_save_count();
+        app.model_setup = Some(SetupState::builtin(
+            app.provider_catalog.clone(),
+            "deepseek",
+        ));
+        let rejected_runtime_read = credentials.get_count() + 5;
+        credentials.fail_get_call(rejected_runtime_read);
+
+        send_key(&mut app, KeyAction::Tab);
+        send_key(&mut app, KeyAction::Submit);
+
+        assert_eq!(repository.save_count(), 1);
+        let setup = app.model_setup.as_ref().expect("setup remains blocking");
+        let error = setup.error.as_deref().expect("post-commit refresh error");
+        assert!(error.contains("Changes were saved"));
+        assert!(error.contains("Refresh providers"));
+        assert!(!error.contains("injected credential read failure"));
+        let refresh_index = match &setup.screen {
+            SetupScreen::Providers(list) => list
+                .rows
+                .iter()
+                .position(|row| matches!(row, crate::setup::ProviderListRow::RefreshProviders))
+                .expect("refresh row"),
+            _ => panic!("committed save must leave a current provider list"),
+        };
+
+        for _ in 0..refresh_index {
+            send_key(&mut app, KeyAction::Down);
+        }
+        send_key(&mut app, KeyAction::Submit);
+
+        assert_eq!(repository.save_count(), 1);
+        let setup = app.model_setup.as_ref().expect("setup remains open");
+        assert!(setup.error.is_none());
+        assert!(matches!(setup.screen, SetupScreen::Providers(_)));
+        assert_eq!(app.config.llm.provider, "deepseek");
+        assert_eq!(app.config.llm.api_key, "test-key");
     }
 
     #[test]

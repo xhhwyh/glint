@@ -19,6 +19,7 @@ pub struct SetupState {
 }
 
 const DEGRADED_CREDENTIAL_REPAIR_NOTICE: &str = "The system credential store is unavailable.\nRe-enter an API key to repair this provider.\nGlint will switch to its protected auth.json file.";
+const SAVED_REFRESH_FAILED_MESSAGE: &str = "Changes were saved, but credential, provider, or runtime status could not be refreshed. Choose Refresh providers to try again.";
 
 impl SetupState {
     pub fn welcome(catalog: &ProviderCatalog) -> Self {
@@ -166,6 +167,9 @@ impl SetupState {
                             ));
                             None
                         }
+                        Some(ProviderListRow::RefreshProviders) => {
+                            Some(SetupEffect::RefreshProviders)
+                        }
                         Some(ProviderListRow::StartGlint) => Some(SetupEffect::StartGlint),
                         None => None,
                     }
@@ -251,6 +255,20 @@ impl SetupState {
         };
         Ok(())
     }
+
+    pub(crate) fn show_saved_refresh_failure(&mut self, manager: &ConfigurationManager) {
+        self.screen = SetupScreen::Providers(ProviderListState::from_committed_config(
+            &self.catalog,
+            manager,
+        ));
+        self.notice = match manager.credential_store_status() {
+            CredentialStoreStatus::Ready => None,
+            CredentialStoreStatus::KeyringUnavailable { .. } => {
+                Some(DEGRADED_CREDENTIAL_REPAIR_NOTICE.to_owned())
+            }
+        };
+        self.error = Some(SAVED_REFRESH_FAILED_MESSAGE.to_owned());
+    }
 }
 
 impl fmt::Debug for SetupState {
@@ -327,6 +345,7 @@ impl ProviderListState {
                 configured: false,
                 needs_credential: false,
                 model_count: provider.models.len(),
+                status_unavailable: false,
             })
             .collect::<Vec<_>>();
         rows.push(ProviderListRow::AddCustom);
@@ -351,6 +370,7 @@ impl ProviderListState {
                 configured: status.configured,
                 needs_credential: status.needs_credential,
                 model_count: status.model_count,
+                status_unavailable: false,
             });
         }
         for status in statuses.iter().filter(|status| !status.builtin) {
@@ -364,12 +384,49 @@ impl ProviderListState {
                 base_url: provider.base_url.clone(),
                 models: provider.models.clone(),
                 needs_credential: status.needs_credential,
+                status_unavailable: false,
             });
         }
         rows.push(ProviderListRow::AddCustom);
         if has_available_models {
             rows.push(ProviderListRow::StartGlint);
         }
+        Self { rows, focus: 0 }
+    }
+
+    fn from_committed_config(catalog: &ProviderCatalog, manager: &ConfigurationManager) -> Self {
+        let user = manager.user_config();
+        let mut rows = catalog
+            .providers()
+            .iter()
+            .map(|provider| {
+                let configured = user
+                    .configured_providers
+                    .iter()
+                    .any(|provider_id| provider_id == &provider.id);
+                ProviderListRow::Builtin {
+                    provider_id: provider.id.clone(),
+                    display_name: provider.name.clone(),
+                    configured,
+                    needs_credential: false,
+                    model_count: provider.models.len(),
+                    status_unavailable: configured,
+                }
+            })
+            .collect::<Vec<_>>();
+        rows.extend(
+            user.custom_providers
+                .iter()
+                .map(|(name, provider)| ProviderListRow::Custom {
+                    name: name.clone(),
+                    base_url: provider.base_url.clone(),
+                    models: provider.models.clone(),
+                    needs_credential: false,
+                    status_unavailable: true,
+                }),
+        );
+        rows.push(ProviderListRow::AddCustom);
+        rows.push(ProviderListRow::RefreshProviders);
         Self { rows, focus: 0 }
     }
 
@@ -397,14 +454,17 @@ pub enum ProviderListRow {
         configured: bool,
         needs_credential: bool,
         model_count: usize,
+        status_unavailable: bool,
     },
     Custom {
         name: String,
         base_url: String,
         models: Vec<String>,
         needs_credential: bool,
+        status_unavailable: bool,
     },
     AddCustom,
+    RefreshProviders,
     StartGlint,
 }
 
@@ -413,7 +473,7 @@ impl ProviderListRow {
         match self {
             Self::Builtin { provider_id, .. } => Some(provider_id),
             Self::Custom { name, .. } => Some(name),
-            Self::AddCustom | Self::StartGlint => None,
+            Self::AddCustom | Self::RefreshProviders | Self::StartGlint => None,
         }
     }
 
@@ -422,6 +482,7 @@ impl ProviderListRow {
             Self::Builtin { display_name, .. } => display_name,
             Self::Custom { name, .. } => name,
             Self::AddCustom => "Custom provider",
+            Self::RefreshProviders => "Refresh providers",
             Self::StartGlint => "Start Glint",
         }
     }
@@ -444,7 +505,7 @@ impl ProviderListRow {
             | Self::Custom {
                 needs_credential, ..
             } => *needs_credential,
-            Self::AddCustom | Self::StartGlint => false,
+            Self::AddCustom | Self::RefreshProviders | Self::StartGlint => false,
         }
     }
 
@@ -452,7 +513,7 @@ impl ProviderListRow {
         match self {
             Self::Builtin { model_count, .. } => *model_count,
             Self::Custom { models, .. } => models.len(),
-            Self::AddCustom | Self::StartGlint => 0,
+            Self::AddCustom | Self::RefreshProviders | Self::StartGlint => 0,
         }
     }
 
@@ -464,6 +525,18 @@ impl ProviderListRow {
                 ..
             } | Self::Custom { .. }
         )
+    }
+
+    pub fn status_unavailable(&self) -> bool {
+        match self {
+            Self::Builtin {
+                status_unavailable, ..
+            }
+            | Self::Custom {
+                status_unavailable, ..
+            } => *status_unavailable,
+            Self::AddCustom | Self::RefreshProviders | Self::StartGlint => false,
+        }
     }
 }
 
@@ -815,6 +888,7 @@ pub enum SetupEffect {
     DeleteProvider {
         provider_id: String,
     },
+    RefreshProviders,
     StartGlint,
     Exit,
 }
@@ -843,6 +917,7 @@ impl fmt::Debug for SetupEffect {
                 .debug_struct("DeleteProvider")
                 .field("provider_id", provider_id)
                 .finish(),
+            Self::RefreshProviders => formatter.write_str("RefreshProviders"),
             Self::StartGlint => formatter.write_str("StartGlint"),
             Self::Exit => formatter.write_str("Exit"),
         }
@@ -872,6 +947,14 @@ pub fn apply_setup_effect(
             models,
         } => manager.save_custom(&name, &base_url, api_key.as_deref(), models),
         SetupEffect::DeleteProvider { provider_id } => manager.delete_provider(&provider_id),
+        SetupEffect::RefreshProviders => {
+            if state.refresh_provider_list(manager).is_err() {
+                state.show_saved_refresh_failure(manager);
+            } else {
+                state.error = None;
+            }
+            return Ok(None);
+        }
         SetupEffect::StartGlint => {
             let providers = match manager.available_providers() {
                 Ok(providers) => providers,
@@ -899,11 +982,7 @@ pub fn apply_setup_effect(
     }
 
     if state.refresh_provider_list(manager).is_err() {
-        state.error = Some(
-            ConfigurationMutationErrorKind::CredentialUnavailable
-                .user_message()
-                .to_owned(),
-        );
+        state.show_saved_refresh_failure(manager);
         return Ok(None);
     }
 
@@ -1315,7 +1394,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_failure_after_a_successful_save_stays_redacted_and_keeps_the_form() {
+    fn refresh_failure_after_a_successful_save_shows_the_committed_provider() {
         let fixture = ManagerFixture::new();
         fixture.credentials.fail_get_after(2);
         let mut manager = fixture.manager();
@@ -1335,18 +1414,132 @@ mod tests {
         .expect("refresh failures become state errors");
 
         assert_eq!(outcome, None);
+        assert_eq!(fixture.repository.save_count(), 1);
         assert_eq!(manager.user_config().configured_providers, ["deepseek"]);
-        let form = state.builtin_form_mut().expect("form stays visible");
-        assert_eq!(form.api_key.value, "secret-value");
-        assert_eq!(form.focus, BuiltinFocus::Save);
+        let list = match &state.screen {
+            SetupScreen::Providers(list) => list,
+            _ => panic!("committed save must replace the stale form"),
+        };
+        assert!(
+            list.rows
+                .iter()
+                .any(|row| { row.provider_id() == Some("deepseek") && row.configured() })
+        );
         assert!(
             state
                 .error
                 .as_deref()
                 .expect("redacted refresh error")
-                .contains("Credential storage is unavailable")
+                .contains("Changes were saved")
         );
+        assert!(
+            state
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Refresh providers")
+        );
+        assert!(!state.error.as_deref().unwrap().contains("not saved"));
         assert!(!state.error.as_deref().unwrap().contains("secret-value"));
+    }
+
+    #[test]
+    fn committed_custom_save_refresh_failure_can_retry_without_another_write() {
+        let fixture = ManagerFixture::new();
+        fixture.credentials.fail_get_after(2);
+        let mut manager = fixture.manager();
+        let mut state = SetupState::custom_provider(test_catalog());
+
+        apply_setup_effect(
+            &mut manager,
+            &mut state,
+            SetupEffect::SaveCustom {
+                name: "Gateway".into(),
+                base_url: "https://llm.example/v1".into(),
+                api_key: Some("sentinel-secret".into()),
+                models: vec!["model".into()],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fixture.repository.save_count(), 1);
+        let list = provider_list(&state);
+        assert!(
+            list.rows
+                .iter()
+                .any(|row| { row.provider_id() == Some("Gateway") && row.status_unavailable() })
+        );
+        assert!(
+            list.rows
+                .iter()
+                .any(|row| matches!(row, ProviderListRow::RefreshProviders))
+        );
+        assert!(!state.error.as_deref().unwrap().contains("sentinel-secret"));
+
+        fixture.credentials.allow_gets();
+        select_row(&mut state, |row| {
+            matches!(row, ProviderListRow::RefreshProviders)
+        });
+        let effect = state.update(KeyAction::Submit).expect("refresh effect");
+        assert_eq!(effect, SetupEffect::RefreshProviders);
+        apply_setup_effect(&mut manager, &mut state, effect).unwrap();
+
+        assert_eq!(fixture.repository.save_count(), 1);
+        assert!(state.error.is_none());
+        assert!(
+            provider_list(&state)
+                .rows
+                .iter()
+                .any(|row| row.provider_id() == Some("Gateway") && !row.status_unavailable())
+        );
+    }
+
+    #[test]
+    fn committed_delete_refresh_failure_cannot_restore_or_delete_the_old_row_again() {
+        let fixture = ManagerFixture::new();
+        let mut manager = fixture.manager();
+        manager
+            .save_builtin("deepseek", Some("deepseek-secret"))
+            .unwrap();
+        manager
+            .save_custom(
+                "Gateway",
+                "https://llm.example/v1",
+                Some("gateway-secret"),
+                vec!["model".into()],
+            )
+            .unwrap();
+        fixture.repository.reset_save_count();
+        fixture.credentials.reset_get_count();
+        fixture.credentials.allow_gets();
+        let mut state = SetupState::provider_list(&test_catalog(), &manager).unwrap();
+        fixture.credentials.reset_get_count();
+        fixture.credentials.fail_get_after(2);
+
+        state.update(KeyAction::Delete);
+        let effect = state.update(KeyAction::Submit).expect("delete effect");
+        apply_setup_effect(&mut manager, &mut state, effect).unwrap();
+
+        assert_eq!(fixture.repository.save_count(), 1);
+        assert!(
+            !manager
+                .user_config()
+                .configured_providers
+                .iter()
+                .any(|id| id == "deepseek")
+        );
+        assert!(
+            !provider_list(&state)
+                .rows
+                .iter()
+                .any(|row| row.provider_id() == Some("deepseek") && row.configured())
+        );
+
+        assert_eq!(state.update(KeyAction::Escape), None);
+        assert!(matches!(state.screen, SetupScreen::Providers(_)));
+        assert_eq!(state.update(KeyAction::Delete), None);
+        assert!(matches!(state.screen, SetupScreen::Providers(_)));
+        assert_eq!(fixture.repository.save_count(), 1);
     }
 
     #[test]
@@ -1410,6 +1603,24 @@ mod tests {
         ProviderCatalog::embedded().expect("embedded catalog")
     }
 
+    fn provider_list(state: &SetupState) -> &ProviderListState {
+        match &state.screen {
+            SetupScreen::Providers(list) => list,
+            _ => panic!("expected provider list"),
+        }
+    }
+
+    fn select_row(state: &mut SetupState, predicate: impl Fn(&ProviderListRow) -> bool) {
+        let index = provider_list(state)
+            .rows
+            .iter()
+            .position(predicate)
+            .expect("matching provider row");
+        for _ in 0..index {
+            state.update(KeyAction::Down);
+        }
+    }
+
     struct ManagerFixture {
         credentials: MemoryCredentialStore,
         repository: MemoryUserConfigStore,
@@ -1442,6 +1653,7 @@ mod tests {
     struct MemoryUserConfigStore {
         config: Arc<Mutex<Option<UserConfig>>>,
         fail_save: Arc<Mutex<bool>>,
+        save_calls: Arc<std::sync::atomic::AtomicUsize>,
         path: PathBuf,
     }
 
@@ -1452,6 +1664,15 @@ mod tests {
 
         fn fail_saves(&self) {
             *self.fail_save.lock().expect("save lock") = true;
+        }
+
+        fn reset_save_count(&self) {
+            self.save_calls
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn save_count(&self) -> usize {
+            self.save_calls.load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
@@ -1465,6 +1686,8 @@ mod tests {
         }
 
         fn save(&self, config: &UserConfig) -> Result<()> {
+            self.save_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if *self.fail_save.lock().expect("save lock") {
                 bail!("injected save failed for secret-value")
             }
@@ -1488,6 +1711,15 @@ mod tests {
 
         fn mark_keyring_unavailable(&self) {
             *self.keyring_unavailable.lock().expect("status lock") = true;
+        }
+
+        fn allow_gets(&self) {
+            *self.fail_get_after.lock().expect("failure lock") = None;
+        }
+
+        fn reset_get_count(&self) {
+            self.get_calls
+                .store(0, std::sync::atomic::Ordering::Relaxed);
         }
     }
 

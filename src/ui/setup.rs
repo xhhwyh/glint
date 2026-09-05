@@ -141,7 +141,9 @@ fn provider_lines(
         let selected = index == list.focus;
         let text = match row {
             ProviderListRow::Builtin { .. } | ProviderListRow::Custom { .. } => {
-                let status = if row.needs_credential() {
+                let status = if row.status_unavailable() {
+                    "status unavailable"
+                } else if row.needs_credential() {
                     "needs API key"
                 } else if row.configured() {
                     "configured"
@@ -156,6 +158,7 @@ fn provider_lines(
                 )
             }
             ProviderListRow::AddCustom => "Custom provider".into(),
+            ProviderListRow::RefreshProviders => "Refresh providers".into(),
             ProviderListRow::StartGlint => "Start Glint".into(),
         };
         lines.push(action_line(&text, selected, width));
@@ -532,6 +535,18 @@ mod tests {
         assert!(rendered.contains("Enter an API key for this provider."));
     }
 
+    #[test]
+    fn committed_refresh_failure_renders_unknown_status_and_reachable_retry() {
+        let state = committed_refresh_failure_state();
+
+        let rendered = render_setup(&state, 100, 30);
+
+        assert!(rendered.contains("Changes were saved"));
+        assert!(rendered.contains("status unavailable"));
+        assert!(rendered.contains("Refresh providers"));
+        assert!(!rendered.contains("sentinel-secret"));
+    }
+
     fn test_catalog() -> ProviderCatalog {
         ProviderCatalog::embedded().unwrap()
     }
@@ -588,6 +603,30 @@ mod tests {
             state.update(crate::event::KeyAction::Down);
         }
         state.update(crate::event::KeyAction::Submit);
+        std::fs::remove_dir_all(home).ok();
+        state
+    }
+
+    fn committed_refresh_failure_state() -> SetupState {
+        let home = std::env::temp_dir().join(format!(
+            "glint-setup-render-refresh-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = GlintPaths::from_home(&home);
+        let catalog = test_catalog();
+        let mut manager = ConfigurationManager::new(
+            paths.clone(),
+            PathBuf::from("/workspace"),
+            catalog.clone(),
+            Box::new(UserConfigStore::new(paths.clone())),
+            Box::new(FileCredentialStore::new(paths.auth())),
+        )
+        .unwrap();
+        manager
+            .save_builtin("deepseek", Some("sentinel-secret"))
+            .unwrap();
+        let mut state = SetupState::welcome(&catalog);
+        state.show_saved_refresh_failure(&manager);
         std::fs::remove_dir_all(home).ok();
         state
     }
