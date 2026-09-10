@@ -6,7 +6,7 @@ use crate::config::LlmConfig;
 
 use super::{
     AgentEvent, TokenUsage,
-    openai::OpenAiProvider,
+    provider::ConfiguredProvider,
     provider::{FinishReason, ModelMessage, ModelProvider, ModelRequest, ModelResponse},
 };
 
@@ -39,7 +39,7 @@ struct CompactRunResult {
 pub fn spawn_compact_loop(input: CompactRunInput, tx: Sender<AgentEvent>) {
     thread::spawn(move || {
         tx.send(AgentEvent::CompactStarted).ok();
-        let mut provider = OpenAiProvider::new(input.llm.clone());
+        let mut provider = ConfiguredProvider::new(input.llm.clone());
         match run_compact(input, &mut provider) {
             Ok(result) => {
                 tx.send(AgentEvent::CompactFinished {
@@ -236,6 +236,7 @@ mod tests {
     fn input() -> CompactRunInput {
         CompactRunInput {
             llm: LlmConfig {
+                reasoning_effort: None,
                 provider: "test".to_owned(),
                 base_url: "http://localhost".to_owned(),
                 model: "test-model".to_owned(),
@@ -254,6 +255,7 @@ mod tests {
 
     fn response(text: &str) -> ModelResponse {
         ModelResponse {
+            reasoning: None,
             assistant_text: Some(text.to_owned()),
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
@@ -307,6 +309,7 @@ mod tests {
     #[test]
     fn length_finish_reason_is_rejected() {
         let response = ModelResponse {
+            reasoning: None,
             assistant_text: Some("<summary>partial</summary>".to_owned()),
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Length,

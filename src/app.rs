@@ -96,6 +96,8 @@ pub struct App {
     pub configuration: ConfigurationManager,
     pub(crate) provider_catalog: ProviderCatalog,
     pub current_dir: String,
+    pub recent_sessions: Vec<TranscriptSessionSummary>,
+    pub recent_sessions_error: bool,
     pub agent_activity: Option<String>,
     pub run_notice: Option<String>,
     pub approval: Option<ApprovalPrompt>,
@@ -156,6 +158,8 @@ pub struct ModelPicker {
     pub stage: ModelPickerStage,
     pub selected_provider: usize,
     pub selected_model: usize,
+    pub selected_effort: usize,
+    pub reasoning_options: crate::configuration::ReasoningOptions,
     pub providers: Vec<AvailableProvider>,
     pub error: Option<String>,
 }
@@ -170,6 +174,7 @@ pub enum ModelPickerProviderRow {
 pub enum ModelPickerStage {
     Provider,
     Model,
+    Reasoning,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -392,6 +397,7 @@ pub struct PluginOperationView {
 }
 
 enum PluginUiMutation {
+    Refresh,
     AddMarketplace(String),
     Install(String),
     Uninstall(String),
@@ -583,6 +589,8 @@ impl App {
             configuration,
             provider_catalog,
             current_dir,
+            recent_sessions: Vec::new(),
+            recent_sessions_error: false,
             agent_activity: None,
             run_notice: None,
             approval: None,
@@ -601,6 +609,7 @@ impl App {
             #[cfg(test)]
             execution_output_projection_count: Cell::new(0),
         };
+        app.refresh_recent_sessions();
         app.preload_all_execution_previews();
         Ok(app)
     }
@@ -654,6 +663,7 @@ impl App {
             config: Config {
                 config_path: PathBuf::from("config.yaml"),
                 llm: LlmConfig {
+                    reasoning_effort: None,
                     provider: "test".to_owned(),
                     base_url: "http://localhost".to_owned(),
                     model: "test-model".to_owned(),
@@ -685,6 +695,8 @@ impl App {
             configuration,
             provider_catalog,
             current_dir: "/workspace".to_owned(),
+            recent_sessions: Vec::new(),
+            recent_sessions_error: false,
             agent_activity: None,
             run_notice: None,
             approval: None,
@@ -710,6 +722,17 @@ impl App {
     pub fn update(&mut self, event: AppEvent) {
         match event {
             AppEvent::Key(key) => self.update_key(key),
+            AppEvent::ExtensionMouse(ExtensionMouseAction::Setup(action))
+                if self.model_setup.is_some() =>
+            {
+                let effect = self
+                    .model_setup
+                    .as_mut()
+                    .and_then(|state| state.update_mouse(action));
+                if let Some(effect) = effect {
+                    self.apply_model_setup_effect(effect);
+                }
+            }
             AppEvent::Mouse(_) | AppEvent::ExtensionMouse(_) if self.model_setup.is_some() => {}
             AppEvent::Mouse(mouse) => self.update_mouse(mouse),
             AppEvent::ExtensionMouse(mouse) => self.update_extension_mouse(mouse),
@@ -718,6 +741,16 @@ impl App {
     }
 
     pub fn update_agent_events(&mut self) {
+        let configuration_changed = self
+            .model_setup
+            .as_mut()
+            .is_some_and(|state| state.poll_chatgpt_login(&mut self.configuration));
+        if configuration_changed
+            && self.refresh_model_runtime().is_err()
+            && let Some(state) = self.model_setup.as_mut()
+        {
+            state.show_saved_refresh_failure(&self.configuration);
+        }
         while let Some(event) = self.runtime.try_recv_agent_event() {
             self.update(AppEvent::Agent(event));
         }
@@ -1593,16 +1626,7 @@ impl App {
             SlashCommandKind::Mcp => self.open_mcp_view(),
             SlashCommandKind::Plugins => self.open_plugins_view(),
             SlashCommandKind::PluginPrompt(index) => self.run_plugin_prompt(index),
-            SlashCommandKind::ReloadPlugins => {
-                let glint_root = self.plugin_root();
-                let result = PluginManager::refresh(
-                    &self.config.plugins,
-                    self.config.base_mcp.clone(),
-                    self.config.base_lsp.clone(),
-                    &glint_root,
-                );
-                self.apply_plugin_mutation("/reload-plugins", result);
-            }
+            SlashCommandKind::ReloadPlugins => self.start_plugin_refresh(),
         }
     }
 
@@ -1659,6 +1683,8 @@ impl App {
             stage: ModelPickerStage::Provider,
             selected_provider,
             selected_model,
+            selected_effort: 0,
+            reasoning_options: Default::default(),
             providers,
             error,
         });
@@ -1696,6 +1722,8 @@ impl App {
             KeyAction::Backspace => self.back_out_of_model_picker(),
             KeyAction::Up => self.move_model_picker(-1),
             KeyAction::Down => self.move_model_picker(1),
+            KeyAction::Left => self.move_model_effort(-1),
+            KeyAction::Right => self.move_model_effort(1),
             _ => {}
         }
     }
@@ -1738,8 +1766,10 @@ impl App {
                     picker.selected_model = selected_model;
                     picker.error = None;
                 }
+                self.refresh_model_effort();
             }
             ModelPickerStage::Model => self.switch_selected_model(),
+            ModelPickerStage::Reasoning => self.switch_selected_model(),
         }
     }
 
@@ -1780,7 +1810,19 @@ impl App {
             return;
         };
 
-        let selected = match self.configuration.select_model(&provider_name, &model_name) {
+        let effort = self.model_picker.as_ref().and_then(|picker| {
+            picker
+                .selected_effort
+                .checked_sub(1)
+                .and_then(|index| picker.reasoning_options.levels.get(index))
+                .map(|level| level.effort.clone())
+        });
+        let selection = self.configuration.select_model_with_reasoning(
+            &provider_name,
+            &model_name,
+            effort.as_deref(),
+        );
+        let selected = match selection {
             Ok(selected) => selected,
             Err(_) => {
                 if let Some(picker) = self.model_picker.as_mut() {
@@ -1799,7 +1841,22 @@ impl App {
             command
         };
         self.messages.push(Message::user(command.clone()));
-        let result = format!("Switch model to `{model_name}` provided by `{provider_name}`");
+        let mut result = format!("Switch model to `{model_name}` provided by `{provider_name}`");
+        if !self
+            .configuration
+            .model_reasoning_options(&provider_name, &model_name)
+            .levels
+            .is_empty()
+        {
+            result.push_str(&format!(
+                " · reasoning `{}`",
+                self.config
+                    .llm
+                    .reasoning_effort
+                    .as_deref()
+                    .unwrap_or("default")
+            ));
+        }
         self.record_local_exchange(command, result.clone());
         self.messages.push(Message::assistant(result));
         self.scroll = 0;
@@ -1811,7 +1868,9 @@ impl App {
             return;
         };
 
-        if picker.stage == ModelPickerStage::Model {
+        if picker.stage == ModelPickerStage::Reasoning {
+            picker.stage = ModelPickerStage::Model;
+        } else if picker.stage == ModelPickerStage::Model {
             picker.stage = ModelPickerStage::Provider;
         } else {
             self.model_picker = None;
@@ -1841,7 +1900,65 @@ impl App {
                     .unwrap_or(0);
                 picker.selected_model = move_index(picker.selected_model, direction, model_count);
             }
+            ModelPickerStage::Reasoning => return,
         }
+        self.refresh_model_effort();
+    }
+
+    fn refresh_model_effort(&mut self) {
+        let Some(picker) = self.model_picker.as_mut() else {
+            return;
+        };
+        let Some(provider) = picker.providers.get(picker.selected_provider) else {
+            return;
+        };
+        let Some(model) = provider.models.get(picker.selected_model) else {
+            return;
+        };
+        picker.reasoning_options = self
+            .configuration
+            .model_reasoning_options(&provider.id, &model.name);
+        let saved = self
+            .configuration
+            .saved_model_reasoning_effort(&provider.id, &model.name);
+        picker.selected_effort = picker
+            .reasoning_options
+            .levels
+            .iter()
+            .position(|level| Some(level.effort.as_str()) == saved.as_deref())
+            .map_or(0, |index| index + 1);
+        picker.error = None;
+    }
+
+    fn move_model_effort(&mut self, direction: isize) {
+        let Some(picker) = self.model_picker.as_mut() else {
+            return;
+        };
+        if picker.reasoning_options.levels.is_empty() {
+            return;
+        }
+        if picker.stage == ModelPickerStage::Model && direction > 0 {
+            picker.stage = ModelPickerStage::Reasoning;
+            return;
+        }
+        if picker.stage != ModelPickerStage::Reasoning {
+            return;
+        }
+        let index = picker.selected_effort.checked_sub(1).unwrap_or_else(|| {
+            picker
+                .reasoning_options
+                .levels
+                .iter()
+                .position(|level| {
+                    Some(&level.effort) == picker.reasoning_options.default_effort.as_ref()
+                })
+                .unwrap_or(0)
+        });
+        picker.selected_effort = index
+            .saturating_add_signed(direction)
+            .min(picker.reasoning_options.levels.len() - 1)
+            + 1;
+        picker.error = None;
     }
 
     fn update_model_setup_key(&mut self, action: KeyAction) {
@@ -1856,6 +1973,10 @@ impl App {
         let Some(effect) = effect else {
             return;
         };
+        self.apply_model_setup_effect(effect);
+    }
+
+    fn apply_model_setup_effect(&mut self, effect: SetupEffect) {
         let mutation = matches!(
             effect,
             SetupEffect::SaveBuiltin { .. }
@@ -2794,6 +2915,18 @@ impl App {
         self.clamp_plugins_view_selection();
     }
 
+    fn start_plugin_refresh(&mut self) {
+        if self.pending_plugin_operation.is_some() {
+            return;
+        }
+        self.open_plugins_view();
+        self.start_plugin_ui_operation(
+            "Refreshing plugins".to_owned(),
+            "Marketplaces and installed plugins".to_owned(),
+            PluginUiMutation::Refresh,
+        );
+    }
+
     fn start_plugin_ui_operation(
         &mut self,
         title: String,
@@ -2826,6 +2959,9 @@ impl App {
                     .ok();
             });
             let result = PluginManager::with_progress(reporter, || match mutation {
+                PluginUiMutation::Refresh => {
+                    PluginManager::refresh(&plugins, mcp, lsp, &glint_root)
+                }
                 PluginUiMutation::AddMarketplace(source) => {
                     sender
                         .send(PluginOperationEvent::Progress(
@@ -2944,9 +3080,25 @@ impl App {
         }
     }
 
+    fn refresh_recent_sessions(&mut self) {
+        match self.runtime.recent_sessions() {
+            Ok(sessions) => {
+                self.recent_sessions = sessions;
+                self.recent_sessions_error = false;
+            }
+            Err(_) => {
+                self.recent_sessions.clear();
+                self.recent_sessions_error = true;
+            }
+        }
+    }
+
     fn apply_loaded_transcript(&mut self, loaded: LoadedTranscript) {
         self.reset_execution_presentation();
         self.messages = loaded.messages;
+        if self.messages.is_empty() {
+            self.refresh_recent_sessions();
+        }
         self.usage = loaded.usage;
         self.subagent_transcripts = subagent_transcripts_by_task_id(loaded.subagent_transcripts);
         self.preload_all_execution_previews();
@@ -3045,6 +3197,7 @@ impl App {
 
     fn update_extension_mouse(&mut self, mouse: ExtensionMouseAction) {
         match mouse {
+            ExtensionMouseAction::Setup(_) => {}
             ExtensionMouseAction::Resume(action) => self.update_resume_mouse(action),
             ExtensionMouseAction::Mcp(action) => self.update_mcp_mouse(action),
             ExtensionMouseAction::Plugins(action) => self.update_plugins_mouse(action),
@@ -3515,32 +3668,16 @@ impl App {
     }
 
     fn run_plugin_manager_command(&mut self, prompt: &str) -> bool {
-        if prompt == "/reload-plugins" || prompt == "/plugins reload" {
-            let glint_root = self.plugin_root();
-            let result = PluginManager::refresh(
-                &self.config.plugins,
-                self.config.base_mcp.clone(),
-                self.config.base_lsp.clone(),
-                &glint_root,
-            );
-            self.apply_plugin_mutation(prompt, result);
+        if prompt == "/reload-plugins"
+            || prompt == "/plugins reload"
+            || prompt == "/plugins marketplace update"
+            || prompt.starts_with("/plugins marketplace update ")
+        {
+            self.start_plugin_refresh();
             return true;
         }
         if prompt == "/plugins marketplace list" {
             self.show_local_command(prompt, self.config.extensions.plugin_status());
-            return true;
-        }
-        if prompt == "/plugins marketplace update"
-            || prompt.starts_with("/plugins marketplace update ")
-        {
-            let glint_root = self.plugin_root();
-            let result = PluginManager::refresh(
-                &self.config.plugins,
-                self.config.base_mcp.clone(),
-                self.config.base_lsp.clone(),
-                &glint_root,
-            );
-            self.apply_plugin_mutation(prompt, result);
             return true;
         }
         let operation = [
@@ -3750,6 +3887,7 @@ impl App {
                 usage,
                 finish_reason,
                 tool_calls,
+                reasoning,
             } => {
                 if let Some(usage) = usage {
                     self.usage = self.usage.record(usage);
@@ -3760,6 +3898,7 @@ impl App {
                     usage,
                     finish_reason,
                     None,
+                    reasoning,
                 );
             }
             AgentEvent::ToolStarted {
@@ -3845,6 +3984,7 @@ impl App {
                     None,
                     FinishReason::Other("error".to_owned()),
                     Some(error.clone()),
+                    None,
                 );
                 self.runtime.abort_turn(error);
                 self.status = AgentStatus::Idle;
@@ -3922,8 +4062,10 @@ impl App {
         usage: Option<TokenUsage>,
         finish_reason: FinishReason,
         error: Option<String>,
+        reasoning: Option<crate::agent::provider::ProviderReasoning>,
     ) {
         self.runtime.record_assistant(AssistantRecord {
+            reasoning,
             content,
             provider: self.config.llm.provider.clone(),
             model: self.config.llm.model.clone(),
@@ -4377,6 +4519,34 @@ mod tests {
         App::test_empty()
     }
 
+    #[test]
+    fn assistant_turn_records_private_reasoning_without_displaying_it() {
+        let mut app = app();
+        let reasoning = crate::agent::provider::ProviderReasoning {
+            provider: app.config.llm.provider.clone(),
+            model: app.config.llm.model.clone(),
+            data: crate::agent::provider::ReasoningData {
+                reasoning_content: Some("private thought".into()),
+                ..Default::default()
+            },
+        };
+        app.update_agent(AgentEvent::Started);
+        app.update_agent(AgentEvent::AssistantDelta("Public answer".into()));
+        app.update_agent(AgentEvent::AssistantTurn {
+            usage: None,
+            finish_reason: FinishReason::Stop,
+            tool_calls: Vec::new(),
+            reasoning: Some(reasoning.clone()),
+        });
+        let history = app.runtime.model_history();
+        assert_eq!(history.last().unwrap().reasoning.as_ref(), Some(&reasoning));
+        assert_eq!(
+            history.last().unwrap().content.as_deref(),
+            Some("Public answer")
+        );
+        assert_eq!(app.messages.last().unwrap().content, "Public answer");
+    }
+
     #[derive(Clone)]
     struct CountingUserConfigStore {
         config: Arc<Mutex<Option<UserConfig>>>,
@@ -4559,6 +4729,11 @@ mod tests {
     }
 
     fn choose_model(app: &mut App, provider_id: &str, model_name: &str) {
+        highlight_model(app, provider_id, model_name);
+        send_key(app, KeyAction::Submit);
+    }
+
+    fn highlight_model(app: &mut App, provider_id: &str, model_name: &str) {
         open_model_picker_through_update(app);
         let providers = app
             .configuration
@@ -4568,9 +4743,26 @@ mod tests {
             .iter()
             .position(|provider| provider.id == provider_id)
             .expect("provider row");
-        while app.model_picker.as_ref().unwrap().selected_provider != provider_index {
-            send_key(app, KeyAction::Down);
+        for _ in 0..=providers.len() {
+            if app.model_picker.as_ref().unwrap().selected_provider == provider_index {
+                break;
+            }
+            let current = app.model_picker.as_ref().unwrap().selected_provider;
+            send_key(
+                app,
+                if current < provider_index {
+                    KeyAction::Down
+                } else {
+                    KeyAction::Up
+                },
+            );
         }
+        assert_eq!(
+            app.model_picker.as_ref().unwrap().selected_provider,
+            provider_index,
+            "{:?}",
+            app.model_picker
+        );
         send_key(app, KeyAction::Submit);
 
         let model_index = providers[provider_index]
@@ -4578,10 +4770,21 @@ mod tests {
             .iter()
             .position(|model| model.name == model_name)
             .expect("model row");
-        while app.model_picker.as_ref().unwrap().selected_model != model_index {
-            send_key(app, KeyAction::Down);
+        for _ in 0..providers[provider_index].models.len() {
+            if app.model_picker.as_ref().unwrap().selected_model == model_index {
+                return;
+            }
+            let current = app.model_picker.as_ref().unwrap().selected_model;
+            send_key(
+                app,
+                if current < model_index {
+                    KeyAction::Down
+                } else {
+                    KeyAction::Up
+                },
+            );
         }
-        send_key(app, KeyAction::Submit);
+        panic!("model navigation failed: {:?}", app.model_picker);
     }
 
     fn delete_provider_through_setup(app: &mut App, provider_id: &str) {
@@ -6079,6 +6282,7 @@ mod tests {
         app.runtime = SessionRuntime::test_empty(path.clone(), "/workspace".to_owned());
         let request = subagent_request();
         app.runtime.record_assistant(AssistantRecord {
+            reasoning: None,
             content: "Delegating parser inspection.".to_owned(),
             provider: "test".to_owned(),
             model: "test-model".to_owned(),
@@ -6097,6 +6301,7 @@ mod tests {
             false,
         );
         app.runtime.record_assistant(AssistantRecord {
+            reasoning: None,
             content: String::new(),
             provider: "test".to_owned(),
             model: "test-model".to_owned(),
@@ -6328,6 +6533,17 @@ mod tests {
         };
 
         assert!(app.run_plugin_manager_command("/reload-plugins"));
+        assert!(app.pending_plugin_operation.is_some());
+        assert!(matches!(
+            app.plugins_view.as_ref().map(|view| &view.screen),
+            Some(PluginsScreen::Operation(_))
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.pending_plugin_operation.is_some() && std::time::Instant::now() < deadline {
+            app.drain_plugin_operation();
+            std::thread::yield_now();
+        }
+        assert!(app.pending_plugin_operation.is_none());
 
         assert_eq!(app.config.extensions.plugins[0].name, "rooted");
         assert!(
@@ -7450,6 +7666,136 @@ mod tests {
             app.model_setup.as_ref().map(|setup| &setup.screen),
             Some(SetupScreen::Providers(_))
         ));
+    }
+
+    #[test]
+    fn chatgpt_reasoning_picker_saves_supported_choice_and_restores_it() {
+        let mut app = app_with_configured_providers(["deepseek"]);
+        app.configuration
+            .save_chatgpt(vec!["reason-model".into()], None)
+            .unwrap();
+        std::fs::write(app.configuration.paths().root().join("chatgpt-models.json"),
+            r#"{"models":[{"slug":"reason-model","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low","description":"Faster"},{"effort":"high","description":"Deeper"}]}]}"#).unwrap();
+        highlight_model(&mut app, "chatgpt", "reason-model");
+        send_key(&mut app, KeyAction::Right);
+        assert_eq!(
+            app.model_picker.as_ref().unwrap().stage,
+            ModelPickerStage::Reasoning
+        );
+        assert_eq!(
+            app.model_picker
+                .as_ref()
+                .unwrap()
+                .reasoning_options
+                .levels
+                .len(),
+            2
+        );
+        send_key(&mut app, KeyAction::Right);
+        send_key(&mut app, KeyAction::Right);
+        send_key(&mut app, KeyAction::Submit);
+        assert!(app.model_picker.is_none());
+        assert_eq!(app.config.llm.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            app.configuration
+                .build_model_runtime()
+                .unwrap()
+                .llm
+                .reasoning_effort
+                .as_deref(),
+            Some("high")
+        );
+        highlight_model(&mut app, "chatgpt", "reason-model");
+        send_key(&mut app, KeyAction::Right);
+        assert_eq!(app.model_picker.as_ref().unwrap().selected_effort, 2);
+        send_key(&mut app, KeyAction::Left);
+        send_key(&mut app, KeyAction::Left);
+        send_key(&mut app, KeyAction::Submit);
+        assert_eq!(app.config.llm.reasoning_effort.as_deref(), Some("low"));
+        assert!(
+            app.configuration
+                .saved_reasoning_effort("reason-model")
+                .as_deref()
+                == Some("low")
+        );
+    }
+
+    #[test]
+    fn builtin_inline_effort_uses_model_capabilities_and_saves_on_enter() {
+        let mut app = app_with_configured_providers(["deepseek"]);
+        let before = app.configuration.user_config().clone();
+        highlight_model(&mut app, "deepseek", "deepseek-v4-pro");
+        assert_eq!(
+            app.model_picker
+                .as_ref()
+                .unwrap()
+                .reasoning_options
+                .levels
+                .len(),
+            3
+        );
+        send_key(&mut app, KeyAction::Right);
+        send_key(&mut app, KeyAction::Right);
+        assert_eq!(app.configuration.user_config(), &before);
+        send_key(&mut app, KeyAction::Submit);
+        assert!(app.model_picker.is_none());
+        assert_eq!(app.config.llm.reasoning_effort.as_deref(), Some("max"));
+        highlight_model(&mut app, "deepseek", "deepseek-v4-pro");
+        assert_eq!(app.model_picker.as_ref().unwrap().selected_effort, 3);
+        send_key(&mut app, KeyAction::Up);
+        assert_eq!(app.model_picker.as_ref().unwrap().selected_effort, 0);
+    }
+
+    #[test]
+    fn chatgpt_inline_effort_tracks_model_and_enter_keeps_default() {
+        let mut app = app_with_configured_providers(["deepseek"]);
+        app.configuration
+            .save_chatgpt(vec!["first".into(), "second".into()], None)
+            .unwrap();
+        std::fs::write(app.configuration.paths().root().join("chatgpt-models.json"),
+            r#"{"models":[{"slug":"first","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}]},{"slug":"second","default_reasoning_level":"high","supported_reasoning_levels":[{"effort":"high"},{"effort":"xhigh"}]}]}"#).unwrap();
+        highlight_model(&mut app, "chatgpt", "first");
+        send_key(&mut app, KeyAction::Down);
+        let picker = app.model_picker.as_ref().unwrap();
+        assert_eq!(picker.reasoning_options.levels[0].effort, "high");
+        send_key(&mut app, KeyAction::Right);
+        send_key(&mut app, KeyAction::Down);
+        assert_eq!(app.model_picker.as_ref().unwrap().selected_model, 1);
+        send_key(&mut app, KeyAction::Right);
+        send_key(&mut app, KeyAction::Submit);
+        assert_eq!(app.config.llm.model, "second");
+        assert_eq!(app.config.llm.reasoning_effort.as_deref(), Some("xhigh"));
+        highlight_model(&mut app, "chatgpt", "first");
+        send_key(&mut app, KeyAction::Submit);
+        assert!(app.model_picker.is_none());
+        assert!(app.config.llm.reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn chatgpt_reasoning_picker_defers_save_and_can_go_back() {
+        let mut app = app_with_configured_providers(["deepseek"]);
+        app.configuration
+            .save_chatgpt(vec!["reason-model".into()], None)
+            .unwrap();
+        std::fs::write(app.configuration.paths().root().join("chatgpt-models.json"),
+            r#"{"models":[{"slug":"reason-model","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}]}]}"#).unwrap();
+        let before = app.configuration.user_config().clone();
+        highlight_model(&mut app, "chatgpt", "reason-model");
+        send_key(&mut app, KeyAction::Right);
+        assert!(
+            app.model_picker.is_some(),
+            "ChatGPT needs a reasoning selection before saving"
+        );
+        assert_eq!(app.configuration.user_config(), &before);
+        send_key(&mut app, KeyAction::Backspace);
+        assert_eq!(
+            app.model_picker.as_ref().unwrap().stage,
+            ModelPickerStage::Model
+        );
+        send_key(&mut app, KeyAction::Backspace);
+        send_key(&mut app, KeyAction::Backspace);
+        assert!(app.model_picker.is_none());
+        assert_eq!(app.configuration.user_config(), &before);
     }
 
     #[test]

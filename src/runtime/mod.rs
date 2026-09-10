@@ -139,6 +139,7 @@ pub struct CompactFailed {
 }
 
 pub struct AssistantRecord {
+    pub reasoning: Option<crate::agent::provider::ProviderReasoning>,
     pub content: String,
     pub provider: String,
     pub model: String,
@@ -347,6 +348,10 @@ impl SessionRuntime {
         TranscriptStore::sessions(&self.sessions_root, &self.transcript_cwd)
     }
 
+    pub fn recent_sessions(&self) -> Result<Vec<TranscriptSessionSummary>> {
+        TranscriptStore::recent_sessions(&self.sessions_root, &self.transcript_cwd)
+    }
+
     pub fn workspace_usage_stats(&self) -> Result<WorkspaceUsageStats> {
         TranscriptStore::workspace_usage_stats(&self.sessions_root, &self.transcript_cwd)
     }
@@ -374,6 +379,7 @@ impl SessionRuntime {
 
     pub fn archive_current_session(&mut self) -> Result<LoadedTranscript> {
         let transcript = TranscriptStore::create_new(&self.sessions_root, &self.transcript_cwd)?;
+        self.cancel_active_agent();
         self.transcript.archive_current(&self.sessions_root)?;
         self.transcript = transcript;
         self.reset_session_state();
@@ -382,6 +388,7 @@ impl SessionRuntime {
 
     pub fn delete_current_session(&mut self) -> Result<LoadedTranscript> {
         let transcript = TranscriptStore::create_new(&self.sessions_root, &self.transcript_cwd)?;
+        self.cancel_active_agent();
         self.transcript.delete_current()?;
         self.transcript = transcript;
         self.reset_session_state();
@@ -714,6 +721,7 @@ impl SessionRuntime {
     ) {
         self.transcript.append_user(user).ok();
         self.record_assistant(AssistantRecord {
+            reasoning: None,
             content: assistant,
             provider,
             model,
@@ -727,6 +735,7 @@ impl SessionRuntime {
     pub fn record_assistant(&mut self, record: AssistantRecord) {
         self.transcript
             .append_assistant(AssistantTranscript {
+                reasoning: record.reasoning,
                 content: record.content,
                 provider: record.provider,
                 model: record.model,
@@ -1002,9 +1011,16 @@ impl SessionRuntime {
     }
 
     fn reset_agent_channel(&mut self) {
+        self.cancel_active_agent();
         let (agent_tx, agent_events) = mpsc::channel();
         self.agent_tx = agent_tx;
         self.agent_events = agent_events;
+    }
+
+    fn cancel_active_agent(&mut self) {
+        if let Some(control) = self.agent_control_tx.take() {
+            control.send(AgentControl::Cancel).ok();
+        }
     }
 
     fn reset_session_state(&mut self) {
@@ -1086,6 +1102,7 @@ fn subagent_activity(event: &AgentEvent) -> Option<(String, bool)> {
 
 impl Drop for SessionRuntime {
     fn drop(&mut self) {
+        self.cancel_active_agent();
         for run in &self.running_subagents {
             run.control.send(AgentControl::Cancel).ok();
             run.steering.close();
@@ -1117,6 +1134,51 @@ mod tests {
     use super::*;
     use crate::progress::TodoUpdate;
     use crate::tasks::{SubagentBackend, TaskRequest};
+
+    #[test]
+    fn chatgpt_manual_compaction_uses_glint_history() {
+        let mut runtime = runtime();
+        let llm = LlmConfig {
+            reasoning_effort: None,
+            provider: crate::config::CHATGPT_PROVIDER_ID.into(),
+            base_url: String::new(),
+            model: "model".into(),
+            providers: Vec::new(),
+            temperature: 0.7,
+            max_tokens: 8196,
+            context_window: None,
+            api_key: String::new(),
+            default_context_window: None,
+            prompt_cache: Default::default(),
+        };
+        assert!(matches!(
+            runtime.start_manual_compact(llm, Some(100_000)),
+            RuntimeEvent::NoMessagesToCompact
+        ));
+        assert!(runtime.agent_control_tx.is_none());
+        assert!(runtime.agent_events.try_recv().is_err());
+    }
+
+    #[test]
+    fn dropping_runtime_cancels_its_agent() {
+        let mut runtime = runtime();
+        let (control, receiver) = mpsc::channel();
+        runtime.agent_control_tx = Some(control);
+        drop(runtime);
+        assert!(matches!(receiver.try_recv(), Ok(AgentControl::Cancel)));
+    }
+
+    #[test]
+    fn clear_context_cancels_agent_and_clears_model_history() {
+        let mut runtime = runtime();
+        runtime.transcript.append_user("previous".into()).unwrap();
+        let (control, receiver) = mpsc::channel();
+        runtime.agent_control_tx = Some(control);
+        runtime.clear_context().unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(AgentControl::Cancel)));
+        assert!(runtime.transcript.model_history().is_empty());
+        runtime.transcript.delete_current().unwrap();
+    }
 
     #[test]
     fn new_session_after_legacy_resume_uses_explicit_sessions_root() {

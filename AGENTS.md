@@ -74,6 +74,8 @@ lsp:
 
 The optional `lsp.servers` block configures stdio language servers by file extension. If `lsp.servers` is omitted, Glint registers the Rust default shown above. If present, its configured servers replace that default. The `mcp` and `plugins` blocks use the schemas in `EXTENSIONS.md`.
 
+ChatGPT subscription access uses reserved provider ID `chatgpt` with native OAuth and a Responses ModelProvider. Optional `chatgpt.models` stores discovered model IDs; `chatgpt.reasoning_efforts` stores explicit per-model choices and omits defaults. Reasoning options/defaults come from cached model metadata (including legacy cache fallback), not a fixed list. Validate before saving; unsupported saved choices fall back to the model default. ChatGPT requests use `reasoning.effort` only when explicit, and other providers never inherit it. The `/model` ChatGPT flow confirms model and effort together; `llm.provider: chatgpt` selects it. It must never request an API key or fall through to Chat Completions. Native authentication lives in protected `~/.glint/chatgpt-auth.json`; legacy isolated `~/.glint/codex/auth.json` can be imported only when native credentials are absent, preserving the original. Startup uses cached metadata without network authentication. Glint owns tools, approvals, context, compaction and sessions for every provider. Do not launch Codex App Server or create Codex thread references. Legacy synthetic Codex tool cards remain UI-only; native ChatGPT tool calls/results must remain in model history.
+
 Core state lives below `~/.glint`: configuration, optional `auth.json`, default plugin cache and state, MCP OAuth state, and sessions. `plugins.cache_dir` can instead place plugin cache and install state at an explicit path, including an absolute one. The startup working directory remains the workspace. It is the root for coding tools and LSP, the default and relative cwd for MCP processes, MCP's advertised root, and hook process cwd. Plugins resolve relative sources from `~/.glint`, while hooks retain `GLINT_PLUGIN_ROOT` and `CLAUDE_PLUGIN_ROOT` for plugin-owned resources.
 
 ## Architecture
@@ -92,6 +94,8 @@ agent thread -> AgentEvent -> AppEvent::Agent -> App::update -> ui::render
 - `src/input.rs`: editable multiline buffer and cursor behavior.
 - `src/message.rs`: chat message model and roles.
 - `src/agent/`: agent event/status types, compaction entry points, model provider types, and OpenAI-compatible HTTP integration.
+- `src/chatgpt/`: native ChatGPT OAuth, protected token persistence, refresh and model discovery.
+- `src/agent/chatgpt.rs`: subscription Responses transport and model-message/tool adaptation.
 - `src/query/`: model-turn orchestration, tool-call batching, approval flow, and `spawn_agent_loop`.
 - `src/services/`: cross-cutting agent services such as tool-result budgeting.
 - `src/services/mcp/`: persistent MCP client runtime, transports, OAuth, elicitation, dynamic tools, resources, and prompts.
@@ -134,3 +138,7 @@ Common types: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `perf`, `ci`. 
 ## Extension Notes
 
 Use the agent event model for cancellation, streaming deltas, conversation context, tool requests, retries, and richer failures. Input and agent events update `App`; `ui::render` only displays `App`.
+
+## Reasoning Effort
+
+`src/reasoning.rs` records verified effort capabilities for exact built-in provider/model pairs; sources and exceptions are in `REASONING.md`. API-provider preferences live in optional `reasoning_efforts: {provider: {model: effort}}`; ChatGPT subscription preferences retain their existing `chatgpt.reasoning_efforts` schema. UI and HTTP validation must use the same capability definitions. Never infer a custom gateway capability solely from its model name.

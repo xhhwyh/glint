@@ -3,6 +3,8 @@ use std::fmt;
 use anyhow::Result;
 
 use crate::{
+    chatgpt::{LoginEvent, LoginHandle},
+    config::{CHATGPT_PROVIDER_ID, CHATGPT_PROVIDER_NAME},
     configuration::{
         ConfigurationManager, ConfigurationMutationErrorKind, ProviderStatus,
         compare_custom_provider_names,
@@ -19,6 +21,7 @@ pub struct SetupState {
     pub error: Option<String>,
     pub notice: Option<String>,
     catalog: ProviderCatalog,
+    pub mouse: super::SetupMouseState,
 }
 
 const DEGRADED_CREDENTIAL_REPAIR_NOTICE: &str = "The system credential store is unavailable.\nRe-enter an API key to repair this provider.\nGlint will switch to its protected auth.json file.";
@@ -31,6 +34,7 @@ impl SetupState {
             error: None,
             notice: None,
             catalog: catalog.clone(),
+            mouse: Default::default(),
         }
     }
 
@@ -50,6 +54,7 @@ impl SetupState {
             error: None,
             notice: None,
             catalog,
+            mouse: Default::default(),
         }
     }
 
@@ -63,6 +68,7 @@ impl SetupState {
                 error: Some(format!("Built-in provider '{provider_id}' is not defined.")),
                 notice: None,
                 catalog,
+                mouse: Default::default(),
             };
         };
         Self {
@@ -79,6 +85,7 @@ impl SetupState {
             error: None,
             notice: None,
             catalog,
+            mouse: Default::default(),
         }
     }
 
@@ -96,7 +103,38 @@ impl SetupState {
         }
     }
 
+    pub fn backspace_returns(&self) -> bool {
+        match &self.screen {
+            SetupScreen::Welcome(_) => false,
+            SetupScreen::Providers(_) | SetupScreen::ConfirmDelete(_) | SetupScreen::ChatGpt(_) => {
+                true
+            }
+            SetupScreen::Builtin(form) => {
+                form.focus != BuiltinFocus::ApiKey || form.api_key.value.is_empty()
+            }
+            SetupScreen::Custom(form) => match form.focus {
+                CustomFocus::Name => form.name_is_read_only() || form.name.value.is_empty(),
+                CustomFocus::BaseUrl => form.base_url.value.is_empty(),
+                CustomFocus::ApiKey => form.api_key.value.is_empty(),
+                CustomFocus::Model(index) => form.models[index].value.is_empty(),
+                CustomFocus::DeleteModel(_)
+                | CustomFocus::AddModel
+                | CustomFocus::Save
+                | CustomFocus::Cancel => true,
+            },
+        }
+    }
+
     pub fn update(&mut self, action: KeyAction) -> Option<SetupEffect> {
+        self.mouse = Default::default();
+        let action = if action == KeyAction::Backspace
+            && self.backspace_returns()
+            && !matches!(self.screen, SetupScreen::Providers(_))
+        {
+            KeyAction::Escape
+        } else {
+            action
+        };
         let mut next_screen = None;
         let effect = match &mut self.screen {
             SetupScreen::Welcome(welcome) => {
@@ -105,7 +143,9 @@ impl SetupState {
                     match welcome.focus {
                         WelcomeFocus::AddModel => {
                             next_screen = Some(SetupScreen::Providers(
-                                ProviderListState::from_catalog(&self.catalog),
+                                welcome.providers.take().unwrap_or_else(|| {
+                                    ProviderListState::from_catalog(&self.catalog)
+                                }),
                             ));
                             None
                         }
@@ -117,7 +157,13 @@ impl SetupState {
             }
             SetupScreen::Providers(list) => {
                 list.navigate(action);
-                if action == KeyAction::Delete {
+                if action == KeyAction::Backspace {
+                    next_screen = Some(SetupScreen::Welcome(WelcomeState {
+                        focus: WelcomeFocus::AddModel,
+                        providers: Some(list.clone()),
+                    }));
+                    None
+                } else if action == KeyAction::Delete {
                     if let Some(row) = list.selected().cloned().filter(ProviderListRow::can_delete)
                     {
                         next_screen = Some(SetupScreen::ConfirmDelete(DeleteProviderState {
@@ -164,6 +210,13 @@ impl SetupState {
                             )));
                             None
                         }
+                        Some(ProviderListRow::ChatGpt { configured }) => {
+                            next_screen = Some(SetupScreen::ChatGpt(ChatGptForm::new(
+                                list.clone(),
+                                configured,
+                            )));
+                            None
+                        }
                         Some(ProviderListRow::AddCustom) => {
                             next_screen = Some(SetupScreen::Custom(
                                 CustomProviderForm::new_with_list(list.clone()),
@@ -180,6 +233,32 @@ impl SetupState {
                     None
                 }
             }
+            SetupScreen::ChatGpt(form) => match action {
+                KeyAction::Escape => {
+                    if let Some(login) = &form.login {
+                        login.cancel();
+                    }
+                    next_screen = Some(SetupScreen::Providers((*form.list).clone()));
+                    None
+                }
+                KeyAction::Up | KeyAction::Down | KeyAction::Tab => {
+                    form.focus = match form.focus {
+                        ChatGptFocus::SignIn => ChatGptFocus::Cancel,
+                        ChatGptFocus::Cancel => ChatGptFocus::SignIn,
+                    };
+                    None
+                }
+                KeyAction::Submit if form.focus == ChatGptFocus::Cancel => {
+                    if let Some(login) = &form.login {
+                        login.cancel();
+                    }
+                    next_screen = Some(SetupScreen::Providers((*form.list).clone()));
+                    None
+                }
+                KeyAction::Submit if form.url.is_some() => Some(SetupEffect::OpenChatGptBrowser),
+                KeyAction::Submit if form.login.is_none() => Some(SetupEffect::StartChatGptLogin),
+                _ => None,
+            },
             SetupScreen::Builtin(form) => match form.handle(action) {
                 FormAction::None => None,
                 FormAction::Cancel => {
@@ -237,6 +316,76 @@ impl SetupState {
         effect
     }
 
+    /// Called by the event loop; rendering never polls or starts authentication.
+    pub fn poll_chatgpt_login(&mut self, manager: &mut ConfigurationManager) -> bool {
+        let events = match &mut self.screen {
+            SetupScreen::ChatGpt(form) => {
+                if let Some(success) = form
+                    .browser
+                    .as_ref()
+                    .and_then(super::chatgpt::BrowserJob::poll)
+                {
+                    form.browser = None;
+                    if !success {
+                        self.error = Some("Could not open a browser. Open the displayed URL on this computer to finish signing in.".into());
+                    }
+                }
+                form.login
+                    .as_ref()
+                    .map(LoginHandle::poll)
+                    .unwrap_or_default()
+            }
+            _ => return false,
+        };
+        for event in events {
+            if self.apply_chatgpt_event(manager, event) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn apply_chatgpt_event(
+        &mut self,
+        manager: &mut ConfigurationManager,
+        event: LoginEvent,
+    ) -> bool {
+        let SetupScreen::ChatGpt(form) = &mut self.screen else {
+            return false;
+        };
+        match event {
+            LoginEvent::Url(url) => {
+                form.url = Some(url);
+            }
+            LoginEvent::Failed(message) => {
+                form.login = None;
+                form.url = None;
+                self.error = Some(message);
+            }
+            LoginEvent::Completed(models) => {
+                form.login = None;
+                form.url = None;
+                let default = models
+                    .iter()
+                    .find(|model| model.is_default)
+                    .map(|model| model.id.clone());
+                match manager
+                    .save_chatgpt(models.into_iter().map(|model| model.id).collect(), default)
+                {
+                    Ok(()) => {
+                        self.error = None;
+                        if self.refresh_provider_list(manager).is_err() {
+                            self.show_saved_refresh_failure(manager);
+                        }
+                        return true;
+                    }
+                    Err(error) => self.error = Some(error.user_message().to_owned()),
+                }
+            }
+        }
+        false
+    }
+
     fn refresh_provider_list(&mut self, manager: &ConfigurationManager) -> Result<()> {
         let statuses = manager.provider_statuses()?;
         let available_models = manager
@@ -292,11 +441,13 @@ pub enum SetupScreen {
     Builtin(BuiltinProviderForm),
     Custom(CustomProviderForm),
     ConfirmDelete(DeleteProviderState),
+    ChatGpt(ChatGptForm),
 }
 
 impl fmt::Debug for SetupScreen {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ChatGpt(form) => formatter.debug_tuple("ChatGpt").field(form).finish(),
             Self::Welcome(state) => formatter.debug_tuple("Welcome").field(state).finish(),
             Self::Providers(state) => formatter.debug_tuple("Providers").field(state).finish(),
             Self::Builtin(form) => formatter.debug_tuple("Builtin").field(form).finish(),
@@ -311,6 +462,7 @@ impl fmt::Debug for SetupScreen {
 #[derive(Clone, Debug, Default)]
 pub struct WelcomeState {
     pub focus: WelcomeFocus,
+    providers: Option<ProviderListState>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -351,6 +503,7 @@ impl ProviderListState {
                 status_unavailable: false,
             })
             .collect::<Vec<_>>();
+        rows.push(ProviderListRow::ChatGpt { configured: false });
         rows.push(ProviderListRow::AddCustom);
         Self { rows, focus: 0 }
     }
@@ -390,6 +543,9 @@ impl ProviderListState {
                 status_unavailable: false,
             });
         }
+        rows.push(ProviderListRow::ChatGpt {
+            configured: manager.user_config().chatgpt.is_some(),
+        });
         rows.push(ProviderListRow::AddCustom);
         if has_available_models {
             rows.push(ProviderListRow::StartGlint);
@@ -430,6 +586,9 @@ impl ProviderListState {
                     status_unavailable: true,
                 }),
         );
+        rows.push(ProviderListRow::ChatGpt {
+            configured: manager.user_config().chatgpt.is_some(),
+        });
         rows.push(ProviderListRow::AddCustom);
         rows.push(ProviderListRow::RefreshProviders);
         Self { rows, focus: 0 }
@@ -453,6 +612,9 @@ impl ProviderListState {
 
 #[derive(Clone, Debug)]
 pub enum ProviderListRow {
+    ChatGpt {
+        configured: bool,
+    },
     Builtin {
         provider_id: String,
         display_name: String,
@@ -476,6 +638,7 @@ pub enum ProviderListRow {
 impl ProviderListRow {
     pub fn provider_id(&self) -> Option<&str> {
         match self {
+            Self::ChatGpt { .. } => Some(CHATGPT_PROVIDER_ID),
             Self::Builtin { provider_id, .. } => Some(provider_id),
             Self::Custom { name, .. } => Some(name),
             Self::AddCustom | Self::RefreshProviders | Self::StartGlint => None,
@@ -484,6 +647,7 @@ impl ProviderListRow {
 
     pub fn display_name(&self) -> &str {
         match self {
+            Self::ChatGpt { .. } => CHATGPT_PROVIDER_NAME,
             Self::Builtin { display_name, .. } => display_name,
             Self::Custom { name, .. } => name,
             Self::AddCustom => "Custom provider",
@@ -499,6 +663,7 @@ impl ProviderListRow {
                 configured: true,
                 ..
             } | Self::Custom { .. }
+                | Self::ChatGpt { configured: true }
         )
     }
 
@@ -510,7 +675,9 @@ impl ProviderListRow {
             | Self::Custom {
                 needs_credential, ..
             } => *needs_credential,
-            Self::AddCustom | Self::RefreshProviders | Self::StartGlint => false,
+            Self::ChatGpt { .. } | Self::AddCustom | Self::RefreshProviders | Self::StartGlint => {
+                false
+            }
         }
     }
 
@@ -518,7 +685,7 @@ impl ProviderListRow {
         match self {
             Self::Builtin { model_count, .. } => *model_count,
             Self::Custom { models, .. } => models.len(),
-            Self::AddCustom | Self::RefreshProviders | Self::StartGlint => 0,
+            Self::ChatGpt { .. } | Self::AddCustom | Self::RefreshProviders | Self::StartGlint => 0,
         }
     }
 
@@ -529,6 +696,7 @@ impl ProviderListRow {
                 configured: true,
                 ..
             } | Self::Custom { .. }
+                | Self::ChatGpt { configured: true }
         )
     }
 
@@ -540,9 +708,51 @@ impl ProviderListRow {
             | Self::Custom {
                 status_unavailable, ..
             } => *status_unavailable,
-            Self::AddCustom | Self::RefreshProviders | Self::StartGlint => false,
+            Self::ChatGpt { .. } | Self::AddCustom | Self::RefreshProviders | Self::StartGlint => {
+                false
+            }
         }
     }
+}
+
+#[derive(Clone)]
+pub struct ChatGptForm {
+    pub focus: ChatGptFocus,
+    pub configured: bool,
+    pub url: Option<String>,
+    pub login: Option<LoginHandle>,
+    browser: Option<super::chatgpt::BrowserJob>,
+    list: Box<ProviderListState>,
+}
+
+impl ChatGptForm {
+    fn new(list: ProviderListState, configured: bool) -> Self {
+        Self {
+            focus: ChatGptFocus::SignIn,
+            configured,
+            url: None,
+            login: None,
+            browser: None,
+            list: Box::new(list),
+        }
+    }
+}
+
+impl fmt::Debug for ChatGptForm {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChatGptForm")
+            .field("focus", &self.focus)
+            .field("configured", &self.configured)
+            .field("login_pending", &self.login.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatGptFocus {
+    SignIn,
+    Cancel,
 }
 
 #[derive(Clone)]
@@ -734,17 +944,33 @@ impl CustomProviderForm {
                 self.focus = self
                     .focus
                     .next(self.models.len(), !self.name_is_read_only());
+                if action == KeyAction::Down && matches!(self.focus, CustomFocus::DeleteModel(_)) {
+                    self.focus = self
+                        .focus
+                        .next(self.models.len(), !self.name_is_read_only());
+                }
                 FormAction::None
             }
             KeyAction::Up => {
                 self.focus = self
                     .focus
                     .previous(self.models.len(), !self.name_is_read_only());
+                if matches!(self.focus, CustomFocus::DeleteModel(_)) {
+                    self.focus = self
+                        .focus
+                        .previous(self.models.len(), !self.name_is_read_only());
+                }
                 FormAction::None
             }
             KeyAction::Submit if self.focus == CustomFocus::AddModel => {
                 self.add_model_row();
                 self.focus = CustomFocus::Model(self.models.len() - 1);
+                FormAction::None
+            }
+            KeyAction::Delete if matches!(self.focus, CustomFocus::Model(_)) => {
+                if let CustomFocus::Model(index) = self.focus {
+                    self.delete_model_row(index);
+                }
                 FormAction::None
             }
             KeyAction::Submit | KeyAction::Delete
@@ -880,6 +1106,8 @@ enum FormAction {
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum SetupEffect {
+    StartChatGptLogin,
+    OpenChatGptBrowser,
     SaveBuiltin {
         provider_id: String,
         api_key: Option<String>,
@@ -922,6 +1150,8 @@ impl fmt::Debug for SetupEffect {
                 .debug_struct("DeleteProvider")
                 .field("provider_id", provider_id)
                 .finish(),
+            Self::StartChatGptLogin => formatter.write_str("StartChatGptLogin"),
+            Self::OpenChatGptBrowser => formatter.write_str("OpenChatGptBrowser"),
             Self::RefreshProviders => formatter.write_str("RefreshProviders"),
             Self::StartGlint => formatter.write_str("StartGlint"),
             Self::Exit => formatter.write_str("Exit"),
@@ -941,6 +1171,28 @@ pub fn apply_setup_effect(
     effect: SetupEffect,
 ) -> Result<Option<SetupOutcome>> {
     let result = match effect {
+        SetupEffect::StartChatGptLogin => {
+            if let SetupScreen::ChatGpt(form) = &mut state.screen {
+                if let Some(login) = form.login.take() {
+                    login.cancel();
+                }
+                form.url = None;
+                form.login = Some(LoginHandle::start(manager.paths().root().to_path_buf()));
+                state.error = None;
+            }
+            return Ok(None);
+        }
+        SetupEffect::OpenChatGptBrowser => {
+            if let SetupScreen::ChatGpt(form) = &mut state.screen
+                && let Some(url) = &form.url
+                && form.browser.is_none()
+            {
+                form.browser = Some(super::chatgpt::BrowserJob::start(url.clone()));
+                state.error = None;
+            }
+            return Ok(None);
+        }
+
         SetupEffect::SaveBuiltin {
             provider_id,
             api_key,
@@ -1021,6 +1273,104 @@ mod tests {
     use anyhow::{Result, bail};
 
     use super::*;
+
+    #[test]
+    fn chatgpt_screen_navigates_and_backspace_returns_to_provider_list() {
+        let catalog = ProviderCatalog::embedded().unwrap();
+        let mut state = SetupState::welcome(&catalog);
+        state.update(KeyAction::Submit);
+        let SetupScreen::Providers(list) = &mut state.screen else {
+            panic!("provider list")
+        };
+        list.focus = list
+            .rows
+            .iter()
+            .position(|row| matches!(row, ProviderListRow::ChatGpt { .. }))
+            .unwrap();
+        state.update(KeyAction::Submit);
+        assert!(matches!(state.screen, SetupScreen::ChatGpt(_)));
+        assert_eq!(
+            state.update(KeyAction::Submit),
+            Some(SetupEffect::StartChatGptLogin)
+        );
+        state.update(KeyAction::Backspace);
+        assert!(matches!(state.screen, SetupScreen::Providers(_)));
+    }
+
+    fn open_chatgpt_screen() -> SetupState {
+        let mut state = SetupState::welcome(&test_catalog());
+        state.update(KeyAction::Submit);
+        select_row(&mut state, |row| {
+            matches!(row, ProviderListRow::ChatGpt { .. })
+        });
+        state.update(KeyAction::Submit);
+        state
+    }
+
+    fn completed_login() -> LoginEvent {
+        LoginEvent::Completed(vec![crate::chatgpt::CodexModel {
+            id: "account-model".into(),
+            display_name: "Account model".into(),
+            is_default: true,
+        }])
+    }
+
+    #[test]
+    fn chatgpt_completion_saves_models_and_enables_start_without_api_key() {
+        let fixture = ManagerFixture::new();
+        let mut manager = fixture.manager();
+        let mut state = open_chatgpt_screen();
+        assert!(state.apply_chatgpt_event(&mut manager, completed_login()));
+        assert!(
+            provider_list(&state)
+                .rows
+                .iter()
+                .any(|row| matches!(row, ProviderListRow::ChatGpt { configured: true }))
+        );
+        assert!(
+            provider_list(&state)
+                .rows
+                .iter()
+                .any(|row| matches!(row, ProviderListRow::StartGlint))
+        );
+        assert_eq!(
+            manager.user_config().llm.as_ref().unwrap().provider,
+            CHATGPT_PROVIDER_ID
+        );
+        assert!(fixture.credentials.values.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn chatgpt_failed_save_keeps_form_and_cancel_ignores_late_completion() {
+        let fixture = ManagerFixture::new();
+        let mut manager = fixture.manager();
+        let mut state = open_chatgpt_screen();
+        fixture.repository.fail_saves();
+        assert!(!state.apply_chatgpt_event(&mut manager, completed_login()));
+        assert!(matches!(state.screen, SetupScreen::ChatGpt(_)));
+        assert!(state.error.is_some());
+        assert!(manager.user_config().chatgpt.is_none());
+        state.update(KeyAction::Escape);
+        assert!(!state.apply_chatgpt_event(&mut manager, completed_login()));
+        assert!(manager.user_config().chatgpt.is_none());
+    }
+
+    #[test]
+    fn chatgpt_url_is_not_in_debug_and_open_browser_is_explicit() {
+        let fixture = ManagerFixture::new();
+        let mut manager = fixture.manager();
+        let mut state = open_chatgpt_screen();
+        state.apply_chatgpt_event(
+            &mut manager,
+            LoginEvent::Url("https://auth.openai.com/?state=private-login-state".into()),
+        );
+        assert!(!format!("{state:?}").contains("private-login-state"));
+        assert_eq!(
+            state.update(KeyAction::Submit),
+            Some(SetupEffect::OpenChatGptBrowser)
+        );
+        assert!(manager.user_config().chatgpt.is_none());
+    }
     use crate::{
         config::UserConfig,
         configuration::ConfigurationManager,
@@ -1030,6 +1380,81 @@ mod tests {
         persistence::UserConfigRepository,
         provider_catalog::ProviderCatalog,
     };
+
+    #[test]
+    fn backspace_returns_to_welcome_and_preserves_provider_list() {
+        let mut state = SetupState::welcome(&test_catalog());
+        state.update(KeyAction::Submit);
+        if let SetupScreen::Providers(list) = &mut state.screen {
+            list.focus = 1;
+            if let ProviderListRow::Builtin { configured, .. } = &mut list.rows[1] {
+                *configured = true;
+            }
+        }
+        assert!(state.update(KeyAction::Backspace).is_none());
+        assert!(matches!(state.screen, SetupScreen::Welcome(_)));
+        state.update(KeyAction::Backspace);
+        assert!(matches!(state.screen, SetupScreen::Welcome(_)));
+        state.update(KeyAction::Submit);
+        let list = provider_list(&state);
+        assert_eq!(list.focus, 1);
+        assert!(list.rows[1].configured());
+    }
+
+    #[test]
+    fn backspace_edits_nonempty_key_then_returns_from_empty_form() {
+        let mut state = SetupState::builtin(test_catalog(), "deepseek");
+        state.builtin_form_mut().unwrap().api_key.set("x");
+        state.update(KeyAction::Backspace);
+        assert!(state.builtin_form_mut().unwrap().api_key.value.is_empty());
+        state.update(KeyAction::Backspace);
+        assert!(matches!(state.screen, SetupScreen::Providers(_)));
+    }
+
+    #[test]
+    fn backspace_preserves_editing_in_every_custom_input() {
+        for focus in [
+            CustomFocus::Name,
+            CustomFocus::BaseUrl,
+            CustomFocus::ApiKey,
+            CustomFocus::Model(0),
+        ] {
+            let mut state = SetupState::custom_provider(test_catalog());
+            let form = state.custom_form_mut().unwrap();
+            form.focus = focus;
+            let input = match focus {
+                CustomFocus::Name => &mut form.name,
+                CustomFocus::BaseUrl => &mut form.base_url,
+                CustomFocus::ApiKey => &mut form.api_key,
+                CustomFocus::Model(_) => &mut form.models[0],
+                _ => unreachable!(),
+            };
+            input.set("x");
+            assert!(!state.backspace_returns());
+            state.update(KeyAction::Backspace);
+            assert!(matches!(state.screen, SetupScreen::Custom(_)));
+            assert!(state.backspace_returns());
+            state.update(KeyAction::Backspace);
+            assert!(matches!(state.screen, SetupScreen::Providers(_)));
+        }
+    }
+
+    #[test]
+    fn backspace_returns_from_custom_buttons_and_delete_confirmation() {
+        let mut state = SetupState::custom_provider(test_catalog());
+        state.custom_form_mut().unwrap().focus = CustomFocus::Save;
+        state.update(KeyAction::Backspace);
+        assert!(matches!(state.screen, SetupScreen::Providers(_)));
+        if let SetupScreen::Providers(list) = &mut state.screen {
+            if let ProviderListRow::Builtin { configured, .. } = &mut list.rows[0] {
+                *configured = true;
+            }
+        }
+        state.update(KeyAction::Delete);
+        assert!(matches!(state.screen, SetupScreen::ConfirmDelete(_)));
+        state.update(KeyAction::Backspace);
+        assert!(matches!(state.screen, SetupScreen::Providers(_)));
+    }
 
     #[test]
     fn welcome_submit_opens_provider_list() {
@@ -1058,6 +1483,54 @@ mod tests {
 
         assert_eq!(form.models.len(), 1);
         assert_eq!(form.models[0].value, "");
+    }
+
+    #[test]
+    fn custom_model_down_and_up_skip_delete_buttons() {
+        let mut state = SetupState::custom_provider(test_catalog());
+        let form = state.custom_form_mut().unwrap();
+        form.models[0].set("model-one");
+        form.focus = CustomFocus::Model(0);
+        state.update(KeyAction::Down);
+        assert_eq!(
+            state.custom_form_mut().unwrap().focus,
+            CustomFocus::AddModel
+        );
+        state.update(KeyAction::Up);
+        assert_eq!(
+            state.custom_form_mut().unwrap().focus,
+            CustomFocus::Model(0)
+        );
+        state.custom_form_mut().unwrap().add_model_row();
+        state.update(KeyAction::Down);
+        assert_eq!(
+            state.custom_form_mut().unwrap().focus,
+            CustomFocus::Model(1)
+        );
+        state.update(KeyAction::Down);
+        assert_eq!(
+            state.custom_form_mut().unwrap().focus,
+            CustomFocus::AddModel
+        );
+    }
+
+    #[test]
+    fn delete_on_model_input_removes_row_and_keeps_one_editable_row() {
+        let mut state = SetupState::custom_provider(test_catalog());
+        let form = state.custom_form_mut().unwrap();
+        form.models[0].set("first-model");
+        form.add_model_row();
+        form.models[1].set("second-model");
+        form.focus = CustomFocus::Model(0);
+        state.update(KeyAction::Delete);
+        let form = state.custom_form_mut().unwrap();
+        assert_eq!(form.models.len(), 1);
+        assert_eq!(form.models[0].value, "second-model");
+        assert_eq!(form.focus, CustomFocus::Model(0));
+        state.update(KeyAction::Delete);
+        let form = state.custom_form_mut().unwrap();
+        assert_eq!(form.models.len(), 1);
+        assert!(form.models[0].value.is_empty());
     }
 
     #[test]
@@ -1528,7 +2001,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             builtin_names
                 .clone()
-                .chain(["alpha", "Zulu", "Custom provider", "Start Glint"])
+                .chain([
+                    "alpha",
+                    "Zulu",
+                    CHATGPT_PROVIDER_NAME,
+                    "Custom provider",
+                    "Start Glint"
+                ])
                 .collect::<Vec<_>>()
         );
 
@@ -1541,7 +2020,13 @@ mod tests {
                 .map(ProviderListRow::display_name)
                 .collect::<Vec<_>>(),
             builtin_names
-                .chain(["alpha", "Zulu", "Custom provider", "Refresh providers"])
+                .chain([
+                    "alpha",
+                    "Zulu",
+                    CHATGPT_PROVIDER_NAME,
+                    "Custom provider",
+                    "Refresh providers"
+                ])
                 .collect::<Vec<_>>()
         );
         assert!(

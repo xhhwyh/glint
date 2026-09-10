@@ -1,7 +1,7 @@
 use ratatui::{
     Frame,
     layout::{Position, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Clear, Paragraph},
 };
@@ -11,8 +11,8 @@ use crate::{
     input::InputState,
     provider_catalog::ProviderCatalog,
     setup::{
-        BuiltinFocus, CustomFocus, DeleteFocus, ProviderListRow, SetupScreen, SetupState,
-        WelcomeFocus,
+        BuiltinFocus, ChatGptFocus, CustomFocus, DeleteFocus, ProviderListRow, SetupScreen,
+        SetupState, WelcomeFocus,
     },
 };
 
@@ -24,62 +24,200 @@ use super::{
     },
 };
 
-const STAR_X: u16 = 1;
-const STAR_Y: u16 = 1;
+mod mouse;
+pub use mouse::mouse_action;
 
-pub fn render(frame: &mut Frame, state: &SetupState, _catalog: &ProviderCatalog) {
-    let area = frame.area();
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(star_lines()).style(Style::default().bg(BG_COLOR)),
-        star_area(area),
-    );
+struct PreparedSetup {
+    panel: Rect,
+    lines: Vec<Line<'static>>,
+    cursor: Option<(u16, u16)>,
+    scroll: usize,
+    logo: Option<(Rect, bool)>,
+}
 
-    let panel = panel_area(area);
+fn prepare(state: &SetupState, area: Rect) -> PreparedSetup {
+    let welcome = matches!(state.screen, SetupScreen::Welcome(_));
+    let mut panel = panel_area(area);
     let (lines, cursor) = screen_lines(state, panel.width);
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(BG_COLOR)),
+    let mut logo = None;
+    if welcome {
+        let content_height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        let full_logo = panel.height > content_height + star::STAR_HEIGHT as u16
+            && panel.width >= star::STAR_WIDTH as u16;
+        let logo_height = if full_logo {
+            star::STAR_HEIGHT as u16
+        } else {
+            1
+        };
+        let gap = u16::from(panel.height > content_height + logo_height);
+        let top = panel.y
+            + panel
+                .height
+                .saturating_sub(content_height + logo_height + gap)
+                / 2;
+        let logo_width = (star::STAR_WIDTH as u16).min(panel.width);
+        logo = Some((
+            Rect::new(
+                panel.x + (panel.width - logo_width) / 2,
+                top,
+                logo_width,
+                logo_height,
+            ),
+            full_logo,
+        ));
+        let bottom = panel.bottom();
+        panel.y = (top + logo_height + gap).min(bottom);
+        panel.height = bottom.saturating_sub(panel.y);
+    }
+    // Keep the active input or action visible, including after inserted notices.
+    let focus = cursor
+        .map(|(_, y)| usize::from(y))
+        .or_else(|| {
+            lines.iter().position(|line| {
+                line.spans.iter().any(|span| {
+                    span.content.starts_with("› ")
+                        || (span.content == "×" && span.style.add_modifier.contains(Modifier::BOLD))
+                })
+            })
+        })
+        .unwrap_or(0);
+    let scroll = focus
+        .saturating_add(2)
+        .saturating_sub(usize::from(panel.height))
+        .min(lines.len().saturating_sub(usize::from(panel.height)));
+    PreparedSetup {
         panel,
-    );
-    if let Some((x, y)) = cursor
-        && x < panel.width
-        && y < panel.height
-    {
-        frame.set_cursor_position(Position::new(panel.x + x, panel.y + y));
+        lines,
+        cursor,
+        scroll,
+        logo,
     }
 }
 
-fn star_lines() -> Vec<Line<'static>> {
-    star::glint_star_rows()
-        .into_iter()
-        .map(Line::from)
-        .collect()
-}
-
-fn star_area(area: Rect) -> Rect {
-    Rect::new(
-        area.x.saturating_add(STAR_X),
-        area.y.saturating_add(STAR_Y),
-        (star::STAR_WIDTH as u16).min(area.width.saturating_sub(STAR_X)),
-        (star::STAR_HEIGHT as u16).min(area.height.saturating_sub(STAR_Y)),
-    )
+pub fn render(frame: &mut Frame, state: &SetupState, _catalog: &ProviderCatalog) {
+    let area = frame.area();
+    let prepared = prepare(state, area);
+    let hits = mouse::hitboxes(state, &prepared);
+    let PreparedSetup {
+        panel,
+        lines,
+        cursor,
+        scroll,
+        logo,
+    } = prepared;
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new("").style(Style::default().bg(BG_COLOR)),
+        area,
+    );
+    if let Some((rect, full)) = logo {
+        let rows = if full {
+            star::glint_star_rows()
+                .into_iter()
+                .map(Line::from)
+                .collect()
+        } else {
+            vec![Line::styled("✦", Style::default().fg(ACCENT_COLOR)).centered()]
+        };
+        frame.render_widget(Paragraph::new(rows), rect);
+    }
+    frame.render_widget(
+        Paragraph::new(lines.into_iter().skip(scroll).collect::<Vec<_>>())
+            .style(Style::default().bg(BG_COLOR)),
+        panel,
+    );
+    mouse::render_hover(frame, state, &hits);
+    if let Some((x, y)) = cursor
+        && let Some(y) = usize::from(y).checked_sub(scroll)
+        && x < panel.width
+        && y < usize::from(panel.height)
+    {
+        frame.set_cursor_position(Position::new(panel.x + x, panel.y + y as u16));
+    }
+    let footer = Rect::new(
+        area.x,
+        area.bottom().saturating_sub(1),
+        area.width,
+        area.height.min(1),
+    );
+    frame.render_widget(
+        Paragraph::new(keyboard_hint(state, area.width)).centered(),
+        footer,
+    );
 }
 
 fn panel_area(area: Rect) -> Rect {
-    let preferred_x = STAR_X
-        .saturating_add(star::STAR_WIDTH as u16)
-        .saturating_add(3);
-    let x = if area.width > preferred_x.saturating_add(18) {
-        preferred_x
-    } else {
-        1.min(area.width)
-    };
+    let width = area.width.saturating_sub(4).min(64);
     Rect::new(
-        area.x.saturating_add(x),
-        area.y.saturating_add(1),
-        area.width.saturating_sub(x.saturating_add(1)),
-        area.height.saturating_sub(2),
+        area.x + (area.width - width) / 2,
+        area.y + u16::from(area.height > 2),
+        width,
+        area.height.saturating_sub(3),
     )
+}
+
+fn keyboard_hint(state: &SetupState, width: u16) -> Line<'static> {
+    let mut hints = vec![("↑↓/Tab", "move"), ("Enter", "select")];
+    if state.backspace_returns() {
+        hints.push(("Backspace", "back"));
+    }
+    if let SetupScreen::Custom(form) = &state.screen
+        && matches!(
+            form.focus,
+            CustomFocus::Model(_) | CustomFocus::DeleteModel(_)
+        )
+    {
+        hints.push(("Del", "remove model"));
+    }
+    match &state.screen {
+        SetupScreen::Builtin(_)
+        | SetupScreen::Custom(_)
+        | SetupScreen::ConfirmDelete(_)
+        | SetupScreen::ChatGpt(_) => {
+            hints.push(("Esc", "cancel"));
+        }
+        SetupScreen::Providers(list)
+            if list
+                .rows
+                .get(list.focus)
+                .is_some_and(ProviderListRow::can_delete) =>
+        {
+            hints.push(("Del", "remove"));
+        }
+        _ => {}
+    }
+    hints.push(("Ctrl+C", "quit"));
+    if width >= 110 {
+        hints.push(("Click", "select / edit"));
+    }
+    let full_width: usize = hints
+        .iter()
+        .map(|(key, label)| key.width() + label.width() + 1)
+        .sum::<usize>()
+        + (hints.len() - 1) * 3;
+    let compact = full_width > usize::from(width);
+    let mut spans = Vec::new();
+    for (index, (key, label)) in hints.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(
+                if compact { " " } else { " · " },
+                Style::default().fg(MUTED_TEXT_COLOR),
+            ));
+        }
+        spans.push(Span::styled(
+            key,
+            Style::default()
+                .fg(ACCENT_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ));
+        if !compact {
+            spans.push(Span::styled(
+                format!(" {label}"),
+                Style::default().fg(MUTED_TEXT_COLOR),
+            ));
+        }
+    }
+    Line::from(spans)
 }
 
 fn screen_lines(state: &SetupState, width: u16) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
@@ -88,6 +226,7 @@ fn screen_lines(state: &SetupState, width: u16) -> (Vec<Line<'static>>, Option<(
         SetupScreen::Providers(list) => provider_lines(width, list),
         SetupScreen::Builtin(form) => builtin_lines(width, form),
         SetupScreen::Custom(form) => custom_lines(width, form),
+        SetupScreen::ChatGpt(form) => chatgpt_lines(width, form),
         SetupScreen::ConfirmDelete(confirm) => confirm_delete_lines(width, confirm),
     };
 
@@ -116,54 +255,97 @@ fn wrapped_message_lines(text: &str, width: u16, style: Style) -> Vec<Line<'stat
 }
 
 fn welcome_lines(width: u16, focus: WelcomeFocus) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
-    (
-        vec![
-            box_top("Welcome", width),
-            box_body_styled(
+    let mut lines = vec![
+        Line::styled(
+            "Welcome to Glint",
+            Style::default().fg(TEXT_COLOR).add_modifier(Modifier::BOLD),
+        )
+        .centered(),
+    ];
+    if width >= 28 {
+        lines.push(
+            Line::styled(
                 "Add a model to begin chatting.",
-                width,
-                Style::default().fg(SOFT_TEXT_COLOR),
-            ),
-            action_line("Add model", focus == WelcomeFocus::AddModel, width),
-            action_line("Exit", focus == WelcomeFocus::Exit, width),
-            box_bottom(width),
-        ],
-        None,
-    )
+                Style::default().fg(MUTED_TEXT_COLOR),
+            )
+            .centered(),
+        );
+    }
+    lines.push(Line::default());
+    for (label, selected) in [
+        ("Add model", focus == WelcomeFocus::AddModel),
+        ("Exit", focus == WelcomeFocus::Exit),
+    ] {
+        lines.push(
+            Line::styled(
+                format!("{} {label}  ", if selected { "›" } else { " " }),
+                if selected {
+                    Style::default()
+                        .fg(ACCENT_COLOR)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MUTED_TEXT_COLOR)
+                },
+            )
+            .centered(),
+        );
+    }
+    (lines, None)
 }
 
 fn provider_lines(
     width: u16,
     list: &crate::setup::ProviderListState,
 ) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
-    let mut lines = vec![box_top("Model configuration", width)];
+    let mut lines = vec![box_top("Add model", width)];
     for (index, row) in list.rows.iter().enumerate() {
+        if matches!(row, ProviderListRow::StartGlint) {
+            continue;
+        }
         let selected = index == list.focus;
-        let text = match row {
-            ProviderListRow::Builtin { .. } | ProviderListRow::Custom { .. } => {
-                let status = if row.status_unavailable() {
-                    "status unavailable"
-                } else if row.needs_credential() {
-                    "needs API key"
-                } else if row.configured() {
-                    "configured"
-                } else {
-                    "not configured"
-                };
-                format!(
-                    "{}  ·  {}  ·  {} models",
-                    row.display_name(),
-                    status,
-                    row.model_count()
-                )
-            }
-            ProviderListRow::AddCustom => "Custom provider".into(),
-            ProviderListRow::RefreshProviders => "Refresh providers".into(),
-            ProviderListRow::StartGlint => "Start Glint".into(),
+        let (icon, color) = if row.status_unavailable() || row.needs_credential() {
+            ("!", Color::Yellow)
+        } else if row.configured() {
+            ("✓", Color::Green)
+        } else {
+            (" ", MUTED_TEXT_COLOR)
         };
-        lines.push(action_line(&text, selected, width));
+        let style = if selected {
+            Style::default()
+                .fg(ACCENT_COLOR)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(SOFT_TEXT_COLOR)
+        };
+        lines.push(box_input_body_line(
+            Line::from(vec![
+                Span::styled(if selected { "› " } else { "  " }, style),
+                Span::styled(format!("{icon} "), Style::default().fg(color)),
+                Span::styled(row.display_name().to_owned(), style),
+            ]),
+            width,
+        ));
     }
     lines.push(box_bottom(width));
+    if let Some(index) = list
+        .rows
+        .iter()
+        .position(|row| matches!(row, ProviderListRow::StartGlint))
+    {
+        lines.push(Line::default());
+        lines.push(form_action_line("Start Glint", index == list.focus));
+    }
+    if list.rows.iter().any(|row| row.status_unavailable()) {
+        lines.push(Line::styled(
+            "! status unavailable · Refresh providers to retry",
+            Style::default().fg(MUTED_TEXT_COLOR),
+        ));
+    } else if list.rows.iter().any(|row| row.needs_credential()) {
+        lines.push(Line::styled(
+            "! needs API key · Select provider to repair",
+            Style::default().fg(MUTED_TEXT_COLOR),
+        ));
+    }
     (lines, None)
 }
 
@@ -181,29 +363,87 @@ fn builtin_lines(
     );
     let input_y = lines.len() as u16;
     lines.push(input);
-    lines.push(box_body_styled(
-        "Models",
+    lines.push(box_input_body_line(
+        Line::styled("Models:", Style::default().fg(MUTED_TEXT_COLOR)),
         width,
-        Style::default().fg(MUTED_TEXT_COLOR),
     ));
     for model in &form.models {
-        lines.push(box_body_styled(
-            model,
+        lines.push(box_input_body_line(
+            Line::styled(model.clone(), Style::default().fg(SOFT_TEXT_COLOR)),
             width,
-            Style::default().fg(SOFT_TEXT_COLOR),
         ));
     }
-    lines.push(action_line("Save", form.focus == BuiltinFocus::Save, width));
-    lines.push(action_line(
+    lines.push(box_bottom(width));
+    lines.push(Line::default());
+    lines.push(form_action_line("Save", form.focus == BuiltinFocus::Save));
+    lines.push(form_action_line(
         "Cancel",
         form.focus == BuiltinFocus::Cancel,
-        width,
     ));
-    lines.push(box_bottom(width));
     (
         lines,
         (form.focus == BuiltinFocus::ApiKey).then_some((cursor_x, input_y)),
     )
+}
+
+fn chatgpt_lines(
+    width: u16,
+    form: &crate::setup::ChatGptForm,
+) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
+    let mut lines = vec![box_top(crate::config::CHATGPT_PROVIDER_NAME, width)];
+    for message in [
+        "Use the Codex access included in your ChatGPT plan.",
+        "Sign in securely in your browser. No API key needed.",
+        "Glint manages your conversation and tools.",
+    ] {
+        lines.extend(wrapped_message_lines(
+            message,
+            width,
+            Style::default().fg(SOFT_TEXT_COLOR),
+        ));
+    }
+    if form.configured {
+        lines.extend(wrapped_message_lines(
+            "Connected · Sign in to refresh your account and models.",
+            width,
+            Style::default().fg(ACCENT_COLOR),
+        ));
+    }
+    if let Some(url) = &form.url {
+        lines.extend(wrapped_message_lines(
+            "Open your browser to finish signing in:",
+            width,
+            Style::default().fg(ACCENT_COLOR),
+        ));
+        lines.extend(wrapped_message_lines(
+            url,
+            width,
+            Style::default().fg(MUTED_TEXT_COLOR),
+        ));
+    } else if form.login.is_some() {
+        lines.extend(wrapped_message_lines(
+            "Connecting to ChatGPT…",
+            width,
+            Style::default().fg(ACCENT_COLOR),
+        ));
+    }
+    lines.push(box_bottom(width));
+    lines.push(Line::default());
+    lines.push(form_action_line(
+        if form.url.is_some() {
+            "Open browser"
+        } else if form.login.is_some() {
+            "Signing in…"
+        } else {
+            "Sign in with ChatGPT"
+        },
+        form.focus == ChatGptFocus::SignIn,
+    ));
+    lines.push(form_action_line(
+        "Cancel",
+        form.focus == ChatGptFocus::Cancel,
+    ));
+    (lines, None)
 }
 
 fn custom_lines(
@@ -236,10 +476,9 @@ fn custom_lines(
             cursor = Some((x, y));
         }
     }
-    lines.push(box_body_styled(
-        "Models",
+    lines.push(box_input_body_line(
+        Line::styled("Models:", Style::default().fg(MUTED_TEXT_COLOR)),
         width,
-        Style::default().fg(MUTED_TEXT_COLOR),
     ));
     for (index, model) in form.models.iter().enumerate() {
         let y = lines.len() as u16;
@@ -256,13 +495,13 @@ fn custom_lines(
         form.focus == CustomFocus::AddModel,
         width,
     ));
-    lines.push(action_line("Save", form.focus == CustomFocus::Save, width));
-    lines.push(action_line(
+    lines.push(box_bottom(width));
+    lines.push(Line::default());
+    lines.push(form_action_line("Save", form.focus == CustomFocus::Save));
+    lines.push(form_action_line(
         "Cancel",
         form.focus == CustomFocus::Cancel,
-        width,
     ));
-    lines.push(box_bottom(width));
     (lines, cursor)
 }
 
@@ -299,6 +538,23 @@ fn action_line(text: &str, selected: bool, width: u16) -> Line<'static> {
         width,
         style,
     )
+}
+
+fn form_action_line(text: &str, selected: bool) -> Line<'static> {
+    let style = if selected {
+        Style::default()
+            .fg(ACCENT_COLOR)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(SOFT_TEXT_COLOR)
+    };
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("{} {text}", if selected { "›" } else { " " }),
+            style,
+        ),
+    ])
 }
 
 fn input_line(
@@ -424,6 +680,97 @@ mod tests {
     use super::{panel_area, render, screen_lines};
 
     #[test]
+    fn chatgpt_login_actions_are_outside_box_and_mouse_cancel_returns() {
+        use crate::{
+            event::{KeyAction, MouseAction},
+            setup::ProviderListRow,
+        };
+        let mut state = SetupState::welcome(&test_catalog());
+        state.update(KeyAction::Submit);
+        if let SetupScreen::Providers(list) = &mut state.screen {
+            list.focus = list
+                .rows
+                .iter()
+                .position(|row| matches!(row, ProviderListRow::ChatGpt { .. }))
+                .unwrap();
+        }
+        state.update(KeyAction::Submit);
+        let rows = render_rows(&state, 100, 30);
+        let sign_in = rows
+            .iter()
+            .position(|row| row.contains("Sign in with ChatGPT"))
+            .unwrap();
+        let cancel = rows.iter().position(|row| row.contains("Cancel")).unwrap();
+        assert!(!rows[sign_in].contains('│'));
+        assert!(!rows[cancel].contains('│'));
+        assert!(!rows.iter().any(|row| row.contains("API key:")));
+        let panel = panel_area(Rect::new(0, 0, 100, 30));
+        let hover = super::mouse_action(
+            &state,
+            MouseAction::Move {
+                column: panel.x + 3,
+                row: cancel as u16,
+            },
+            100,
+            30,
+        );
+        state.update_mouse(hover);
+        let hovered = render_rows(&state, 100, 30);
+        assert_eq!(hovered.join("").matches('›').count(), 1);
+        assert!(hovered[cancel].contains('›'));
+        let click = super::mouse_action(
+            &state,
+            MouseAction::LeftDown {
+                column: panel.x + 3,
+                row: cancel as u16,
+            },
+            100,
+            30,
+        );
+        state.update_mouse(click);
+        assert!(matches!(state.screen, SetupScreen::Providers(_)));
+    }
+
+    #[test]
+    fn mouse_click_opens_provider_and_deletes_custom_model() {
+        use crate::{
+            event::MouseAction,
+            setup::{CustomFocus, SetupScreen},
+        };
+        let mut state = SetupState::welcome(&test_catalog());
+        let action = super::mouse_action(
+            &state,
+            MouseAction::LeftDown {
+                column: 50,
+                row: 22,
+            },
+            100,
+            30,
+        );
+        state.update_mouse(action);
+        assert!(matches!(state.screen, SetupScreen::Providers(_)));
+        let mut state = SetupState::custom_provider(test_catalog());
+        state.custom_form_mut().unwrap().add_model_row();
+        state.custom_form_mut().unwrap().models[0].set("first");
+        state.custom_form_mut().unwrap().models[1].set("second");
+        let panel = panel_area(Rect::new(0, 0, 100, 30));
+        let action = super::mouse_action(
+            &state,
+            MouseAction::LeftDown {
+                column: panel.x + panel.width - 3,
+                row: panel.y + 5,
+            },
+            100,
+            30,
+        );
+        state.update_mouse(action);
+        let form = state.custom_form_mut().unwrap();
+        assert_eq!(form.models.len(), 1);
+        assert_eq!(form.models[0].value, "second");
+        assert_eq!(form.focus, CustomFocus::Model(0));
+    }
+
+    #[test]
     fn welcome_renders_star_and_only_primary_actions() {
         let state = SetupState::welcome(&test_catalog());
         let rendered = render_setup(&state, 100, 30);
@@ -431,6 +778,96 @@ mod tests {
         assert!(rendered.contains("Add model"));
         assert!(rendered.contains("Exit"));
         assert!(!rendered.contains("Start Glint"));
+    }
+
+    #[test]
+    fn welcome_stacks_logo_above_title_and_keeps_footer_at_bottom() {
+        let state = SetupState::welcome(&test_catalog());
+        let rows = render_rows(&state, 100, 30);
+        let title_row = rows
+            .iter()
+            .position(|row| row.contains("Welcome to Glint"))
+            .unwrap();
+        assert!(title_row >= super::star::STAR_HEIGHT);
+        assert!(rows.last().unwrap().contains("Enter"));
+        for (width, height) in [(40, 12), (24, 8)] {
+            let compact = render_setup(&state, width, height);
+            assert!(compact.contains("Add model"));
+            assert!(compact.contains("Exit"));
+            assert!(compact.contains("Enter"));
+        }
+    }
+
+    #[test]
+    fn provider_rows_use_configured_icon_without_status_or_count() {
+        let mut state = SetupState::welcome(&test_catalog());
+        state.update(crate::event::KeyAction::Submit);
+        if let SetupScreen::Providers(list) = &mut state.screen {
+            if let crate::setup::ProviderListRow::Builtin { configured, .. } = &mut list.rows[0] {
+                *configured = true;
+            }
+        }
+        let rendered = render_setup(&state, 100, 30);
+        assert!(rendered.contains("✓"));
+        assert!(!rendered.contains("configured"));
+        assert!(!rendered.contains(" models"));
+    }
+
+    #[test]
+    fn short_provider_list_keeps_last_selection_visible_above_footer() {
+        let mut state = SetupState::welcome(&test_catalog());
+        state.update(crate::event::KeyAction::Submit);
+        if let SetupScreen::Providers(list) = &mut state.screen {
+            list.focus = list.rows.len() - 1;
+        }
+        let rendered = render_setup(&state, 40, 8);
+        assert!(rendered.contains("Custom provider"));
+        assert!(rendered.contains("Enter"));
+    }
+
+    #[test]
+    fn short_form_scrolls_input_cursor_and_save_action_into_view() {
+        let mut state = SetupState::custom_provider(test_catalog());
+        let form = state.custom_form_mut().unwrap();
+        for _ in 0..12 {
+            form.add_model_row();
+        }
+        form.models[12].set("last-model");
+        form.focus = crate::setup::CustomFocus::Model(12);
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &state, &test_catalog()))
+            .unwrap();
+        let (x, y) = terminal.get_cursor_position().map(|p| (p.x, p.y)).unwrap();
+        assert!(y < 8);
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((x - 1, y))
+                .unwrap()
+                .symbol(),
+            "l"
+        );
+        state.custom_form_mut().unwrap().focus = crate::setup::CustomFocus::Save;
+        let rendered = render_setup(&state, 40, 10);
+        assert!(rendered.contains("› Save"));
+        assert!(rendered.contains("Esc"));
+    }
+
+    #[test]
+    fn footer_shows_backspace_only_when_it_navigates_back() {
+        let mut state = SetupState::builtin(test_catalog(), "deepseek");
+        assert!(
+            render_rows(&state, 100, 30)
+                .last()
+                .unwrap()
+                .contains("Backspace back")
+        );
+        state.builtin_form_mut().unwrap().api_key.set("secret");
+        let rows = render_rows(&state, 100, 30);
+        assert!(!rows.last().unwrap().contains("Backspace"));
+        assert!(rows.last().unwrap().contains("Esc cancel"));
     }
 
     #[test]
@@ -552,6 +989,10 @@ mod tests {
     }
 
     fn render_setup(state: &SetupState, width: u16, height: u16) -> String {
+        render_rows(state, width, height).concat()
+    }
+
+    fn render_rows(state: &SetupState, width: u16, height: u16) -> Vec<String> {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         let catalog = test_catalog();
@@ -562,8 +1003,8 @@ mod tests {
             .backend()
             .buffer()
             .content
-            .iter()
-            .map(|cell| cell.symbol())
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
             .collect()
     }
 

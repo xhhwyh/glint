@@ -15,7 +15,7 @@ use serde_json::json;
 use crate::{
     agent::{
         AgentEvent,
-        openai::OpenAiProvider,
+        provider::ConfiguredProvider,
         provider::{
             FinishReason, ModelMessage, ModelProvider, ModelRequest, ModelResponse, ToolCall,
             ToolResult,
@@ -84,7 +84,7 @@ pub fn spawn_agent_loop(
     control_rx: Receiver<AgentControl>,
 ) {
     thread::spawn(move || {
-        let mut provider = OpenAiProvider::new(input.llm.clone());
+        let mut provider = ConfiguredProvider::new(input.llm.clone());
         let registry = main_tool_registry(&input);
         let tool_context = input.tool_context.clone();
 
@@ -119,7 +119,7 @@ pub fn spawn_subagent_loop(
     steering: Arc<SubagentSteering>,
 ) {
     thread::spawn(move || {
-        let mut provider = OpenAiProvider::new(input.llm.clone());
+        let mut provider = ConfiguredProvider::new(input.llm.clone());
         let registry = subagent_tool_registry(&input);
         let tool_context = input.tool_context.clone();
         let result = with_tool_context(tool_context, || {
@@ -283,6 +283,7 @@ fn run_model_turns(
             usage: response.usage,
             finish_reason: response.finish_reason.clone(),
             tool_calls: response.tool_calls.clone(),
+            reasoning: response.reasoning.clone(),
         })
         .ok();
 
@@ -316,10 +317,13 @@ fn run_model_turns(
             if response.finish_reason != FinishReason::Stop {
                 return finish_without_tools(response);
             }
-            messages.push(ModelMessage::assistant(
-                response.assistant_text.filter(|text| !text.is_empty()),
-                Vec::new(),
-            ));
+            messages.push(
+                ModelMessage::assistant(
+                    response.assistant_text.filter(|text| !text.is_empty()),
+                    Vec::new(),
+                )
+                .with_reasoning(response.reasoning),
+            );
             append_steering_messages(messages, steering_messages);
             continue;
         }
@@ -357,10 +361,10 @@ fn append_tool_turn(
         apply_before_tool_hook(state.hook_runner, call)?;
     }
     let assistant_text = response.assistant_text.filter(|text| !text.is_empty());
-    messages.push(ModelMessage::assistant(
-        assistant_text,
-        response.tool_calls.clone(),
-    ));
+    messages.push(
+        ModelMessage::assistant(assistant_text, response.tool_calls.clone())
+            .with_reasoning(response.reasoning),
+    );
 
     for batch in partition_tool_calls(registry, response.tool_calls, state) {
         if batch.concurrent {
@@ -908,7 +912,10 @@ mod tests {
                 self.steering
                     .send("focus on the parser tests".to_owned())
                     .unwrap();
-                Ok(final_response("initial answer"))
+                Ok(ModelResponse {
+                    reasoning: Some(test_reasoning()),
+                    ..final_response("initial answer")
+                })
             } else {
                 Ok(final_response("revised answer"))
             }
@@ -930,6 +937,7 @@ mod tests {
         let (task_requests, _task_rx) = mpsc::channel();
         AgentRunInput {
             llm: LlmConfig {
+                reasoning_effort: None,
                 provider: "test".to_owned(),
                 base_url: "http://localhost".to_owned(),
                 model: "test-model".to_owned(),
@@ -969,6 +977,76 @@ mod tests {
             hook_runner: HookRunner::default(),
             tool_context: ToolContext::new("/workspace", "/home/tester"),
         }
+    }
+
+    // Explicit opt-in acceptance: uses local ChatGPT credentials and subscription quota.
+    #[test]
+    #[ignore = "requires a configured ChatGPT subscription and network access"]
+    fn native_chatgpt_live_read_tool_roundtrip() {
+        let paths = crate::paths::GlintPaths::discover().unwrap();
+        let user: crate::config::UserConfig =
+            serde_yaml::from_str(&std::fs::read_to_string(paths.config()).unwrap()).unwrap();
+        let model = user
+            .llm
+            .as_ref()
+            .filter(|selection| selection.provider == crate::config::CHATGPT_PROVIDER_ID)
+            .map(|selection| selection.model.clone())
+            .or_else(|| {
+                user.chatgpt
+                    .as_ref()
+                    .and_then(|c| c.models.first().cloned())
+            })
+            .expect("configure ChatGPT before running the live acceptance");
+        let root = std::env::temp_dir().join(format!("glint-native-live-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = format!("GLINT_NATIVE_{}", uuid::Uuid::new_v4().simple());
+        std::fs::write(root.join("probe.txt"), &marker).unwrap();
+        let mut run_input = input();
+        run_input.llm.provider = crate::config::CHATGPT_PROVIDER_ID.into();
+        run_input.llm.model = model;
+        run_input.llm.reasoning_effort = Some("low".into());
+        run_input.llm.api_key.clear();
+        run_input.system_prompt = "You are testing a coding tool. Use only Read, exactly once on probe.txt, then reply with its exact contents. Do not call other tools.".into();
+        run_input.current_user_message = "Read probe.txt and return its contents.".into();
+        run_input.runtime_context.current_dir = root.display().to_string();
+        run_input.tool_context = ToolContext::new(&root, paths.home());
+        run_input.tool_results_dir = root.join("tool-results");
+        let context = run_input.tool_context.clone();
+        let registry = subagent_tool_registry(&run_input);
+        let mut provider = ConfiguredProvider::new(run_input.llm.clone());
+        let (tx, events) = mpsc::channel();
+        let (control, control_rx) = mpsc::channel();
+        let (finished, done) = mpsc::channel();
+        let watchdog = thread::spawn(move || {
+            if done
+                .recv_timeout(std::time::Duration::from_secs(90))
+                .is_err()
+            {
+                control.send(AgentControl::Cancel).ok();
+            }
+        });
+        let outcome = with_tool_context(context, || {
+            run_agent_loop(
+                run_input,
+                &mut provider,
+                &registry,
+                &tx,
+                &control_rx,
+                None,
+                true,
+            )
+        });
+        finished.send(()).ok();
+        watchdog.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        let outcome = outcome.expect("native ChatGPT model/tool roundtrip failed");
+        assert!(
+            outcome.final_message.contains(&marker),
+            "unexpected probe response: {}",
+            outcome.final_message
+        );
+        assert!(events.try_iter().any(|event| matches!(event,
+            AgentEvent::ToolFinished { name, is_error: false, .. } if name == "Read")));
     }
 
     #[test]
@@ -1026,8 +1104,20 @@ mod tests {
         );
     }
 
+    fn test_reasoning() -> crate::agent::provider::ProviderReasoning {
+        crate::agent::provider::ProviderReasoning {
+            provider: "test".into(),
+            model: "test-model".into(),
+            data: crate::agent::provider::ReasoningData {
+                reasoning_content: Some("private thought".into()),
+                ..Default::default()
+            },
+        }
+    }
+
     fn final_response(text: &str) -> ModelResponse {
         ModelResponse {
+            reasoning: None,
             assistant_text: Some(text.to_owned()),
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
@@ -1037,6 +1127,7 @@ mod tests {
 
     fn tool_response(id_suffix: &str) -> ModelResponse {
         ModelResponse {
+            reasoning: None,
             assistant_text: None,
             tool_calls: vec![ToolCall {
                 id: format!("tool-{id_suffix}"),
@@ -1050,6 +1141,7 @@ mod tests {
 
     fn todo_response() -> ModelResponse {
         ModelResponse {
+            reasoning: None,
             assistant_text: None,
             tool_calls: vec![ToolCall {
                 id: "todo-one".to_owned(),
@@ -1150,6 +1242,7 @@ mod tests {
         assert!(second_request.messages.iter().any(|message| {
             message.role == ModelRole::Assistant
                 && message.content.as_deref() == Some("initial answer")
+                && message.reasoning == Some(test_reasoning())
         }));
         assert!(second_request.messages.iter().any(|message| {
             message.role == ModelRole::User
@@ -1164,7 +1257,13 @@ mod tests {
     fn tool_call_causes_second_model_request_with_tool_result() {
         let (tx, _rx) = mpsc::channel();
         let registry = ToolRegistry::new();
-        let mut provider = FakeProvider::new(vec![tool_response("one"), final_response("done")]);
+        let mut provider = FakeProvider::new(vec![
+            ModelResponse {
+                reasoning: Some(test_reasoning()),
+                ..tool_response("one")
+            },
+            final_response("done"),
+        ]);
 
         let control_rx = control_rx();
         run_agent_loop(
@@ -1180,6 +1279,9 @@ mod tests {
 
         assert_eq!(provider.requests.len(), 2);
         let second_request = &provider.requests[1];
+        assert!(second_request.messages.iter().any(|message| {
+            message.role == ModelRole::Assistant && message.reasoning == Some(test_reasoning())
+        }));
         assert!(second_request.messages.iter().any(|message| {
             message.role == ModelRole::Tool
                 && message.tool_call_id.as_deref() == Some("tool-one")
@@ -1319,6 +1421,7 @@ mod tests {
             append_tool_turn(
                 &mut messages,
                 ModelResponse {
+                    reasoning: None,
                     assistant_text: None,
                     tool_calls: vec![
                         ToolCall {
@@ -1376,6 +1479,7 @@ mod tests {
         );
         let mut messages = Vec::new();
         let response = ModelResponse {
+            reasoning: None,
             assistant_text: None,
             tool_calls: ["one.txt", "two.txt"]
                 .into_iter()

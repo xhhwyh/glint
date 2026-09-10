@@ -13,7 +13,31 @@ use super::{
 };
 
 pub(super) fn info_line(app: &App, width: u16) -> Line<'static> {
-    let left_width = format!("{} · {}", app.config.llm.model, app.config.llm.provider).width();
+    let effort = if app.config.llm.provider == crate::config::CHATGPT_PROVIDER_ID
+        || !crate::reasoning::options(&app.config.llm.provider, &app.config.llm.model)
+            .levels
+            .is_empty()
+    {
+        format!(
+            " · effort {}",
+            app.config
+                .llm
+                .reasoning_effort
+                .as_deref()
+                .unwrap_or("default")
+        )
+    } else {
+        String::new()
+    };
+    let provider = if app.config.llm.provider == crate::config::CHATGPT_PROVIDER_ID {
+        crate::config::CHATGPT_PROVIDER_NAME
+    } else {
+        app.provider_catalog
+            .builtin(&app.config.llm.provider)
+            .map(|provider| provider.name.as_str())
+            .unwrap_or(&app.config.llm.provider)
+    };
+    let left_width = format!("{} · {}{}", app.config.llm.model, provider, effort).width();
     let cwd_limit = (width as usize).saturating_sub(left_width + 2);
     let cwd = if cwd_limit == 0 {
         String::new()
@@ -29,11 +53,12 @@ pub(super) fn info_line(app: &App, width: u16) -> Line<'static> {
         ),
         Span::styled(" · ", Style::default().fg(MUTED_TEXT_COLOR)),
         Span::styled(
-            app.config.llm.provider.clone(),
+            provider.to_owned(),
             Style::default()
                 .fg(ACCENT_COLOR)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::styled(effort, Style::default().fg(MUTED_TEXT_COLOR)),
         Span::raw(" ".repeat(spacer)),
         Span::styled(cwd, Style::default().fg(MUTED_TEXT_COLOR)),
     ])
@@ -68,14 +93,12 @@ pub(super) fn context_line(app: &App, _width: u16) -> Line<'static> {
         ));
         spans.push(Span::styled(
             usage.prompt_tokens.to_string(),
-            Style::default()
-                .fg(BORDER_BRIGHT_COLOR)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(TEXT_COLOR).add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             cached_suffix(cache_percent),
-            Style::default().fg(ACCENT_COLOR),
+            Style::default().fg(TEXT_COLOR).add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw("   "));
         spans.push(Span::styled(

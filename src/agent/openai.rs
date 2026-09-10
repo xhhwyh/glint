@@ -10,7 +10,8 @@ use crate::config::LlmConfig;
 use super::{
     TokenUsage,
     provider::{
-        FinishReason, ModelMessage, ModelProvider, ModelRequest, ModelResponse, ToolCall, ToolSpec,
+        FinishReason, ModelMessage, ModelProvider, ModelRequest, ModelResponse, ProviderReasoning,
+        ReasoningData, ToolCall, ToolSpec,
     },
 };
 
@@ -45,8 +46,83 @@ impl ModelProvider for OpenAiProvider {
     }
 }
 
+impl ReasoningData {
+    fn append(&mut self, delta: Self) -> Result<()> {
+        for (target, incoming) in [
+            (&mut self.reasoning_content, delta.reasoning_content),
+            (&mut self.encrypted_content, delta.encrypted_content),
+        ] {
+            if let Some(text) = incoming {
+                target.get_or_insert_default().push_str(&text);
+            }
+        }
+        if let Some(details) = delta.reasoning_details {
+            let target = self.reasoning_details.get_or_insert_default();
+            for detail in details {
+                let index = detail.get("index");
+                if let Some(existing) = target
+                    .iter_mut()
+                    .find(|entry| index.is_some() && entry.get("index") == index)
+                {
+                    if let (Some(existing), Some(incoming)) =
+                        (existing.as_object_mut(), detail.as_object())
+                    {
+                        for (key, value) in incoming {
+                            if matches!(key.as_str(), "text" | "data" | "signature")
+                                && let (Some(Value::String(text)), Value::String(fragment)) =
+                                    (existing.get_mut(key), value)
+                            {
+                                text.push_str(fragment);
+                            } else {
+                                existing.insert(key.clone(), value.clone());
+                            }
+                        }
+                    }
+                } else {
+                    anyhow::ensure!(target.len() < 256, "too many reasoning detail blocks");
+                    target.push(detail);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn request_messages(config: &LlmConfig, messages: &[ModelMessage]) -> Result<Vec<ChatMessage>> {
+    messages
+        .iter()
+        .map(|message| {
+            let mut chat = chat_message_from_model(message)?;
+            if message.role == super::provider::ModelRole::Assistant {
+                if let Some(reasoning) = &message.reasoning
+                    && reasoning.provider == config.provider
+                    && reasoning.model == config.model
+                {
+                    chat.reasoning = reasoning.data.clone();
+                }
+                // Local command answers and legacy sessions have no recorded reasoning.
+                // DeepSeek requires the field to be present for assistant history with tools.
+                if config.provider == "deepseek" {
+                    chat.reasoning.reasoning_content.get_or_insert_default();
+                }
+            }
+            Ok(chat)
+        })
+        .collect()
+}
+
+fn response_reasoning(config: &LlmConfig, data: ReasoningData) -> Option<ProviderReasoning> {
+    (data != ReasoningData::default()).then(|| ProviderReasoning {
+        provider: config.provider.clone(),
+        model: config.model.clone(),
+        data,
+    })
+}
+
 #[derive(Serialize)]
 struct ChatRequest {
+    #[serde(flatten)]
+    reasoning_parameters: serde_json::Map<String, Value>,
     model: String,
     messages: Vec<ChatMessage>,
     temperature: f32,
@@ -65,6 +141,8 @@ struct ChatRequest {
 
 #[derive(Serialize)]
 struct ChatMessage {
+    #[serde(flatten)]
+    reasoning: ReasoningData,
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
@@ -126,6 +204,8 @@ struct StreamChoice {
 
 #[derive(Deserialize)]
 struct StreamDelta {
+    #[serde(flatten)]
+    reasoning: ReasoningData,
     content: Option<String>,
     tool_calls: Option<Vec<StreamToolCall>>,
 }
@@ -178,6 +258,7 @@ impl From<OpenAiUsage> for TokenUsage {
 #[derive(Default)]
 struct StreamingState {
     saw_done: bool,
+    reasoning: ReasoningData,
     assistant_text: String,
     tool_calls: Vec<StreamingToolCall>,
     finish_reason: Option<String>,
@@ -200,6 +281,8 @@ struct Choice {
 
 #[derive(Deserialize)]
 struct ResponseMessage {
+    #[serde(flatten)]
+    reasoning: ReasoningData,
     content: Option<String>,
     tool_calls: Option<Vec<ChatToolCall>>,
 }
@@ -210,12 +293,13 @@ fn complete_chat(
     request: ModelRequest,
 ) -> Result<ModelResponse> {
     let request = ChatRequest {
+        reasoning_parameters: crate::reasoning::request_fields(
+            &config.provider,
+            &config.model,
+            config.reasoning_effort.as_deref(),
+        )?,
         model: config.model.clone(),
-        messages: request
-            .messages
-            .iter()
-            .map(chat_message_from_model)
-            .collect::<Result<Vec<_>>>()?,
+        messages: request_messages(config, &request.messages)?,
         temperature: config.temperature,
         max_tokens: request.max_tokens.unwrap_or(config.max_tokens),
         prompt_cache_key: config.prompt_cache.key.clone(),
@@ -242,7 +326,10 @@ fn complete_chat(
         .next()
         .context("response did not include a choice")?;
 
-    model_response_from_choice(choice, response.usage.map(TokenUsage::from))
+    let data = choice.message.reasoning.clone();
+    let mut response = model_response_from_choice(choice, response.usage.map(TokenUsage::from))?;
+    response.reasoning = response_reasoning(config, data);
+    Ok(response)
 }
 
 fn stream_chat(
@@ -252,12 +339,13 @@ fn stream_chat(
     on_delta: &mut dyn FnMut(String),
 ) -> Result<ModelResponse> {
     let request = ChatRequest {
+        reasoning_parameters: crate::reasoning::request_fields(
+            &config.provider,
+            &config.model,
+            config.reasoning_effort.as_deref(),
+        )?,
         model: config.model.clone(),
-        messages: request
-            .messages
-            .iter()
-            .map(chat_message_from_model)
-            .collect::<Result<Vec<_>>>()?,
+        messages: request_messages(config, &request.messages)?,
         temperature: config.temperature,
         max_tokens: request.max_tokens.unwrap_or(config.max_tokens),
         prompt_cache_key: config.prompt_cache.key.clone(),
@@ -304,11 +392,15 @@ fn stream_chat(
         state.apply_chunk(chunk, on_delta)?;
     }
 
-    state.into_model_response()
+    let data = state.reasoning.clone();
+    let mut response = state.into_model_response()?;
+    response.reasoning = response_reasoning(config, data);
+    Ok(response)
 }
 
 fn chat_message_from_model(message: &ModelMessage) -> Result<ChatMessage> {
     Ok(ChatMessage {
+        reasoning: ReasoningData::default(),
         role: message.role.as_str().to_owned(),
         content: message.content.clone(),
         tool_call_id: message.tool_call_id.clone(),
@@ -368,6 +460,7 @@ fn model_response_from_choice(choice: Choice, usage: Option<TokenUsage>) -> Resu
         .collect::<Result<Vec<_>>>()?;
 
     Ok(ModelResponse {
+        reasoning: None,
         assistant_text: choice.message.content,
         tool_calls,
         finish_reason: finish_reason(choice.finish_reason),
@@ -404,6 +497,7 @@ impl StreamingState {
             return Ok(());
         };
 
+        self.reasoning.append(choice.delta.reasoning)?;
         if let Some(content) = choice.delta.content.filter(|content| !content.is_empty()) {
             self.assistant_text.push_str(&content);
             on_delta(content);
@@ -467,6 +561,7 @@ impl StreamingState {
         };
 
         Ok(ModelResponse {
+            reasoning: None,
             assistant_text,
             tool_calls,
             finish_reason,
@@ -536,6 +631,215 @@ fn finish_reason(reason: Option<String>) -> FinishReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_tool_roundtrip_preserves_streamed_provider_fields() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+        for (provider_id, model, effort) in [
+            ("deepseek", "deepseek-v4-pro", "max"),
+            ("volcengine", "doubao-seed-2-1-pro-260628", "low"),
+            ("openrouter", "deepseek/deepseek-v4-flash", "xhigh"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                for turn in 0..3 {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut reader = BufReader::new(&mut socket);
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            length = value.trim().parse::<usize>().unwrap();
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body).unwrap();
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    if provider_id == "openrouter" {
+                        assert_eq!(request["reasoning"]["effort"], effort);
+                    } else {
+                        assert_eq!(request["reasoning_effort"], effort);
+                    }
+                    let (content_type, body) = if turn == 0 {
+                        assert_eq!(request["stream"], true);
+                        let mut delta = serde_json::json!({"content":"", "tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"Read","arguments":"{}"}}]});
+                        if provider_id == "openrouter" {
+                            delta["reasoning_details"] = serde_json::json!([{"index":0,"type":"reasoning.text","text":"private thought"}]);
+                        } else {
+                            delta["reasoning_content"] = Value::String("private thought".into());
+                        }
+                        if provider_id == "volcengine" {
+                            delta["encrypted_content"] = Value::String("ciphertext".into());
+                        }
+                        let chunk = serde_json::json!({"choices":[{"delta":delta,"finish_reason":"tool_calls"}]});
+                        (
+                            "text/event-stream",
+                            format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                        )
+                    } else {
+                        let assistant = &request["messages"][1];
+                        assert_eq!(assistant["tool_calls"][0]["id"], "call-1");
+                        if provider_id == "openrouter" {
+                            assert_eq!(
+                                assistant["reasoning_details"][0]["text"],
+                                "private thought"
+                            );
+                        } else {
+                            assert_eq!(assistant["reasoning_content"], "private thought");
+                        }
+                        if provider_id == "volcengine" {
+                            assert_eq!(assistant["encrypted_content"], "ciphertext");
+                        }
+                        if turn == 2 {
+                            let final_assistant = &request["messages"][3];
+                            if provider_id == "openrouter" {
+                                assert_eq!(
+                                    final_assistant["reasoning_details"][0]["text"],
+                                    "final thought"
+                                );
+                            } else {
+                                assert_eq!(final_assistant["reasoning_content"], "final thought");
+                            }
+                            assert_eq!(request["messages"][4]["content"], "next prompt");
+                        }
+                        assert!(request.get("stream").is_none());
+                        let mut final_message = serde_json::json!({"content":"done"});
+                        if provider_id == "openrouter" {
+                            final_message["reasoning_details"] = serde_json::json!([{"index":0,"type":"reasoning.text","text":"final thought"}]);
+                        } else {
+                            final_message["reasoning_content"] =
+                                Value::String("final thought".into());
+                        }
+                        ("application/json", serde_json::json!({"choices":[{"message":final_message,"finish_reason":"stop"}]}).to_string())
+                    };
+                    write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                }
+            });
+            let mut config = crate::app::App::test_empty().config.llm.clone();
+            config.provider = provider_id.into();
+            config.model = model.into();
+            config.base_url = format!("http://{address}");
+            config.reasoning_effort = Some(effort.into());
+            let mut provider = OpenAiProvider {
+                config,
+                client: Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .unwrap(),
+            };
+            let first = ModelRequest {
+                messages: vec![ModelMessage::user("probe")],
+                tools: vec![],
+                max_tokens: None,
+            };
+            let mut visible = String::new();
+            let result = provider
+                .stream(first.clone(), &mut |delta| visible.push_str(&delta))
+                .unwrap();
+            assert!(
+                visible.is_empty(),
+                "reasoning must not enter the answer transcript"
+            );
+            let mut messages = first.messages;
+            // The query loop normalizes empty assistant text to None.
+            messages.push(
+                ModelMessage::assistant(None, result.tool_calls).with_reasoning(result.reasoning),
+            );
+            messages.push(ModelMessage {
+                reasoning: None,
+                role: super::super::provider::ModelRole::Tool,
+                content: Some("tool result".into()),
+                tool_call_id: Some("call-1".into()),
+                tool_calls: vec![],
+            });
+            let final_response = provider
+                .complete(ModelRequest {
+                    messages: messages.clone(),
+                    tools: vec![],
+                    max_tokens: None,
+                })
+                .unwrap();
+            assert_eq!(final_response.assistant_text.as_deref(), Some("done"));
+            messages.push(
+                ModelMessage::assistant(final_response.assistant_text, vec![])
+                    .with_reasoning(final_response.reasoning),
+            );
+            messages.push(ModelMessage::user("next prompt"));
+            // Each user prompt constructs a new provider in spawn_agent_loop.
+            let mut next_provider = OpenAiProvider {
+                config: provider.config.clone(),
+                client: provider.client.clone(),
+            };
+            let result = next_provider
+                .complete(ModelRequest {
+                    messages,
+                    tools: vec![ToolSpec {
+                        name: "Read".into(),
+                        description: "Read test file".into(),
+                        parameters: serde_json::json!({"type":"object"}),
+                    }],
+                    max_tokens: None,
+                })
+                .unwrap();
+            assert_eq!(result.assistant_text.as_deref(), Some("done"));
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn reasoning_history_is_scoped_to_origin_and_legacy_messages_remain_compatible() {
+        let mut config = crate::app::App::test_empty().config.llm.clone();
+        config.provider = "deepseek".into();
+        config.model = "deepseek-v4-pro".into();
+        let reason = ProviderReasoning {
+            provider: "volcengine".into(),
+            model: "doubao-seed-2-1-pro-260628".into(),
+            data: ReasoningData {
+                reasoning_content: Some("other provider thought".into()),
+                encrypted_content: Some("other provider cipher".into()),
+                reasoning_details: None,
+            },
+        };
+        let messages = vec![
+            ModelMessage::assistant(Some("old answer".into()), vec![]).with_reasoning(Some(reason)),
+        ];
+        let wire = serde_json::to_value(request_messages(&config, &messages).unwrap()).unwrap();
+        assert_eq!(wire[0]["reasoning_content"], "");
+        assert!(wire[0].get("encrypted_content").is_none());
+        config.provider = "custom".into();
+        let wire = serde_json::to_value(request_messages(&config, &messages).unwrap()).unwrap();
+        assert!(wire[0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn reasoning_deltas_join_text_and_encrypted_blocks_without_losing_metadata() {
+        let mut data = ReasoningData::default();
+        for part in ["first", "second"] {
+            data.append(serde_json::from_value(serde_json::json!({
+                "reasoning_content": part, "encrypted_content": part,
+                "reasoning_details": [{"index": 0,"id":"reason-1","type":"reasoning.encrypted","data":part,"format":"provider-v1"}]
+            })).unwrap()).unwrap();
+        }
+        assert_eq!(data.reasoning_content.as_deref(), Some("firstsecond"));
+        assert_eq!(data.encrypted_content.as_deref(), Some("firstsecond"));
+        let detail = &data.reasoning_details.unwrap()[0];
+        assert_eq!(detail["data"], "firstsecond");
+        assert_eq!(detail["id"], "reason-1");
+        assert_eq!(detail["format"], "provider-v1");
+    }
 
     #[test]
     fn streaming_state_emits_text_deltas_as_chunks_arrive() {
@@ -616,6 +920,7 @@ mod tests {
     #[test]
     fn chat_request_serializes_prompt_cache_options_when_configured() {
         let request = ChatRequest {
+            reasoning_parameters: Default::default(),
             model: "gpt-5-codex".to_owned(),
             messages: Vec::new(),
             temperature: 0.0,
@@ -636,6 +941,7 @@ mod tests {
     #[test]
     fn chat_request_omits_prompt_cache_options_by_default() {
         let request = ChatRequest {
+            reasoning_parameters: Default::default(),
             model: "test-model".to_owned(),
             messages: Vec::new(),
             temperature: 0.0,
@@ -698,6 +1004,7 @@ mod tests {
         StreamResponse {
             choices: vec![StreamChoice {
                 delta: StreamDelta {
+                    reasoning: ReasoningData::default(),
                     content: Some(content.to_owned()),
                     tool_calls: None,
                 },
@@ -718,6 +1025,7 @@ mod tests {
         StreamResponse {
             choices: vec![StreamChoice {
                 delta: StreamDelta {
+                    reasoning: ReasoningData::default(),
                     content: None,
                     tool_calls: Some(vec![StreamToolCall {
                         index,

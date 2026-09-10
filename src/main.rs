@@ -1,6 +1,7 @@
 mod agent;
 mod app;
 mod approval;
+mod chatgpt;
 mod cli;
 mod commands;
 mod config;
@@ -24,6 +25,7 @@ mod progress;
 #[allow(dead_code)]
 mod provider_catalog;
 mod query;
+mod reasoning;
 mod runtime;
 mod services;
 mod settings;
@@ -303,15 +305,30 @@ fn run_setup(
     catalog: &ProviderCatalog,
 ) -> Result<SetupOutcome> {
     loop {
+        state.poll_chatgpt_login(manager);
         terminal.draw(|frame| ui::setup::render(frame, &state, catalog))?;
-        let Event::Key(key) = term_event::read()? else {
-            continue;
-        };
-        if key.kind != KeyEventKind::Press {
+        if !term_event::poll(Duration::from_millis(25))? {
             continue;
         }
-        let input = KeyInput::from(key);
-        match setup_step(&mut state, input.action) {
+        let step = match term_event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                setup_step(&mut state, KeyInput::from(key).action)
+            }
+            Event::Mouse(mouse) => {
+                let size = terminal.size()?;
+                let action = ui::setup::mouse_action(
+                    &state,
+                    MouseAction::from(mouse),
+                    size.width,
+                    size.height,
+                );
+                state
+                    .update_mouse(action)
+                    .map_or(SetupStep::Continue, SetupStep::Effect)
+            }
+            _ => SetupStep::Continue,
+        };
+        match step {
             SetupStep::Continue => {}
             SetupStep::Exit(outcome) => return Ok(outcome),
             SetupStep::Effect(effect) => {
@@ -564,6 +581,39 @@ fn base64_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[test]
+    #[ignore = "requires a PTY mouse driver and isolated fixture root"]
+    fn setup_mouse_terminal_child() {
+        let root =
+            std::path::PathBuf::from(std::env::var_os("GLINT_SETUP_MOUSE_TEST_ROOT").unwrap());
+        let paths = crate::paths::GlintPaths::from_home(&root);
+        let catalog = ProviderCatalog::embedded().unwrap();
+        let mut manager = ConfigurationManager::new(
+            paths.clone(),
+            root.clone(),
+            catalog.clone(),
+            Box::new(crate::persistence::UserConfigStore::new(paths.clone())),
+            Box::new(crate::credentials::FileCredentialStore::new(paths.auth())),
+        )
+        .unwrap();
+        let mut stdout = io::stdout();
+        let mut lifecycle = TerminalLifecycle::enter(&mut stdout).unwrap();
+        let mut terminal = Terminal::new(CrosstermBackend::new(stdout)).unwrap();
+        let result = run_setup(
+            &mut terminal,
+            &mut manager,
+            SetupState::custom_provider(catalog.clone()),
+            &catalog,
+        );
+        lifecycle.restore(terminal.backend_mut()).unwrap();
+        terminal.show_cursor().unwrap();
+        assert!(matches!(result.unwrap(), SetupOutcome::Exit));
+        assert_eq!(
+            manager.user_config().custom_providers["Mouse Test"].models,
+            ["keep"]
+        );
+    }
 
     #[test]
     fn unconfigured_interactive_startup_enters_setup() {

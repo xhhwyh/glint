@@ -11,6 +11,9 @@ use crate::{
 
 pub use crate::provider_catalog::PromptCacheConfig;
 
+pub const CHATGPT_PROVIDER_ID: &str = "chatgpt";
+pub const CHATGPT_PROVIDER_NAME: &str = "OpenAI";
+
 pub(crate) const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
 
 #[derive(Clone)]
@@ -44,6 +47,7 @@ impl Config {
 
 #[derive(Clone)]
 pub struct LlmConfig {
+    pub reasoning_effort: Option<String>,
     pub provider: String,
     pub base_url: String,
     pub model: String,
@@ -82,13 +86,18 @@ impl LlmConfig {
         if !provider.models.iter().any(|candidate| candidate == model) {
             bail!("model '{model}' is not defined for provider '{provider_name}'");
         }
-        let api_key = api_key.with_context(|| {
-            format!(
-                "credential '{}' is unavailable",
-                provider.credential_id.as_str()
-            )
-        })?;
+        let api_key = if provider_name == CHATGPT_PROVIDER_ID {
+            String::new()
+        } else {
+            api_key.with_context(|| {
+                format!(
+                    "credential '{}' is unavailable",
+                    provider.credential_id.as_str()
+                )
+            })?
+        };
 
+        self.reasoning_effort = None;
         self.provider = provider.name;
         self.base_url = provider.base_url;
         self.model = model.to_owned();
@@ -114,6 +123,10 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub custom_providers: BTreeMap<String, CustomProviderConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chatgpt: Option<ChatGptConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reasoning_efforts: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp: Option<serde_yaml::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugins: Option<serde_yaml::Value>,
@@ -132,6 +145,7 @@ impl fmt::Debug for UserConfig {
             .field("llm", &self.llm)
             .field("configured_providers", &self.configured_providers)
             .field("custom_providers", &self.custom_providers)
+            .field("chatgpt", &self.chatgpt)
             .field("mcp_configured", &self.mcp.is_some())
             .field("plugins_configured", &self.plugins.is_some())
             .field("lsp_configured", &self.lsp.is_some())
@@ -147,6 +161,8 @@ impl Default for UserConfig {
             llm: None,
             configured_providers: Vec::new(),
             custom_providers: BTreeMap::new(),
+            chatgpt: None,
+            reasoning_efforts: BTreeMap::new(),
             mcp: None,
             plugins: None,
             lsp: None,
@@ -161,6 +177,14 @@ pub struct UserLlmConfig {
     pub model: String,
     pub temperature: f32,
     pub max_tokens: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChatGptConfig {
+    pub models: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reasoning_efforts: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -320,6 +344,7 @@ mod tests {
         for section in [
             "configured_providers:",
             "custom_providers:",
+            "chatgpt:",
             "mcp:",
             "plugins:",
             "lsp:",

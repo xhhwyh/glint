@@ -8,6 +8,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -370,7 +371,7 @@ impl PluginManager {
         cwd: &Path,
     ) -> Result<PluginLoadResult> {
         let state = load_plugin_state(config, cwd)?;
-        load_with_state(config, &state, mcp, lsp, cwd)
+        load_with_cached_sources(config, &state, mcp, lsp, cwd)
     }
 
     pub fn add_marketplace(
@@ -958,6 +959,7 @@ fn load_marketplace_with_mode(
     source_mode: GitSourceMode,
 ) -> Result<LoadedMarketplace> {
     let local = resolve_user_path(Path::new(source), cwd);
+    let mut downloaded_cache = None;
     let (content, root) = if local.exists() {
         let manifest_path = marketplace_manifest_path(&local)?;
         let root = marketplace_root(&manifest_path)?;
@@ -971,13 +973,27 @@ fn load_marketplace_with_mode(
             Some(root),
         )
     } else if is_remote_marketplace_file(source) {
-        report_progress(format!("http: downloading marketplace {source}"));
-        let content = reqwest::blocking::get(source)
-            .with_context(|| format!("failed to download plugin marketplace '{source}'"))?
-            .error_for_status()
-            .with_context(|| format!("failed to download plugin marketplace '{source}'"))?
-            .text()
-            .with_context(|| format!("failed to read plugin marketplace '{source}'"))?;
+        let cache = plugin_cache_dir(config, cwd)
+            .join(format!("marketplace-{:016x}.json", stable_hash(source)));
+        let content = if source_mode == GitSourceMode::Cached {
+            fs::read_to_string(&cache).with_context(|| {
+                format!("marketplace '{source}' is not cached; add or refresh it before loading")
+            })?
+        } else {
+            report_progress(format!("http: downloading marketplace {source}"));
+            let content = reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .build()?
+                .get(source)
+                .send()
+                .with_context(|| format!("failed to download plugin marketplace '{source}'"))?
+                .error_for_status()
+                .with_context(|| format!("failed to download plugin marketplace '{source}'"))?
+                .text()
+                .with_context(|| format!("failed to read plugin marketplace '{source}'"))?;
+            downloaded_cache = Some(cache);
+            content
+        };
         (content, None)
     } else {
         let (repository_source, git_ref) = split_marketplace_git_ref(source);
@@ -1008,6 +1024,13 @@ fn load_marketplace_with_mode(
         validate_plugin_name(&plugin.name)?;
         plugin.marketplace = name.clone();
         plugin.installed = false;
+    }
+    // Only replace a valid cached catalog after validating the downloaded one.
+    if let Some(cache) = downloaded_cache {
+        fs::create_dir_all(plugin_cache_dir(config, cwd))?;
+        let temporary = cache.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+        fs::write(&temporary, &content).context("failed to write marketplace cache")?;
+        fs::rename(&temporary, &cache).context("failed to replace marketplace cache")?;
     }
     Ok(LoadedMarketplace {
         name,
@@ -1595,13 +1618,7 @@ fn run_git(command: &mut Command, action: &str) -> Result<Output> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("GIT_TERMINAL_PROMPT", "0");
-    let output = if progress_reporter_active() {
-        run_git_streaming(command, action)?
-    } else {
-        command
-            .output()
-            .with_context(|| format!("failed to start Git while trying to {action}"))?
-    };
+    let output = run_git_streaming(command, action, Duration::from_secs(60))?;
     if output.status.success() {
         report_progress(format!("git: completed {action}"));
         return Ok(output);
@@ -1620,7 +1637,13 @@ fn run_git(command: &mut Command, action: &str) -> Result<Output> {
     bail!("Git failed while trying to {action}: {details}")
 }
 
-fn run_git_streaming(command: &mut Command, action: &str) -> Result<Output> {
+fn run_git_streaming(command: &mut Command, action: &str, timeout: Duration) -> Result<Output> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let deadline = Instant::now() + timeout;
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to start Git while trying to {action}"))?;
@@ -1632,32 +1655,70 @@ fn run_git_streaming(command: &mut Command, action: &str) -> Result<Output> {
     let mut stdout_pending = String::new();
     let mut stderr_pending = String::new();
 
-    std::thread::scope(|scope| {
+    let mut timed_out = false;
+    let status = std::thread::scope(|scope| -> Result<_> {
         let stdout_sender = sender.clone();
         scope.spawn(move || read_git_stream(stdout, false, stdout_sender));
         let stderr_sender = sender.clone();
         scope.spawn(move || read_git_stream(stderr, true, stderr_sender));
         drop(sender);
-        for (is_stderr, chunk) in receiver {
-            if is_stderr {
-                stderr_bytes.extend_from_slice(&chunk);
-                report_git_chunk(&mut stderr_pending, &chunk);
-            } else {
-                stdout_bytes.extend_from_slice(&chunk);
-                report_git_chunk(&mut stdout_pending, &chunk);
+        let mut disconnected = false;
+        loop {
+            if Instant::now() >= deadline {
+                timed_out = true;
+                kill_git_process(&mut child);
+                break;
+            }
+            match receiver.recv_timeout(Duration::from_millis(20)) {
+                Ok((is_stderr, chunk)) => {
+                    if is_stderr {
+                        stderr_bytes.extend_from_slice(&chunk);
+                        report_git_chunk(&mut stderr_pending, &chunk);
+                    } else {
+                        stdout_bytes.extend_from_slice(&chunk);
+                        report_git_chunk(&mut stdout_pending, &chunk);
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => disconnected = true,
+            }
+            if disconnected {
+                match child.try_wait() {
+                    Ok(Some(status)) => return Ok(status),
+                    Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                    Err(error) => {
+                        kill_git_process(&mut child);
+                        return Err(error).context("failed to check Git process");
+                    }
+                }
             }
         }
-    });
+        child
+            .wait()
+            .with_context(|| format!("failed to wait for Git while trying to {action}"))
+    })?;
+    if timed_out {
+        bail!(
+            "Git timed out after {:.1}s while trying to {action}; check the connection and retry",
+            timeout.as_secs_f64()
+        );
+    }
     flush_git_progress(&mut stdout_pending);
     flush_git_progress(&mut stderr_pending);
-    let status = child
-        .wait()
-        .with_context(|| format!("failed to wait for Git while trying to {action}"))?;
     Ok(Output {
         status,
         stdout: stdout_bytes,
         stderr: stderr_bytes,
     })
+}
+
+fn kill_git_process(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    // Git and its transport helpers are isolated in this process group.
+    unsafe {
+        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+    }
+    child.kill().ok();
 }
 
 fn read_git_stream(
@@ -1698,10 +1759,6 @@ fn report_progress(message: String) {
             reporter(message);
         }
     });
-}
-
-fn progress_reporter_active() -> bool {
-    PROGRESS_REPORTER.with(|reporter| reporter.borrow().is_some())
 }
 
 fn load_plugin(
@@ -2239,6 +2296,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn remote_json_marketplace_loads_cached_catalog_when_server_is_offline() {
+        if std::env::var_os("GLINT_HTTP_CACHE_TEST_CHILD").is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "plugins::tests::remote_json_marketplace_loads_cached_catalog_when_server_is_offline"])
+                .env("GLINT_HTTP_CACHE_TEST_CHILD", "1")
+                .env("NO_PROXY", "127.0.0.1").env("no_proxy", "127.0.0.1")
+                .status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        use std::io::Write;
+        let root = test_dir("http-marketplace-cache");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let source = format!("http://{}/marketplace.json", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            stream.read(&mut request).unwrap();
+            let body = r#"{"name":"cached-market","plugins":[]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let config = PluginsConfig::default();
+        let fresh =
+            load_marketplace_with_mode(&source, &config, &root, GitSourceMode::Refresh).unwrap();
+        server.join().unwrap();
+        let cached =
+            load_marketplace_with_mode(&source, &config, &root, GitSourceMode::Cached).unwrap();
+        assert_eq!(cached.name, fresh.name);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn captures_git_failure_output() {
         let mut command = Command::new("git");
         command.arg("glint-command-that-does-not-exist");
@@ -2709,7 +2804,33 @@ mod tests {
                 .iter()
                 .all(|message| !message.starts_with("git:"))
         );
+        // Startup must use the installed cache even when the remote disappears.
+        fs::rename(&repository, root.join("offline-repository")).unwrap();
+        let loaded =
+            PluginManager::load(&config, McpConfig::default(), LspConfig::default(), &root)
+                .unwrap();
+        assert_eq!(loaded.catalog.plugins[0].name, "demo");
+        assert!(
+            PluginManager::refresh(&config, McpConfig::default(), LspConfig::default(), &root,)
+                .is_err()
+        );
         fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_timeout_terminates_descendants_holding_output_pipes() {
+        let start = std::time::Instant::now();
+        let result = run_git_streaming(
+            Command::new("sh")
+                .args(["-c", "sleep 30 & wait"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+            "test stalled Git",
+            std::time::Duration::from_millis(100),
+        );
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
     }
 
     #[test]

@@ -7,7 +7,6 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::app::App;
 
 use super::{
-    format::context_usage_label,
     layout::{box_bottom, box_top_spans, truncate_end_to_width},
     star,
     theme::*,
@@ -32,7 +31,12 @@ pub(super) fn idle_panel_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         let left_width = compact_signal_width(inner_width.saturating_sub(gutter + 28));
         let right_width = inner_width.saturating_sub(gutter + left_width);
         let left_rows = core_signal_panel(left_width);
-        let right_rows = workspace_panel(app, right_width);
+        let mut right_rows = workspace_panel(app, right_width);
+        // Extend the final box into the available height, leaving one row of breathing room.
+        while right_rows.len() + 1 < left_rows.len() {
+            let bottom = right_rows.len() - 1;
+            right_rows.insert(bottom, mini_box_body(vec![], right_width));
+        }
         let row_count = left_rows.len().max(right_rows.len());
 
         for row in 0..row_count {
@@ -102,6 +106,8 @@ fn workspace_panel(app: &App, width: usize) -> Vec<Vec<Span<'static>>> {
         let mut rows = workspace_hud_box(app, width);
         rows.push(vec![]);
         rows.extend(quick_actions_box(width));
+        rows.push(vec![]);
+        rows.extend(recent_conversations_box(app, width));
         return rows;
     }
 
@@ -116,7 +122,7 @@ fn workspace_panel(app: &App, width: usize) -> Vec<Vec<Span<'static>>> {
         gutter,
     );
     rows.push(vec![]);
-    rows.extend(project_info_box(app, width));
+    rows.extend(recent_conversations_box(app, width));
     rows
 }
 
@@ -186,22 +192,62 @@ fn quick_actions_box(width: usize) -> Vec<Vec<Span<'static>>> {
     ]
 }
 
-fn project_info_box(app: &App, width: usize) -> Vec<Vec<Span<'static>>> {
-    let context_tokens = app
-        .usage
-        .last_usage
-        .map(|usage| usage.prompt_tokens)
-        .unwrap_or(0);
-    let context = context_usage_label(context_tokens, app.config.llm.context_window);
-    let tokens = app.usage.total_tokens.to_string();
+fn recent_conversations_box(app: &App, width: usize) -> Vec<Vec<Span<'static>>> {
+    let mut rows = vec![mini_box_top("RECENT CONVERSATIONS", width)];
+    for index in 0..3 {
+        let content = if let Some(session) = app.recent_sessions.get(index) {
+            let time = local_session_time(session.last_timestamp);
+            let title = session
+                .title
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let title = truncate_end_to_width(&title, width.saturating_sub(4 + time.width() + 2));
+            vec![
+                Span::styled(time, Style::default().fg(MUTED_TEXT_COLOR)),
+                Span::raw("  "),
+                Span::styled(title, Style::default().fg(TEXT_COLOR)),
+            ]
+        } else if index == 0 {
+            vec![Span::styled(
+                if app.recent_sessions_error {
+                    "Unable to load conversations"
+                } else {
+                    "No conversations yet"
+                },
+                Style::default().fg(MUTED_TEXT_COLOR),
+            )]
+        } else {
+            vec![]
+        };
+        rows.push(mini_box_body(content, width));
+    }
+    rows.push(mini_box_bottom(width));
+    rows
+}
 
-    vec![
-        mini_box_top("PROJECT", width),
-        metric_row("CWD", &app.current_dir, width),
-        metric_row("CONTEXT", &context, width),
-        metric_row("TOKENS", &tokens, width),
-        mini_box_bottom(width),
-    ]
+fn local_session_time(timestamp: u64) -> String {
+    let Ok(timestamp) = libc::time_t::try_from(timestamp) else {
+        return "-- -- --:--".to_owned();
+    };
+    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // Both APIs write to caller-owned storage and do not use a shared tm buffer.
+    #[cfg(unix)]
+    let valid = unsafe { !libc::localtime_r(&timestamp, local.as_mut_ptr()).is_null() };
+    #[cfg(windows)]
+    let valid = unsafe { libc::localtime_s(local.as_mut_ptr(), &timestamp) == 0 };
+    if !valid {
+        return "-- -- --:--".to_owned();
+    }
+    // The successful conversion initialized every field read below.
+    let local = unsafe { local.assume_init() };
+    format!(
+        "{:02}-{:02} {:02}:{:02}",
+        local.tm_mon + 1,
+        local.tm_mday,
+        local.tm_hour,
+        local.tm_min
+    )
 }
 
 fn side_by_side_boxes(
@@ -365,4 +411,56 @@ fn dashboard_top(width: u16) -> Line<'static> {
         Span::styled("v0.1.0 ", Style::default().fg(BORDER_BRIGHT_COLOR)),
     ];
     box_top_spans(title, width)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transcript::TranscriptSessionSummary;
+
+    #[test]
+    fn recent_conversations_show_time_and_titles_with_bounded_width() {
+        let mut app = App::test_empty();
+        app.recent_sessions = (0..4)
+            .map(|index| TranscriptSessionSummary {
+                path: format!("session-{index}.jsonl").into(),
+                session_id: index.to_string(),
+                title: format!("conversation {index}\nwith a long title 中文内容"),
+                last_timestamp: 1_700_000_000,
+            })
+            .collect();
+        for width in [24, 60] {
+            let rows = recent_conversations_box(&app, width);
+            assert_eq!(rows.len(), 5);
+            for row in &rows {
+                assert_eq!(row.iter().map(Span::width).sum::<usize>(), width);
+            }
+            let text = rows
+                .iter()
+                .flat_map(|row| row.iter())
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert!(!text.contains("conversation 3"));
+            assert!(!text.contains('\n'));
+            if width == 60 {
+                assert!(text.contains("conversation 0"));
+            }
+            assert!(text.contains(&local_session_time(1_700_000_000)));
+        }
+    }
+
+    #[test]
+    fn recent_conversations_empty_and_error_states_are_distinct() {
+        let mut app = App::test_empty();
+        let text = |app: &App| {
+            recent_conversations_box(app, 60)
+                .into_iter()
+                .flatten()
+                .map(|span| span.content.into_owned())
+                .collect::<String>()
+        };
+        assert!(text(&app).contains("No conversations yet"));
+        app.recent_sessions_error = true;
+        assert!(text(&app).contains("Unable to load conversations"));
+    }
 }

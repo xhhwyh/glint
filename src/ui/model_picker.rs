@@ -1,5 +1,5 @@
 use ratatui::{
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
 };
 use unicode_width::UnicodeWidthStr;
@@ -19,6 +19,7 @@ pub(super) fn model_picker_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let title = match picker.stage {
         ModelPickerStage::Provider => "Select Provider",
         ModelPickerStage::Model => "Select Model",
+        ModelPickerStage::Reasoning => "Select Model",
     };
     let mut lines = vec![
         Line::from(Span::styled(
@@ -27,7 +28,7 @@ pub(super) fn model_picker_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 .fg(ACCENT_COLOR)
                 .add_modifier(Modifier::BOLD),
         )),
-        model_picker_help_line(picker.stage),
+        model_picker_help_line(picker.stage, !picker.reasoning_options.levels.is_empty()),
         picker_separator_line(width),
     ];
     if let Some(error) = &picker.error {
@@ -81,7 +82,7 @@ pub(super) fn model_picker_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 ]));
             }
         }
-        ModelPickerStage::Model => {
+        ModelPickerStage::Model | ModelPickerStage::Reasoning => {
             let Some(provider) = picker.providers.get(picker.selected_provider) else {
                 return lines;
             };
@@ -111,6 +112,27 @@ pub(super) fn model_picker_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                     Style::default().fg(MUTED_TEXT_COLOR)
                 };
                 let current_marker = if current { " current" } else { "" };
+                if provider.id == crate::config::CHATGPT_PROVIDER_ID
+                    || (selected && !picker.reasoning_options.levels.is_empty())
+                {
+                    let mut row = vec![
+                        Span::raw("  "),
+                        Span::styled(if selected { "❯ " } else { "  " }, style),
+                        Span::styled(model.name.clone(), style),
+                        Span::styled(current_marker, Style::default().fg(BORDER_BRIGHT_COLOR)),
+                    ];
+                    if selected {
+                        let used: usize = row.iter().map(|s| s.content.width()).sum();
+                        let scale = effort_scale(picker, (width as usize).saturating_sub(used + 2));
+                        let scale_width: usize = scale.iter().map(|s| s.content.width()).sum();
+                        row.push(Span::raw(" ".repeat(
+                            (width as usize).saturating_sub(used + scale_width).max(2),
+                        )));
+                        row.extend(scale);
+                    }
+                    lines.push(Line::from(row));
+                    continue;
+                }
                 lines.push(Line::from(vec![
                     Span::raw("  "),
                     Span::styled(if selected { "❯ " } else { "  " }, style),
@@ -129,6 +151,73 @@ pub(super) fn model_picker_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
+fn effort_scale(picker: &crate::app::ModelPicker, width: usize) -> Vec<Span<'static>> {
+    let levels = &picker.reasoning_options.levels;
+    if levels.is_empty() {
+        return vec![Span::styled(
+            "effort: default",
+            Style::default().fg(MUTED_TEXT_COLOR),
+        )];
+    }
+    let selected = picker.selected_effort.checked_sub(1).unwrap_or_else(|| {
+        levels
+            .iter()
+            .position(|level| {
+                Some(&level.effort) == picker.reasoning_options.default_effort.as_ref()
+            })
+            .unwrap_or(0)
+    });
+    let effort = levels[selected].effort.as_str();
+    // A restrained cool-to-warm palette, stable across models with different levels.
+    let color = match effort {
+        "minimal" => Color::Rgb(123, 148, 231),
+        "low" => Color::Rgb(105, 168, 245),
+        "medium" => Color::Rgb(91, 195, 211),
+        "high" => Color::Rgb(167, 195, 139),
+        "xhigh" => Color::Rgb(229, 190, 112),
+        "max" => Color::Rgb(235, 150, 111),
+        "ultra" => Color::Rgb(233, 113, 125),
+        _ => ACCENT_COLOR,
+    };
+    let style = Style::default().fg(color);
+    let label_width = levels
+        .iter()
+        .map(|level| level.effort.width())
+        .max()
+        .unwrap_or(0);
+    let label_style = style.add_modifier(Modifier::BOLD);
+    let left_padding = (label_width - effort.width()) / 2;
+    let label = pad_to_width(
+        &format!("{}{effort}", " ".repeat(left_padding)),
+        label_width,
+    );
+    let mut spans = vec![Span::styled(label, label_style), Span::raw("  ")];
+    let gaps = levels.len().saturating_sub(1);
+    let segment_width = if gaps == 0 {
+        2
+    } else {
+        width
+            .saturating_sub(label_width + 2 + levels.len())
+            .checked_div(gaps)
+            .unwrap_or(0)
+            .clamp(1, 3)
+    };
+    for index in 0..levels.len() {
+        if index > 0 {
+            spans.push(Span::styled("─".repeat(segment_width), style));
+        }
+        spans.push(Span::styled(
+            if index == selected { "●" } else { "○" },
+            if index == selected {
+                style.add_modifier(Modifier::BOLD)
+            } else {
+                style
+            },
+        ));
+    }
+    spans
+}
+
 fn picker_separator_line(width: u16) -> Line<'static> {
     Line::from(Span::styled(
         "─".repeat(width.max(1) as usize),
@@ -136,7 +225,7 @@ fn picker_separator_line(width: u16) -> Line<'static> {
     ))
 }
 
-fn model_picker_help_line(stage: ModelPickerStage) -> Line<'static> {
+fn model_picker_help_line(stage: ModelPickerStage, chatgpt: bool) -> Line<'static> {
     match stage {
         ModelPickerStage::Provider => Line::from(vec![
             Span::styled(
@@ -148,13 +237,19 @@ fn model_picker_help_line(stage: ModelPickerStage) -> Line<'static> {
             Span::styled("Backspace", Style::default().fg(KEY_HINT_COLOR)),
             Span::styled(" cancels.", Style::default().fg(MUTED_TEXT_COLOR)),
         ]),
-        ModelPickerStage::Model => Line::from(vec![
-            Span::styled(
-                "Choose a model for the selected provider. ",
-                Style::default().fg(MUTED_TEXT_COLOR),
-            ),
+        ModelPickerStage::Model => Line::from(Span::styled(
+            if chatgpt {
+                "↑/↓ model · → effort · Enter select · Backspace back"
+            } else {
+                "↑/↓ model · Enter select · Backspace back"
+            },
+            Style::default().fg(KEY_HINT_COLOR),
+        )),
+        ModelPickerStage::Reasoning => Line::from(vec![
+            Span::styled("←/→", Style::default().fg(KEY_HINT_COLOR)),
+            Span::styled(" choose; ", Style::default().fg(MUTED_TEXT_COLOR)),
             Span::styled("Enter", Style::default().fg(KEY_HINT_COLOR)),
-            Span::styled(" switches; ", Style::default().fg(MUTED_TEXT_COLOR)),
+            Span::styled(" saves; ", Style::default().fg(MUTED_TEXT_COLOR)),
             Span::styled("Backspace", Style::default().fg(KEY_HINT_COLOR)),
             Span::styled(" returns.", Style::default().fg(MUTED_TEXT_COLOR)),
         ]),
@@ -254,6 +349,36 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn reasoning_picker_shows_only_catalog_levels_and_keyboard_help() {
+        let mut app = App::test_empty();
+        open_model_picker(&mut app);
+        let picker = app.model_picker.as_mut().unwrap();
+        picker.stage = crate::app::ModelPickerStage::Reasoning;
+        picker.providers[picker.selected_provider].id = "chatgpt".into();
+        picker.reasoning_options = crate::configuration::ReasoningOptions {
+            default_effort: Some("medium".into()),
+            levels: vec![crate::configuration::ReasoningLevel {
+                effort: "high".into(),
+                description: "Deeper reasoning".into(),
+            }],
+        };
+        let lines = texts(&app);
+        assert!(lines.iter().any(|s| s.contains("Select Model")));
+        assert!(!lines.iter().any(|s| s.contains("ctx")));
+        assert!(
+            lines
+                .iter()
+                .any(|s| s.contains("high") && s.contains("test-model"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|s| s.contains("Enter") && s.contains("Backspace"))
+        );
+        assert!(!lines.iter().any(|s| s.contains("ultra")));
     }
 
     #[test]

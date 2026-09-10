@@ -74,6 +74,8 @@ pub struct TurnContext {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseItem {
     Message {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<crate::agent::provider::ProviderReasoning>,
         role: TranscriptRole,
         content: Vec<ContentBlock>,
         #[serde(default)]
@@ -218,6 +220,7 @@ pub struct ModelTokenTotal {
 }
 
 pub struct AssistantTranscript {
+    pub reasoning: Option<crate::agent::provider::ProviderReasoning>,
     pub content: String,
     pub provider: String,
     pub model: String,
@@ -295,6 +298,21 @@ impl TranscriptStore {
         Ok(sessions)
     }
 
+    pub fn recent_sessions(
+        sessions_root: &Path,
+        cwd: &str,
+    ) -> Result<Vec<TranscriptSessionSummary>> {
+        let mut sessions = Vec::new();
+        for (index, directory) in session_search_dirs(sessions_root, cwd).iter().enumerate() {
+            // Archives are shared; legacy workspace directory names can collide.
+            let filter = (index != 0).then_some(cwd);
+            append_matching_session_summaries(directory, &mut sessions, filter)?;
+        }
+        sessions.sort_by_key(|session| Reverse(session.last_timestamp));
+        sessions.truncate(3);
+        Ok(sessions)
+    }
+
     pub fn workspace_usage_stats(sessions_root: &Path, cwd: &str) -> Result<WorkspaceUsageStats> {
         workspace_usage_stats_in_project_dirs(&[
             transcript_project_dir(sessions_root, cwd),
@@ -346,8 +364,22 @@ impl TranscriptStore {
                 ResponseItem::Message {
                     role: TranscriptRole::Assistant,
                     content,
+                    provider,
+                    reasoning,
                     ..
                 } => {
+                    if provider.as_deref() == Some(crate::config::CHATGPT_PROVIDER_ID)
+                        && matches!(items.get(index + 1), Some(ResponseItem::FunctionCall { name, .. }) if name.starts_with("Codex "))
+                    {
+                        // Legacy App Server tools cannot execute in Glint. Keep portable text;
+                        // synthetic tool cards remain available to the UI only.
+                        let text = content_text(content);
+                        if !text.is_empty() {
+                            history.push(ModelMessage::assistant(Some(text), Vec::new()));
+                        }
+                        index += 1;
+                        continue;
+                    }
                     let start = history.len();
                     let mut tool_calls = Vec::new();
                     index += 1;
@@ -367,10 +399,13 @@ impl TranscriptStore {
                     }
 
                     let text = content_text(content);
-                    history.push(ModelMessage::assistant(
-                        (!text.is_empty()).then_some(text),
-                        tool_calls.clone(),
-                    ));
+                    history.push(
+                        ModelMessage::assistant(
+                            (!text.is_empty()).then_some(text),
+                            tool_calls.clone(),
+                        )
+                        .with_reasoning(reasoning.clone()),
+                    );
 
                     let mut pending_calls = tool_calls
                         .iter()
@@ -584,6 +619,7 @@ impl TranscriptStore {
         self.append(
             TranscriptEntryType::ResponseItem,
             TranscriptPayload::ResponseItem(ResponseItem::Message {
+                reasoning: None,
                 role: TranscriptRole::User,
                 content: vec![ContentBlock::InputText { text: content }],
                 hidden: !visible,
@@ -605,6 +641,7 @@ impl TranscriptStore {
         self.append(
             TranscriptEntryType::ResponseItem,
             TranscriptPayload::ResponseItem(ResponseItem::Message {
+                reasoning: assistant.reasoning,
                 role: TranscriptRole::Assistant,
                 content: vec![ContentBlock::OutputText {
                     text: assistant.content,
@@ -908,7 +945,7 @@ impl TranscriptStore {
     }
 }
 
-fn session_summary(path: &Path) -> Result<Option<TranscriptSessionSummary>> {
+fn session_summary(path: &Path, cwd: Option<&str>) -> Result<Option<TranscriptSessionSummary>> {
     let content = fs::read_to_string(path).context("failed to read transcript")?;
     let mut session_id = path
         .file_stem()
@@ -917,9 +954,19 @@ fn session_summary(path: &Path) -> Result<Option<TranscriptSessionSummary>> {
         .to_owned();
     let mut title = None;
     let mut last_timestamp = 0;
+    let mut matches_workspace = cwd.is_none();
 
     for line in content.lines().filter(|line| !line.trim().is_empty()) {
         let value: Value = serde_json::from_str(line).context("invalid transcript entry")?;
+        if let Some(expected) = cwd
+            && value
+                .get("payload")
+                .and_then(|payload| payload.get("cwd"))
+                .and_then(Value::as_str)
+                == Some(expected)
+        {
+            matches_workspace = true;
+        }
         last_timestamp = last_timestamp.max(entry_timestamp(&value));
         if let Some(id) = value
             .get("payload")
@@ -933,7 +980,7 @@ fn session_summary(path: &Path) -> Result<Option<TranscriptSessionSummary>> {
         }
     }
 
-    if last_timestamp == 0 {
+    if last_timestamp == 0 || !matches_workspace {
         return Ok(None);
     }
 
@@ -976,6 +1023,14 @@ fn append_session_summaries(
     directory: &Path,
     sessions: &mut Vec<TranscriptSessionSummary>,
 ) -> Result<()> {
+    append_matching_session_summaries(directory, sessions, None)
+}
+
+fn append_matching_session_summaries(
+    directory: &Path,
+    sessions: &mut Vec<TranscriptSessionSummary>,
+    cwd: Option<&str>,
+) -> Result<()> {
     if !directory.exists() {
         return Ok(());
     }
@@ -984,7 +1039,7 @@ fn append_session_summaries(
         if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
             continue;
         }
-        if let Ok(Some(summary)) = session_summary(&path) {
+        if let Ok(Some(summary)) = session_summary(&path, cwd) {
             sessions.push(summary);
         }
     }
@@ -1353,6 +1408,196 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_survives_tool_and_final_turn_reload_without_becoming_visible() {
+        use crate::agent::provider::{ProviderReasoning, ReasoningData};
+        let mut transcript = store();
+        transcript.append_user("Read a file".into()).unwrap();
+        let reasoning = ProviderReasoning {
+            provider: "deepseek".into(),
+            model: "deepseek-v4-flash".into(),
+            data: ReasoningData {
+                reasoning_content: Some("private reasoning".into()),
+                encrypted_content: Some("opaque payload".into()),
+                reasoning_details: Some(vec![
+                    serde_json::json!({"type": "reasoning.text", "text": "private detail"}),
+                ]),
+            },
+        };
+        let mut tool_turn = assistant("Inspecting.");
+        tool_turn.reasoning = Some(reasoning.clone());
+        tool_turn.tool_calls = vec![ToolCall {
+            id: "call_reasoning".into(),
+            name: "Read".into(),
+            arguments: serde_json::json!({"file_path":"hello.rs"}),
+        }];
+        tool_turn.finish_reason = FinishReason::ToolCalls;
+        transcript.append_assistant(tool_turn).unwrap();
+        transcript
+            .append_tool("call_reasoning".into(), "file contents".into(), false)
+            .unwrap();
+        let mut final_turn = assistant("Done.");
+        final_turn.reasoning = Some(reasoning.clone());
+        transcript.append_assistant(final_turn).unwrap();
+        transcript.append_user("Now continue".into()).unwrap();
+        let restored = TranscriptStore::load_path(transcript.path.clone()).unwrap();
+        let history = restored.model_history();
+        assert_eq!(history.len(), 5);
+        assert_eq!(history[1].reasoning.as_ref(), Some(&reasoning));
+        assert_eq!(history[3].reasoning.as_ref(), Some(&reasoning));
+        assert_eq!(history[3].content.as_deref(), Some("Done."));
+        assert!(
+            restored
+                .ui_messages()
+                .iter()
+                .all(|message| !message.content.contains("private")
+                    && !message.content.contains("opaque"))
+        );
+        transcript.delete_current().unwrap();
+    }
+
+    #[test]
+    fn legacy_assistant_without_reasoning_loads_and_omits_empty_metadata() {
+        let mut transcript = store();
+        transcript
+            .append_assistant(assistant("Legacy answer"))
+            .unwrap();
+        let raw = std::fs::read_to_string(&transcript.path).unwrap();
+        assert!(!raw.contains("reasoning"));
+        let restored = TranscriptStore::load_path(transcript.path.clone()).unwrap();
+        assert_eq!(restored.model_history()[0].reasoning, None);
+        assert_eq!(
+            restored.model_history()[0].content.as_deref(),
+            Some("Legacy answer")
+        );
+        transcript.delete_current().unwrap();
+    }
+
+    #[test]
+    fn native_chatgpt_tool_history_survives_reload() {
+        let mut transcript = store();
+        transcript.append_user("Read the file".into()).unwrap();
+        let call = ToolCall {
+            id: "call_native".into(),
+            name: "Read".into(),
+            arguments: serde_json::json!({"file_path":"hello.rs"}),
+        };
+        transcript
+            .append_assistant(AssistantTranscript {
+                reasoning: None,
+                provider: crate::config::CHATGPT_PROVIDER_ID.into(),
+                model: "model".into(),
+                content: "Inspecting.".into(),
+                tool_calls: vec![call.clone()],
+                usage: None,
+                finish_reason: FinishReason::ToolCalls,
+                error: None,
+            })
+            .unwrap();
+        transcript
+            .append_tool(call.id.clone(), "file contents".into(), false)
+            .unwrap();
+        let restored = TranscriptStore::load_path(transcript.path.clone()).unwrap();
+        let history = restored.model_history();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[1].tool_calls, vec![call]);
+        assert_eq!(history[2].tool_call_id.as_deref(), Some("call_native"));
+        assert_eq!(history[2].content.as_deref(), Some("file contents"));
+        transcript.delete_current().unwrap();
+    }
+
+    #[test]
+    fn codex_parallel_tools_preserve_text_without_api_tool_invocations() {
+        let mut transcript = store();
+        transcript.append_user("inspect both files".into()).unwrap();
+        for (id, content) in [
+            ("one", "Checking the first file."),
+            ("two", "Checking the second file."),
+        ] {
+            transcript
+                .append_assistant(AssistantTranscript {
+                    reasoning: None,
+                    provider: crate::config::CHATGPT_PROVIDER_ID.into(),
+                    model: "codex-model".into(),
+                    content: content.into(),
+                    tool_calls: vec![ToolCall {
+                        id: id.into(),
+                        name: "Codex command execution".into(),
+                        arguments: serde_json::json!({"command": "cat file"}),
+                    }],
+                    usage: None,
+                    finish_reason: FinishReason::ToolCalls,
+                    error: None,
+                })
+                .unwrap();
+        }
+        transcript
+            .append_tool("two".into(), "second result".into(), false)
+            .unwrap();
+        transcript
+            .append_tool("one".into(), "first result".into(), false)
+            .unwrap();
+        transcript
+            .append_assistant(AssistantTranscript {
+                reasoning: None,
+                provider: crate::config::CHATGPT_PROVIDER_ID.into(),
+                model: "codex-model".into(),
+                content: "Both files are correct.".into(),
+                tool_calls: Vec::new(),
+                usage: None,
+                finish_reason: FinishReason::Stop,
+                error: None,
+            })
+            .unwrap();
+        transcript
+            .append_user("Continue with API mode".into())
+            .unwrap();
+        let history = transcript.model_history();
+        assert_eq!(history.len(), 5);
+        assert_eq!(
+            history
+                .iter()
+                .filter_map(|message| message.content.as_deref())
+                .collect::<Vec<_>>(),
+            [
+                "inspect both files",
+                "Checking the first file.",
+                "Checking the second file.",
+                "Both files are correct.",
+                "Continue with API mode"
+            ]
+        );
+        assert!(
+            history
+                .iter()
+                .all(|message| message.tool_calls.is_empty() && message.tool_call_id.is_none())
+        );
+        let ui = transcript.ui_messages();
+        assert_eq!(ui.iter().filter(|message| message.tool_finished).count(), 2);
+        transcript.delete_current().unwrap();
+    }
+
+    #[test]
+    fn codex_sidecars_follow_session_archive_and_delete() {
+        let root = std::env::temp_dir().join(format!("glint-codex-artifacts-{}", new_id()));
+        let mut store = TranscriptStore::create_new(&root, "/work").unwrap();
+        store.append_user("hello".into()).unwrap();
+        let sidecar = store.session_dir().join("codex-thread-0.json");
+        fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        fs::write(&sidecar, "thread-id").unwrap();
+        let archived_path = root.join("archive").join(store.path.file_name().unwrap());
+        store.archive_current(&root).unwrap();
+        assert!(!sidecar.exists());
+        let archived = TranscriptStore::load_path(archived_path).unwrap();
+        assert_eq!(
+            fs::read_to_string(archived.session_dir().join("codex-thread-0.json")).unwrap(),
+            "thread-id"
+        );
+        archived.delete_current().unwrap();
+        assert!(!archived.session_dir().join("codex-thread-0.json").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn completed_subagent_snapshot_restores_ui_without_model_history() {
         let mut store = store();
         let snapshot = completed_snapshot("a1", "call-subagent");
@@ -1387,6 +1632,7 @@ mod tests {
 
     fn assistant(content: &str) -> AssistantTranscript {
         AssistantTranscript {
+            reasoning: None,
             content: content.to_owned(),
             provider: "test".to_owned(),
             model: "test-model".to_owned(),
@@ -1395,6 +1641,57 @@ mod tests {
             finish_reason: FinishReason::Stop,
             error: None,
         }
+    }
+
+    #[test]
+    fn recent_sessions_are_limited_sorted_and_exclude_other_workspaces_archives() {
+        let root = std::env::temp_dir().join(format!("glint-recent-{}", new_id()));
+        let sessions_root = root.join("sessions");
+        for index in 0..5 {
+            let mut store = TranscriptStore::create_new(&sessions_root, "/work/current").unwrap();
+            store
+                .start_turn("/work/current".into(), "test".into(), "model".into())
+                .unwrap();
+            store.append_user(format!("conversation {index}")).unwrap();
+            let content = fs::read_to_string(&store.path)
+                .unwrap()
+                .lines()
+                .map(|line| {
+                    let mut value: Value = serde_json::from_str(line).unwrap();
+                    value["timestamp"] = serde_json::json!(100 + index);
+                    serde_json::to_string(&value).unwrap()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            fs::write(&store.path, content).unwrap();
+            if index == 4 {
+                store.archive_current(&sessions_root).unwrap();
+            }
+        }
+        let mut other = TranscriptStore::create_new(&sessions_root, "/work/other").unwrap();
+        other
+            .start_turn("/work/other".into(), "test".into(), "model".into())
+            .unwrap();
+        other.append_user("other workspace".into()).unwrap();
+        other.archive_current(&sessions_root).unwrap();
+        let legacy = legacy_project_dir(&sessions_root, "/work-current");
+        assert_eq!(legacy, legacy_project_dir(&sessions_root, "/work/current"));
+        let mut collision = TranscriptStore::create_new_in_project_dir(legacy).unwrap();
+        collision
+            .start_turn("/work-current".into(), "test".into(), "model".into())
+            .unwrap();
+        collision
+            .append_user("unrelated legacy conversation".into())
+            .unwrap();
+        let sessions = TranscriptStore::recent_sessions(&sessions_root, "/work/current").unwrap();
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|s| s.title.as_str())
+                .collect::<Vec<_>>(),
+            ["conversation 4", "conversation 3", "conversation 2"]
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1578,6 +1875,7 @@ mod tests {
             .expect("append user");
         store
             .append_assistant(AssistantTranscript {
+                reasoning: None,
                 content: String::new(),
                 provider: "provider".to_owned(),
                 model: "model".to_owned(),
@@ -1611,6 +1909,7 @@ mod tests {
         let mut transcript = store();
         transcript
             .append_assistant(AssistantTranscript {
+                reasoning: None,
                 content: String::new(),
                 provider: "provider".to_owned(),
                 model: "model".to_owned(),

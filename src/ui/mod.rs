@@ -38,7 +38,6 @@ use crate::event::{ExtensionMouseAction, MouseAction};
 use crate::execution::{ExecutionHitbox, ExecutionId, ExecutionRegion, MAX_EXPANDED_OUTPUT_ROWS};
 use crate::message::{Message, Role};
 
-use layout::box_top;
 use theme::{ACCENT_COLOR, BG_COLOR};
 
 const PROGRESS_ANIMATION_FRAME_MS: u128 = 180;
@@ -57,7 +56,11 @@ pub fn extension_mouse_action(
     width: u16,
     height: u16,
 ) -> Option<ExtensionMouseAction> {
-    if let Some(picker) = &app.resume_picker {
+    if let Some(state) = &app.model_setup {
+        Some(ExtensionMouseAction::Setup(setup::mouse_action(
+            state, mouse, width, height,
+        )))
+    } else if let Some(picker) = &app.resume_picker {
         Some(ExtensionMouseAction::Resume(resume::mouse_action(
             picker, mouse, width, height,
         )))
@@ -551,7 +554,7 @@ fn composer(app: &App, width: u16) -> Composer {
     let input_body_y = input_y + 1;
     let input_body_rows = input_rows.len() as u16;
     let input_content_width = input_view::input_content_width(width) as u16;
-    lines.push(box_top("COMPOSER", width));
+    lines.push(layout::box_top_spans(Vec::new(), width));
     lines.extend(
         input_rows
             .into_iter()
@@ -1431,7 +1434,7 @@ mod tests {
             .expect("slash command row");
         let composer_row = texts
             .iter()
-            .position(|line| line.contains(" COMPOSER "))
+            .position(|line| line.starts_with("╭──"))
             .expect("composer row");
         let status_row = texts
             .iter()
@@ -1474,7 +1477,7 @@ mod tests {
             .expect("slash command row");
         let composer_row = texts
             .iter()
-            .position(|line| line.contains(" COMPOSER "))
+            .position(|line| line.starts_with("╭──"))
             .expect("composer row");
 
         assert!(progress_row < slash_row);
@@ -1505,7 +1508,7 @@ mod tests {
             .expect("subagent task row");
         let composer_row = texts
             .iter()
-            .position(|line| line.contains(" COMPOSER "))
+            .position(|line| line.starts_with("╭──"))
             .expect("composer row");
 
         assert!(tasks_row < composer_row);
@@ -1520,6 +1523,8 @@ mod tests {
             stage: ModelPickerStage::Provider,
             selected_provider: 0,
             selected_model: 0,
+            selected_effort: 0,
+            reasoning_options: Default::default(),
             providers,
             error: None,
         });
@@ -1544,7 +1549,7 @@ mod tests {
             .expect("provider row");
         let composer_row = texts
             .iter()
-            .position(|line| line.contains(" COMPOSER "))
+            .position(|line| line.starts_with("╭──"))
             .expect("composer row");
         let status_row = texts
             .iter()
@@ -1564,7 +1569,7 @@ mod tests {
         let texts = lines.iter().map(line_text).collect::<Vec<_>>();
         let composer_row = texts
             .iter()
-            .position(|line| line.contains(" COMPOSER "))
+            .position(|line| line.starts_with("╭──"))
             .expect("composer row");
         let input_bottom_row = texts
             .iter()
@@ -1722,6 +1727,24 @@ mod tests {
     }
 
     #[test]
+    fn model_setup_mouse_routes_before_underlying_chat_views() {
+        let mut app = App::test_empty();
+        app.model_setup = Some(crate::setup::SetupState::custom_provider(
+            app.provider_catalog.clone(),
+        ));
+        let action =
+            extension_mouse_action(&app, MouseAction::LeftDown { column: 30, row: 3 }, 100, 30)
+                .unwrap();
+        app.update(crate::event::AppEvent::ExtensionMouse(action));
+        let state = app.model_setup.as_mut().unwrap();
+        assert_eq!(
+            state.custom_form_mut().unwrap().focus,
+            crate::setup::CustomFocus::BaseUrl
+        );
+        assert!(app.input.value.is_empty());
+    }
+
+    #[test]
     fn model_setup_replaces_the_entire_chat_view() {
         let mut app = App::test_empty();
         app.messages.push(Message::assistant("CHAT SENTINEL"));
@@ -1735,7 +1758,7 @@ mod tests {
             .expect("render setup");
         let contents = buffer_rows(&terminal).join("\n");
 
-        assert!(contents.contains("WELCOME"));
+        assert!(contents.contains("Welcome to Glint"));
         assert!(contents.contains("Add a model to begin chatting."));
         assert!(!contents.contains("CHAT SENTINEL"));
         assert!(!contents.contains("COMPOSER"));

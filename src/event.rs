@@ -11,6 +11,7 @@ pub enum AppEvent {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExtensionMouseAction {
+    Setup(crate::setup::SetupMouseAction),
     Resume(ResumeMouseAction),
     Mcp(McpMouseAction),
     Plugins(PluginsMouseAction),

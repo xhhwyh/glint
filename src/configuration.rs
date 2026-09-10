@@ -1,3 +1,6 @@
+#[cfg(test)]
+pub use crate::chatgpt::ReasoningLevel;
+pub use crate::chatgpt::ReasoningOptions;
 use std::{
     collections::HashSet,
     error::Error,
@@ -9,9 +12,9 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::{
     config::{
-        Config, CustomProviderConfig, DEFAULT_SYSTEM_PROMPT, LlmConfig, LlmProviderConfig,
-        ModelCatalog, ModelCatalogEntry, ProviderCatalogEntry, RuntimeExtensions, UserConfig,
-        UserLlmConfig,
+        CHATGPT_PROVIDER_ID, CHATGPT_PROVIDER_NAME, ChatGptConfig, Config, CustomProviderConfig,
+        DEFAULT_SYSTEM_PROMPT, LlmConfig, LlmProviderConfig, ModelCatalog, ModelCatalogEntry,
+        ProviderCatalogEntry, RuntimeExtensions, UserConfig, UserLlmConfig,
     },
     credentials::{CredentialId, CredentialStore, CredentialStoreStatus, open_credential_store},
     paths::GlintPaths,
@@ -350,16 +353,97 @@ impl ConfigurationManager {
                 selection.provider
             );
         }
-        let api_key = required_credential(self.credentials.as_ref(), &credential_id(provider))?;
+        let api_key = provider_api_key(self.credentials.as_ref(), provider)?;
         let model_catalog = runtime_model_catalog(&self.catalog, &providers);
-        let llm = llm_from_available(
+        let mut llm = llm_from_available(
             &self.user,
             providers,
             &selection.provider,
             &selection.model,
             api_key,
         )?;
+        llm.reasoning_effort =
+            self.saved_model_reasoning_effort(&selection.provider, &selection.model);
         Ok(ModelRuntimeConfig { llm, model_catalog })
+    }
+
+    pub fn save_chatgpt(
+        &mut self,
+        models: Vec<String>,
+        default_model: Option<String>,
+    ) -> ConfigurationMutationResult<()> {
+        validate_chatgpt_models(&models)?;
+        let mut staged = self.user.clone();
+        let reasoning_efforts = staged
+            .chatgpt
+            .as_ref()
+            .map(|config| {
+                config
+                    .reasoning_efforts
+                    .iter()
+                    .filter(|(model, effort)| {
+                        models.contains(model)
+                            && self
+                                .reasoning_options(model)
+                                .levels
+                                .iter()
+                                .any(|level| &level.effort == *effort)
+                    })
+                    .map(|(model, effort)| (model.clone(), effort.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        staged.chatgpt = Some(ChatGptConfig {
+            models,
+            reasoning_efforts,
+        });
+        let selection_valid = staged.llm.as_ref().is_some_and(|selection| {
+            selection.provider != CHATGPT_PROVIDER_ID
+                || staged
+                    .chatgpt
+                    .as_ref()
+                    .is_some_and(|config| config.models.contains(&selection.model))
+        });
+        if !selection_valid {
+            let config = staged.chatgpt.as_ref().expect("staged above");
+            let model = default_model
+                .filter(|model| config.models.contains(model))
+                .unwrap_or_else(|| config.models[0].clone());
+            let (temperature, max_tokens) = staged
+                .llm
+                .as_ref()
+                .map(|selection| (selection.temperature, selection.max_tokens))
+                .unwrap_or((DEFAULT_TEMPERATURE, DEFAULT_MAX_TOKENS));
+            staged.llm = Some(UserLlmConfig {
+                provider: CHATGPT_PROVIDER_ID.into(),
+                model,
+                temperature,
+                max_tokens,
+            });
+        }
+        self.persist_chatgpt_change(staged)
+    }
+
+    fn persist_chatgpt_change(
+        &mut self,
+        mut staged: UserConfig,
+    ) -> ConfigurationMutationResult<()> {
+        repair_selection_in(&self.catalog, self.credentials.as_ref(), &mut staged).map_err(
+            |error| {
+                ConfigurationMutationError::with_source(
+                    ConfigurationMutationErrorKind::CredentialUnavailable,
+                    error,
+                )
+            },
+        )?;
+        self.repository.save(&staged).map_err(|error| {
+            ConfigurationMutationError::with_source(
+                ConfigurationMutationErrorKind::Persistence,
+                error,
+            )
+        })?;
+        self.user = staged;
+        Ok(())
     }
 
     pub fn save_builtin(
@@ -409,9 +493,11 @@ impl ConfigurationManager {
                 ConfigurationMutationErrorKind::ProviderNameRequired,
             ));
         }
-        if self.catalog.providers().iter().any(|provider| {
-            provider.id.eq_ignore_ascii_case(name) || provider.name.eq_ignore_ascii_case(name)
-        }) {
+        if reserved_chatgpt_name(name)
+            || self.catalog.providers().iter().any(|provider| {
+                provider.id.eq_ignore_ascii_case(name) || provider.name.eq_ignore_ascii_case(name)
+            })
+        {
             return Err(ConfigurationMutationError::new(
                 ConfigurationMutationErrorKind::ProviderNameCollision,
             ));
@@ -451,6 +537,15 @@ impl ConfigurationManager {
     }
 
     pub fn delete_provider(&mut self, provider_id: &str) -> ConfigurationMutationResult<()> {
+        if provider_id == CHATGPT_PROVIDER_ID {
+            let mut staged = self.user.clone();
+            if staged.chatgpt.take().is_none() {
+                return Err(ConfigurationMutationError::new(
+                    ConfigurationMutationErrorKind::ProviderNotConfigured,
+                ));
+            }
+            return self.persist_chatgpt_change(staged);
+        }
         let (credential_id, mut staged) = if self.catalog.builtin(provider_id).is_some() {
             let mut staged = self.user.clone();
             let original_len = staged.configured_providers.len();
@@ -473,6 +568,7 @@ impl ConfigurationManager {
             ));
         };
 
+        staged.reasoning_efforts.remove(provider_id);
         let old_credential = self.credentials.get(&credential_id).map_err(|error| {
             ConfigurationMutationError::with_source(
                 ConfigurationMutationErrorKind::CredentialUnavailable,
@@ -513,7 +609,87 @@ impl ConfigurationManager {
         Ok(())
     }
 
+    pub fn model_reasoning_options(&self, provider: &str, model: &str) -> ReasoningOptions {
+        if provider == CHATGPT_PROVIDER_ID {
+            self.reasoning_options(model)
+        } else {
+            crate::reasoning::options(provider, model)
+        }
+    }
+
+    pub fn saved_model_reasoning_effort(&self, provider: &str, model: &str) -> Option<String> {
+        if provider == CHATGPT_PROVIDER_ID {
+            return self.saved_reasoning_effort(model);
+        }
+        let effort = self.user.reasoning_efforts.get(provider)?.get(model)?;
+        self.model_reasoning_options(provider, model)
+            .levels
+            .iter()
+            .any(|level| &level.effort == effort)
+            .then(|| effort.clone())
+    }
+
+    pub fn select_model_with_reasoning(
+        &mut self,
+        provider: &str,
+        model: &str,
+        effort: Option<&str>,
+    ) -> Result<ModelRuntimeConfig> {
+        if provider == CHATGPT_PROVIDER_ID {
+            return self.select_chatgpt_model_with_effort(model, effort);
+        }
+        if let Some(effort) = effort {
+            anyhow::ensure!(
+                self.model_reasoning_options(provider, model)
+                    .levels
+                    .iter()
+                    .any(|level| level.effort == effort),
+                "reasoning effort '{effort}' is not supported for {provider}/{model}"
+            );
+        }
+        self.select_model_with_effort(provider, model, Some(effort))
+    }
+
+    pub fn reasoning_options(&self, model: &str) -> ReasoningOptions {
+        crate::chatgpt::cached_reasoning_options(self.paths.root(), model)
+    }
+    pub fn saved_reasoning_effort(&self, model: &str) -> Option<String> {
+        let config = self.user.chatgpt.as_ref()?;
+        if !config.models.iter().any(|candidate| candidate == model) {
+            return None;
+        }
+        let effort = config.reasoning_efforts.get(model)?;
+        self.reasoning_options(model)
+            .levels
+            .iter()
+            .any(|level| &level.effort == effort)
+            .then(|| effort.clone())
+    }
+    pub fn select_chatgpt_model_with_effort(
+        &mut self,
+        model: &str,
+        effort: Option<&str>,
+    ) -> Result<ModelRuntimeConfig> {
+        if let Some(effort) = effort
+            && !self
+                .reasoning_options(model)
+                .levels
+                .iter()
+                .any(|level| level.effort == effort)
+        {
+            bail!("reasoning effort '{effort}' is not supported for ChatGPT model '{model}'");
+        }
+        self.select_model_with_effort(CHATGPT_PROVIDER_ID, model, Some(effort))
+    }
     pub fn select_model(&mut self, provider_id: &str, model: &str) -> Result<ModelRuntimeConfig> {
+        self.select_model_with_effort(provider_id, model, None)
+    }
+    fn select_model_with_effort(
+        &mut self,
+        provider_id: &str,
+        model: &str,
+        effort: Option<Option<&str>>,
+    ) -> Result<ModelRuntimeConfig> {
         let providers = self.available_providers()?;
         let provider = providers
             .iter()
@@ -526,8 +702,7 @@ impl ConfigurationManager {
         {
             bail!("model '{model}' is not defined for provider '{provider_id}'");
         }
-        let credential_id = credential_id(provider);
-        let api_key = required_credential(self.credentials.as_ref(), &credential_id)?;
+        let api_key = provider_api_key(self.credentials.as_ref(), provider)?;
         let mut staged = self.user.clone();
         let (temperature, max_tokens) = staged
             .llm
@@ -540,10 +715,36 @@ impl ConfigurationManager {
             temperature,
             max_tokens,
         });
+        let selected_effort = effort
+            .map(|effort| effort.map(str::to_owned))
+            .unwrap_or_else(|| self.saved_model_reasoning_effort(provider_id, model));
+        if provider_id == CHATGPT_PROVIDER_ID {
+            if let Some(chatgpt) = staged.chatgpt.as_mut() {
+                if let Some(effort) = &selected_effort {
+                    chatgpt
+                        .reasoning_efforts
+                        .insert(model.to_owned(), effort.clone());
+                } else {
+                    chatgpt.reasoning_efforts.remove(model);
+                }
+            }
+        } else if let Some(effort) = &selected_effort {
+            staged
+                .reasoning_efforts
+                .entry(provider_id.to_owned())
+                .or_default()
+                .insert(model.to_owned(), effort.clone());
+        } else if let Some(models) = staged.reasoning_efforts.get_mut(provider_id) {
+            models.remove(model);
+            if models.is_empty() {
+                staged.reasoning_efforts.remove(provider_id);
+            }
+        }
         let model_catalog = runtime_model_catalog(&self.catalog, &providers);
         let mut llm = llm_from_available(&staged, providers, provider_id, model, api_key)?;
         let selected_api_key = llm.api_key.clone();
         llm.switch_model(provider_id, model, Some(selected_api_key))?;
+        llm.reasoning_effort = selected_effort;
         self.repository.save(&staged)?;
         self.user = staged;
         Ok(ModelRuntimeConfig { llm, model_catalog })
@@ -641,6 +842,9 @@ fn validate_loaded_user(user: &UserConfig, catalog: &ProviderCatalog) -> Result<
     if user.version != 1 {
         bail!("unsupported configuration version {}", user.version);
     }
+    if let Some(chatgpt) = &user.chatgpt {
+        validate_chatgpt_models(&chatgpt.models).context("invalid ChatGPT models")?;
+    }
     validate_persisted_custom_providers(user, catalog)
 }
 
@@ -653,9 +857,11 @@ fn validate_persisted_custom_providers(user: &UserConfig, catalog: &ProviderCata
         if name.trim() != name {
             bail!("custom provider name '{name}' must not have surrounding whitespace");
         }
-        if catalog.providers().iter().any(|builtin| {
-            builtin.id.eq_ignore_ascii_case(name) || builtin.name.eq_ignore_ascii_case(name)
-        }) {
+        if reserved_chatgpt_name(name)
+            || catalog.providers().iter().any(|builtin| {
+                builtin.id.eq_ignore_ascii_case(name) || builtin.name.eq_ignore_ascii_case(name)
+            })
+        {
             bail!("custom provider '{name}' collides with a built-in provider");
         }
         if !custom_names.insert(name.to_ascii_lowercase()) {
@@ -791,6 +997,7 @@ fn llm_from_available(
         })
         .collect();
     Ok(LlmConfig {
+        reasoning_effort: None,
         provider: selected_provider.to_owned(),
         base_url,
         model: selected_model.to_owned(),
@@ -809,6 +1016,43 @@ fn credential_id(provider: &AvailableProvider) -> CredentialId {
         CredentialId::custom(&provider.id)
     } else {
         CredentialId::builtin(&provider.id)
+    }
+}
+
+fn reserved_chatgpt_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case(CHATGPT_PROVIDER_ID) || name.eq_ignore_ascii_case("ChatGPT (Codex)")
+}
+
+fn validate_chatgpt_models(models: &[String]) -> ConfigurationMutationResult<()> {
+    if models.is_empty()
+        || models.iter().any(|model| {
+            model.is_empty()
+                || model.trim() != model
+                || model.chars().any(char::is_whitespace)
+                || model.chars().any(char::is_control)
+        })
+    {
+        return Err(ConfigurationMutationError::new(
+            ConfigurationMutationErrorKind::ModelRequired,
+        ));
+    }
+    let mut seen = HashSet::new();
+    if models.iter().any(|model| !seen.insert(model)) {
+        return Err(ConfigurationMutationError::new(
+            ConfigurationMutationErrorKind::DuplicateModel,
+        ));
+    }
+    Ok(())
+}
+
+fn provider_api_key(
+    credentials: &dyn CredentialStore,
+    provider: &AvailableProvider,
+) -> Result<String> {
+    if provider.id == CHATGPT_PROVIDER_ID {
+        Ok(String::new())
+    } else {
+        required_credential(credentials, &credential_id(provider))
     }
 }
 
@@ -963,6 +1207,27 @@ fn available_providers(
             continue;
         }
         providers.push(custom_available_provider(name, provider));
+    }
+    if let Some(chatgpt) = &user.chatgpt {
+        providers.push(AvailableProvider {
+            id: CHATGPT_PROVIDER_ID.into(),
+            display_name: CHATGPT_PROVIDER_NAME.into(),
+            description: "Use your ChatGPT subscription with Glint".into(),
+            base_url: String::new(),
+            models: chatgpt
+                .models
+                .iter()
+                .map(|name| AvailableModel {
+                    name: name.clone(),
+                    metadata: ModelMetadata {
+                        context: crate::chatgpt::cached_context_window(name),
+                        ..ModelMetadata::default()
+                    },
+                })
+                .collect(),
+            prompt_cache: PromptCacheConfig::default(),
+            custom: false,
+        });
     }
     Ok(providers)
 }
@@ -1986,6 +2251,373 @@ mod tests {
             repository.load().unwrap().unwrap().configured_providers,
             ["deepseek"]
         );
+    }
+
+    #[test]
+    fn builtin_reasoning_persists_and_never_leaks_between_models() {
+        let mut fixture = ManagerFixture::new();
+        fixture.enable_builtin("deepseek", "secret");
+        fixture.enable_builtin("zhipu", "secret");
+        let mut manager = fixture.manager();
+        manager
+            .select_model_with_reasoning("deepseek", "deepseek-v4-pro", Some("max"))
+            .unwrap();
+        assert_eq!(
+            manager
+                .build_model_runtime()
+                .unwrap()
+                .llm
+                .reasoning_effort
+                .as_deref(),
+            Some("max")
+        );
+        let persisted = fixture.repository.load().unwrap().unwrap();
+        assert_eq!(
+            persisted.reasoning_efforts["deepseek"]["deepseek-v4-pro"],
+            "max"
+        );
+        let yaml = serde_yaml::to_string(&persisted).unwrap();
+        assert_eq!(
+            serde_yaml::from_str::<UserConfig>(&yaml).unwrap(),
+            persisted
+        );
+        manager
+            .select_model("deepseek", "deepseek-v4-flash")
+            .unwrap();
+        assert!(
+            manager
+                .build_model_runtime()
+                .unwrap()
+                .llm
+                .reasoning_effort
+                .is_none()
+        );
+        manager.select_model("deepseek", "deepseek-v4-pro").unwrap();
+        assert_eq!(
+            manager
+                .build_model_runtime()
+                .unwrap()
+                .llm
+                .reasoning_effort
+                .as_deref(),
+            Some("max")
+        );
+        let before = manager.user_config().clone();
+        assert!(
+            manager
+                .select_model_with_reasoning("zhipu", "glm-5.1", Some("high"))
+                .is_err()
+        );
+        assert!(
+            manager
+                .select_model_with_reasoning("deepseek", "deepseek-v4-pro", Some("ultra"))
+                .is_err()
+        );
+        assert_eq!(manager.user_config(), &before);
+        manager
+            .select_model_with_reasoning("deepseek", "deepseek-v4-pro", None)
+            .unwrap();
+        assert!(manager.user_config().reasoning_efforts.is_empty());
+    }
+
+    #[test]
+    fn chatgpt_reasoning_persists_per_model_and_isolates_api_runtime() {
+        let mut fixture = ManagerFixture::new();
+        fixture.user.configured_providers.push("deepseek".into());
+        fixture.credentials.insert("builtin:deepseek", "key");
+        let mut manager = fixture.manager();
+        let home = std::env::temp_dir().join(format!("glint-reasoning-{}", uuid::Uuid::new_v4()));
+        manager.paths = GlintPaths::from_home(&home);
+        std::fs::create_dir_all(manager.paths.root()).unwrap();
+        std::fs::write(manager.paths.root().join("chatgpt-models.json"), r#"{"models":[{"slug":"one","default_reasoning_level":"medium","supported_reasoning_levels":[{"effort":"medium","description":"Balanced"},{"effort":"ultra","description":"Most"}]},{"slug":"two","supported_reasoning_levels":[{"effort":"max","description":"Maximum"}]}]}"#).unwrap();
+        manager
+            .save_chatgpt(vec!["one".into(), "two".into()], None)
+            .unwrap();
+        assert_eq!(
+            manager.reasoning_options("one").default_effort.as_deref(),
+            Some("medium")
+        );
+        let runtime = manager
+            .select_chatgpt_model_with_effort("one", Some("ultra"))
+            .unwrap();
+        assert_eq!(runtime.llm.reasoning_effort.as_deref(), Some("ultra"));
+        assert_eq!(
+            manager.saved_reasoning_effort("one").as_deref(),
+            Some("ultra")
+        );
+        assert_eq!(
+            fixture
+                .repository
+                .load()
+                .unwrap()
+                .unwrap()
+                .chatgpt
+                .unwrap()
+                .reasoning_efforts
+                .get("one")
+                .map(String::as_str),
+            Some("ultra")
+        );
+        assert!(
+            manager
+                .select_chatgpt_model_with_effort("two", Some("ultra"))
+                .is_err()
+        );
+        assert!(
+            manager
+                .select_model("deepseek", "deepseek-v4-flash")
+                .unwrap()
+                .llm
+                .reasoning_effort
+                .is_none()
+        );
+        assert_eq!(
+            manager
+                .select_model("chatgpt", "one")
+                .unwrap()
+                .llm
+                .reasoning_effort
+                .as_deref(),
+            Some("ultra")
+        );
+        let before = manager.user.clone();
+        fixture.repository.fail_saves();
+        assert!(
+            manager
+                .select_chatgpt_model_with_effort("one", None)
+                .is_err()
+        );
+        assert_eq!(manager.user, before);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn chatgpt_reasoning_default_reset_and_catalog_refresh_prune_preferences() {
+        let fixture = ManagerFixture::new();
+        let mut manager = fixture.manager();
+        let home =
+            std::env::temp_dir().join(format!("glint-effort-reset-{}", uuid::Uuid::new_v4()));
+        manager.paths = GlintPaths::from_home(&home);
+        std::fs::create_dir_all(manager.paths.root().join("codex")).unwrap();
+        let cache = manager.paths.root().join("codex/models_cache.json");
+        std::fs::write(&cache,r#"{"models":[{"slug":"one","default_reasoning_level":"max","supported_reasoning_levels":[{"effort":"max","description":"More"}]},{"slug":"two","supported_reasoning_levels":[{"effort":"ultra","description":"Most"}]}]}"#).unwrap();
+        manager
+            .save_chatgpt(vec!["one".into(), "two".into()], None)
+            .unwrap();
+        manager
+            .select_chatgpt_model_with_effort("one", Some("max"))
+            .unwrap();
+        assert_eq!(
+            manager
+                .build_model_runtime()
+                .unwrap()
+                .llm
+                .reasoning_effort
+                .as_deref(),
+            Some("max")
+        );
+        manager
+            .select_chatgpt_model_with_effort("two", Some("ultra"))
+            .unwrap();
+        let runtime = manager
+            .select_chatgpt_model_with_effort("two", None)
+            .unwrap();
+        assert!(runtime.llm.reasoning_effort.is_none());
+        assert!(manager.saved_reasoning_effort("two").is_none());
+        manager
+            .select_chatgpt_model_with_effort("two", Some("ultra"))
+            .unwrap();
+        std::fs::write(manager.paths.root().join("chatgpt-models.json"),r#"{"models":[{"slug":"one","supported_reasoning_levels":[{"effort":"low","description":"Less"}]}]}"#).unwrap();
+        assert!(manager.saved_reasoning_effort("one").is_none());
+        manager.save_chatgpt(vec!["one".into()], None).unwrap();
+        assert!(
+            manager
+                .user
+                .chatgpt
+                .as_ref()
+                .unwrap()
+                .reasoning_efforts
+                .is_empty()
+        );
+        assert!(
+            manager
+                .build_model_runtime()
+                .unwrap()
+                .llm
+                .reasoning_effort
+                .is_none()
+        );
+        assert!(
+            !serde_yaml::to_string(&manager.user)
+                .unwrap()
+                .contains("reasoning_efforts")
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn chatgpt_selection_needs_no_api_credentials_and_preserves_api_choice() {
+        let fixture = ManagerFixture::new();
+        let mut manager = fixture.manager();
+        manager
+            .save_chatgpt(
+                vec!["first".into(), "preferred".into()],
+                Some("preferred".into()),
+            )
+            .unwrap();
+        let runtime = manager.build_model_runtime().unwrap();
+        assert_eq!(runtime.llm.provider, "chatgpt");
+        assert_eq!(runtime.llm.model, "preferred");
+        assert!(runtime.llm.api_key.is_empty());
+        assert!(runtime.llm.base_url.is_empty());
+        manager.select_model("chatgpt", "first").unwrap();
+        manager.save_builtin("deepseek", Some("secret")).unwrap();
+        assert_eq!(manager.user.llm.as_ref().unwrap().provider, "chatgpt");
+        manager
+            .select_model("deepseek", "deepseek-v4-flash")
+            .unwrap();
+        manager.save_chatgpt(vec!["second".into()], None).unwrap();
+        assert_eq!(manager.user.llm.as_ref().unwrap().provider, "deepseek");
+        manager.delete_provider("deepseek").unwrap();
+        assert_eq!(manager.user.llm.as_ref().unwrap().model, "second");
+        manager.delete_provider("chatgpt").unwrap();
+        assert!(manager.user.llm.is_none());
+        assert!(manager.user.chatgpt.is_none());
+    }
+
+    #[test]
+    fn chatgpt_refresh_preserves_selection_and_removal_falls_back_to_api() {
+        let mut fixture = ManagerFixture::new();
+        fixture.enable_builtin("deepseek", "secret");
+        let mut manager = fixture.manager();
+        manager.repair_selection().unwrap();
+        manager
+            .save_chatgpt(vec!["one".into(), "two".into()], Some("two".into()))
+            .unwrap();
+        assert_eq!(manager.user.llm.as_ref().unwrap().provider, "deepseek");
+        manager.select_model("chatgpt", "one").unwrap();
+        manager
+            .save_chatgpt(vec!["one".into(), "two".into()], Some("two".into()))
+            .unwrap();
+        assert_eq!(manager.user.llm.as_ref().unwrap().model, "one");
+        manager
+            .save_chatgpt(vec!["three".into(), "four".into()], Some("four".into()))
+            .unwrap();
+        assert_eq!(manager.user.llm.as_ref().unwrap().model, "four");
+        manager.delete_provider("chatgpt").unwrap();
+        assert_eq!(
+            manager.build_model_runtime().unwrap().llm.provider,
+            "deepseek"
+        );
+    }
+
+    #[test]
+    fn chatgpt_only_startup_never_reads_or_writes_api_credentials() {
+        struct NoCredentials;
+        impl CredentialStore for NoCredentials {
+            fn get(&self, _: &CredentialId) -> Result<Option<String>> {
+                panic!("ChatGPT must not read API credentials")
+            }
+            fn set(&self, _: &CredentialId, _: &str) -> Result<()> {
+                panic!("ChatGPT must not write API credentials")
+            }
+            fn delete(&self, _: &CredentialId) -> Result<()> {
+                panic!("ChatGPT must not delete API credentials")
+            }
+        }
+        let fixture = ManagerFixture::new();
+        fixture.repository.replace(serde_yaml::from_str("version: 1\nchatgpt:\n  models: [one, two]\nllm:\n  provider: chatgpt\n  model: one\n  temperature: 0.7\n  max_tokens: 8196\n").unwrap());
+        let mut manager = ConfigurationManager::new(
+            GlintPaths::from_home("/fixture"),
+            PathBuf::from("/workspace"),
+            ProviderCatalog::embedded().unwrap(),
+            Box::new(fixture.repository.clone()),
+            Box::new(NoCredentials),
+        )
+        .unwrap();
+        manager.repair_selection().unwrap();
+        assert_eq!(fixture.repository.save_count(), 0);
+        let mut runtime = manager.build_model_runtime().unwrap();
+        runtime.llm.switch_model("chatgpt", "two", None).unwrap();
+        manager.provider_statuses().unwrap();
+        manager.select_model("chatgpt", "two").unwrap();
+        manager.save_chatgpt(vec!["two".into()], None).unwrap();
+        manager.delete_provider("chatgpt").unwrap();
+    }
+
+    #[test]
+    fn chatgpt_persisted_metadata_is_validated_without_secrets() {
+        for models in [
+            vec![],
+            vec!["".to_owned()],
+            vec!["a".to_owned(), "a".to_owned()],
+            vec![" a".to_owned()],
+        ] {
+            let mut fixture = ManagerFixture::new();
+            fixture.user.chatgpt = Some(ChatGptConfig {
+                models,
+                reasoning_efforts: Default::default(),
+            });
+            assert!(fixture.try_manager().is_err());
+        }
+        for yaml in [
+            "chatgpt: {}",
+            "chatgpt: {models: [one], access_token: secret}",
+        ] {
+            assert!(serde_yaml::from_str::<UserConfig>(yaml).is_err());
+        }
+        let fixture = ManagerFixture::new();
+        let mut manager = fixture.manager();
+        manager.save_chatgpt(vec!["one".into()], None).unwrap();
+        let yaml = serde_yaml::to_value(manager.user_config()).unwrap();
+        let chatgpt = yaml.get("chatgpt").unwrap().as_mapping().unwrap();
+        assert_eq!(chatgpt.len(), 1);
+        assert!(chatgpt.contains_key("models"));
+    }
+
+    #[test]
+    fn chatgpt_failed_save_and_delete_preserve_configuration() {
+        let fixture = ManagerFixture::new();
+        let mut manager = fixture.manager();
+        manager.save_chatgpt(vec!["one".into()], None).unwrap();
+        let before = manager.user.clone();
+        fixture.repository.fail_saves();
+        assert_eq!(
+            manager
+                .save_chatgpt(vec!["two".into()], None)
+                .unwrap_err()
+                .kind(),
+            ConfigurationMutationErrorKind::Persistence
+        );
+        assert_eq!(manager.user, before);
+        assert!(manager.delete_provider("chatgpt").is_err());
+        assert_eq!(manager.user, before);
+        assert_eq!(fixture.repository.load().unwrap().unwrap(), before);
+    }
+
+    #[test]
+    fn chatgpt_rejects_invalid_models_and_reserved_custom_names() {
+        let fixture = ManagerFixture::new();
+        let mut manager = fixture.manager();
+        for models in [
+            vec![],
+            vec!["".into()],
+            vec!["a".into(), "a".into()],
+            vec![" a".into()],
+            vec!["a\nb".into()],
+        ] {
+            assert!(manager.save_chatgpt(models, None).is_err());
+        }
+        for name in ["CHATGPT", "chatgpt (codex)"] {
+            assert_eq!(
+                manager
+                    .save_custom(name, "https://example.com", Some("key"), vec!["m".into()])
+                    .unwrap_err()
+                    .kind(),
+                ConfigurationMutationErrorKind::ProviderNameCollision
+            );
+        }
+        assert_eq!(fixture.repository.save_count(), 0);
     }
 
     struct ManagerFixture {

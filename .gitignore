@@ -16,3 +16,6 @@ env.sh
 .idea/
 .vscode/
 *.swp
+
+# Local configuration backups (may contain credentials)
+/config.yaml.legacy-backup-*

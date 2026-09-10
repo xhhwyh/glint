@@ -94,7 +94,7 @@ plugins:
     - https://example.com/glint-marketplace.json
 ```
 
-Relative local plugin and marketplace paths are resolved from `~/.glint`; they do not follow the process working directory. `~/` paths use the home directory captured when Glint discovers its fixed paths. Git sources are cloned into the cache, fetched on later launches, optionally checked out at `ref`, and can select a monorepo plugin root with `subdir`. Subdirectory checkouts use Git sparse checkout and reject absolute paths, `..`, and symlink escapes.
+Relative local plugin and marketplace paths are resolved from `~/.glint`; they do not follow the process working directory. `~/` paths use the home directory captured when Glint discovers its fixed paths. Normal startup reads Git sources and remote JSON catalogs from the local cache without network refresh. Add or install sources through the plugin manager first; uncached sources report an error. Explicit installation and refresh operations download sources, optionally check out Git sources at `ref`, and can select a monorepo plugin root with `subdir`. Subdirectory checkouts use Git sparse checkout and reject absolute paths, `..`, and symlink escapes.
 
 Marketplaces can be GitHub `owner/repo` shorthands, Git URLs, local marketplace directories/files, or remote JSON catalogs. Glint understands relative plugin paths and the Claude marketplace `github`, `url`, and `git-subdir` source objects. Remote JSON catalogs cannot use relative plugin paths because the catalog does not include the referenced files. NPM marketplace sources are reported as unsupported.
 
@@ -110,6 +110,8 @@ Use the built-in commands to manage marketplaces and installed plugins:
 /plugins uninstall frontend-design@claude-code-plugins
 /reload-plugins
 ```
+
+`/reload-plugins`, `/plugins reload`, and `/plugins marketplace update` show refresh progress in the plugin manager while running in the background. Each Git command and remote catalog download has a 60-second timeout. Failed refreshes keep the current session's loaded extensions active.
 
 Marketplace additions and installed-plugin state are stored in `~/.glint/plugins/state.json` by default. If `plugins.cache_dir` is set, the state file is stored inside that directory; an absolute cache path is intentionally outside `~/.glint`. Mutations reload skills, commands, hooks, MCP servers, and LSP servers into the current session without restarting Glint.
 

@@ -2,6 +2,7 @@ use crate::approval::ApprovalRequest;
 use crate::progress::TodoUpdate;
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod chatgpt;
 mod compact;
 pub(crate) mod openai;
 pub(crate) mod provider;
@@ -34,6 +35,7 @@ pub enum AgentEvent {
         usage: Option<TokenUsage>,
         finish_reason: provider::FinishReason,
         tool_calls: Vec<provider::ToolCall>,
+        reasoning: Option<provider::ProviderReasoning>,
     },
     ToolStarted {
         id: String,

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -20,8 +21,27 @@ impl ModelRole {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+pub struct ReasoningData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_details: Option<Vec<Value>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct ProviderReasoning {
+    pub provider: String,
+    pub model: String,
+    #[serde(flatten)]
+    pub data: ReasoningData,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelMessage {
+    pub reasoning: Option<ProviderReasoning>,
     pub role: ModelRole,
     pub content: Option<String>,
     pub tool_call_id: Option<String>,
@@ -29,6 +49,10 @@ pub struct ModelMessage {
 }
 
 impl ModelMessage {
+    pub fn with_reasoning(mut self, reasoning: Option<ProviderReasoning>) -> Self {
+        self.reasoning = reasoning;
+        self
+    }
     pub fn system(content: impl Into<String>) -> Self {
         Self::new(ModelRole::System, Some(content.into()))
     }
@@ -39,6 +63,7 @@ impl ModelMessage {
 
     pub fn assistant(content: Option<String>, tool_calls: Vec<ToolCall>) -> Self {
         Self {
+            reasoning: None,
             role: ModelRole::Assistant,
             content,
             tool_call_id: None,
@@ -48,6 +73,7 @@ impl ModelMessage {
 
     pub fn tool_result(result: &ToolResult) -> Self {
         Self {
+            reasoning: None,
             role: ModelRole::Tool,
             content: Some(result.content.clone()),
             tool_call_id: Some(result.call_id.clone()),
@@ -57,6 +83,7 @@ impl ModelMessage {
 
     fn new(role: ModelRole, content: Option<String>) -> Self {
         Self {
+            reasoning: None,
             role,
             content,
             tool_call_id: None,
@@ -96,6 +123,7 @@ pub enum FinishReason {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelResponse {
+    pub reasoning: Option<ProviderReasoning>,
     pub assistant_text: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: FinishReason,
@@ -126,5 +154,38 @@ pub trait ModelProvider {
             on_delta(text.clone());
         }
         Ok(response)
+    }
+}
+
+/// Select the transport once; every provider uses Glint's orchestration.
+pub enum ConfiguredProvider {
+    OpenAi(super::openai::OpenAiProvider),
+    ChatGpt(super::chatgpt::ChatGptProvider),
+}
+impl ConfiguredProvider {
+    pub fn new(config: crate::config::LlmConfig) -> Self {
+        if config.provider == crate::config::CHATGPT_PROVIDER_ID {
+            Self::ChatGpt(super::chatgpt::ChatGptProvider::new(config))
+        } else {
+            Self::OpenAi(super::openai::OpenAiProvider::new(config))
+        }
+    }
+}
+impl ModelProvider for ConfiguredProvider {
+    fn complete(&mut self, request: ModelRequest) -> Result<ModelResponse> {
+        match self {
+            Self::OpenAi(provider) => provider.complete(request),
+            Self::ChatGpt(provider) => provider.complete(request),
+        }
+    }
+    fn stream(
+        &mut self,
+        request: ModelRequest,
+        on_delta: &mut dyn FnMut(String),
+    ) -> Result<ModelResponse> {
+        match self {
+            Self::OpenAi(provider) => provider.stream(request, on_delta),
+            Self::ChatGpt(provider) => provider.stream(request, on_delta),
+        }
     }
 }

@@ -114,6 +114,7 @@ fn assert_streamed_response(base_url: &str, expected: &str) {
 
 fn test_llm_config(base_url: &str) -> LlmConfig {
     LlmConfig {
+        reasoning_effort: None,
         provider: "test".to_owned(),
         base_url: base_url.to_owned(),
         model: "test-model".to_owned(),
